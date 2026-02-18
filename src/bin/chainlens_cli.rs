@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, path::Path};
 use serde::Deserialize;
 
 use chainlens::btc::tx::{analyze_tx, Prevout};
@@ -19,12 +19,43 @@ struct FixtureTx {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("usage: chainlens_cli <fixture.json>");
-        std::process::exit(2);
-    });
+    let args: Vec<String> = std::env::args().collect();
 
-    let s = fs::read_to_string(&path).unwrap_or_else(|e| {
+    // --- Block mode ---
+    if args.len() >= 5 && args[1] == "--block" {
+        let blk = &args[2];
+        let _rev = &args[3]; // currently unused
+        let xor = &args[4];
+
+        fs::create_dir_all("out").unwrap();
+
+        let report = chainlens::btc::block::analyze_block_file_first_block(blk, xor)
+            .unwrap_or_else(|e| {
+                let err = serde_json::json!({
+                    "ok": false,
+                    "error": { "code": "BLOCK_PARSE_ERROR", "message": e }
+                });
+                println!("{}", serde_json::to_string_pretty(&err).unwrap());
+                std::process::exit(1);
+            });
+
+        let out_path = format!("out/{}.json", report.block_header.block_hash);
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        fs::write(&out_path, &json).unwrap();
+
+        println!("{json}");
+        return;
+    }
+
+    // --- Tx mode ---
+    if args.len() < 2 {
+        eprintln!("usage:\n  chainlens_cli <fixture.json>\n  chainlens_cli --block <blk.dat> <rev.dat> <xor.dat>");
+        std::process::exit(2);
+    }
+
+    let path = &args[1];
+
+    let s = fs::read_to_string(path).unwrap_or_else(|e| {
         eprintln!("failed to read fixture {}: {}", path, e);
         std::process::exit(2);
     });
@@ -41,14 +72,24 @@ fn main() {
         script_pubkey_hex: p.script_pubkey_hex,
     }).collect();
 
-    let report = analyze_tx(&fx.network, &fx.raw_tx, &prevouts).unwrap_or_else(|e| {
-        let err = serde_json::json!({
-            "ok": false,
-            "error": { "code": "PARSE_ERROR", "message": e }
-        });
-        println!("{}", serde_json::to_string_pretty(&err).unwrap());
-        std::process::exit(1);
-    });
+    let report = match analyze_tx(&fx.network, &fx.raw_tx, &prevouts) {
+        Ok(r) => r,
+        Err(e) => {
+            let err = serde_json::json!({
+                "ok": false,
+                "error": { "code": "PARSE_ERROR", "message": e }
+            });
+            println!("{}", serde_json::to_string_pretty(&err).unwrap());
+            std::process::exit(1);
+        }
+    };
 
-    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    let out_dir = Path::new("out");
+    let _ = fs::create_dir_all(out_dir);
+
+    let json = serde_json::to_string_pretty(&report).unwrap();
+    let out_path = out_dir.join(format!("{}.json", report.txid));
+    let _ = fs::write(&out_path, &json);
+
+    println!("{}", json);
 }

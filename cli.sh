@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+cd "$(dirname "$0")"
 
 ###############################################################################
 # cli.sh — Bitcoin transaction / block analyzer CLI
@@ -61,9 +62,12 @@ if [[ "${1:-}" == "--block" ]]; then
   #   6. Identify coinbase, decode BIP34 height
   #   7. Write out/<block_hash>.json for each block
 
-  error_json "NOT_IMPLEMENTED" "Block parsing is not yet implemented"
-  echo "Error: Block parsing is not yet implemented" >&2
-  exit 1
+  # Build release binary if missing
+  if [[ ! -x "./target/release/chainlens_cli" ]]; then
+    cargo build --release >/dev/null
+  fi
+
+  exec ./target/release/chainlens_cli --block "$BLK_FILE" "$REV_FILE" "$XOR_FILE"
 fi
 
 # --- Single-transaction mode ---
@@ -94,6 +98,9 @@ mkdir -p out
 #   7. Build and output JSON report
 #   8. Write to out/<txid>.json and print to stdout
 
-error_json "NOT_IMPLEMENTED" "Transaction parsing is not yet implemented"
-echo "Error: Transaction parsing is not yet implemented" >&2
-exit 1
+# Build release binary if missing
+if [[ ! -x "./target/release/chainlens_cli" ]]; then
+  cargo build --release >/dev/null
+fi
+
+exec ./target/release/chainlens_cli "$FIXTURE"
