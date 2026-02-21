@@ -1,152 +1,118 @@
-// Import filesystem helpers and path utilities from the standard library
+// src/bin/chainlens_cli.rs
+
+use serde::Deserialize;
 use std::{fs, path::Path};
 
-// Import Serde trait to allow JSON → struct deserialization
-use serde::Deserialize;
-
-// Import the transaction analyzer and Prevout type from the library
 use chainlens::btc::tx::{analyze_tx, Prevout};
 
-///////////////////////////////////////////////////////////////
-// Structures describing the fixture JSON input format
-///////////////////////////////////////////////////////////////
-
-/// Represents a single previous output entry from the fixture JSON.
-///
-/// Each prevout describes the UTXO being spent by an input.
-#[derive(Deserialize)] // Allows serde to parse JSON into this struct
+#[derive(Deserialize)]
 struct FixturePrevout {
-    txid: String,              // Previous transaction ID (hex)
-    vout: u32,                 // Output index being spent
-    value_sats: u64,           // Value in satoshis
-    script_pubkey_hex: String, // ScriptPubKey hex of the prevout
+    txid: String,
+    vout: u32,
+    value_sats: u64,
+    script_pubkey_hex: String,
 }
 
-/// Top-level fixture format used in transaction analysis mode.
-///
-/// Contains raw transaction data and the referenced prevouts.
 #[derive(Deserialize)]
 struct FixtureTx {
-    network: String,                  // Network name (mainnet/testnet)
-    raw_tx: String,                   // Raw transaction hex
-    prevouts: Vec<FixturePrevout>,    // List of previous outputs
+    network: String,
+    raw_tx: String,
+    prevouts: Vec<FixturePrevout>,
 }
 
-///////////////////////////////////////////////////////////////
-// Program entry point
-///////////////////////////////////////////////////////////////
+fn print_err_and_exit(code: &str, message: impl Into<String>, exit_code: i32) -> ! {
+    let err = serde_json::json!({
+        "ok": false,
+        "error": { "code": code, "message": message.into() }
+    });
+    // pretty JSON like spec examples
+    println!("{}", serde_json::to_string_pretty(&err).unwrap());
+    std::process::exit(exit_code);
+}
 
-/// CLI entry point.
-///
-/// Supports two modes:
-/// - Transaction mode: analyzes a fixture JSON file
-/// - Block mode: analyzes a block data file pair
+fn ensure_out_dir() {
+    if let Err(e) = fs::create_dir_all("out") {
+        print_err_and_exit("IO_ERROR", format!("create out/ failed: {e}"), 1);
+    }
+}
+
 fn main() {
-    // Collect command line arguments into a vector
     let args: Vec<String> = std::env::args().collect();
 
-    ///////////////////////////////////////////////////////////
     // --- Block mode ---
-    ///////////////////////////////////////////////////////////
-
-    // If program is called with "--block" and enough arguments
     if args.len() >= 5 && args[1] == "--block" {
-
-        // Paths to block data files // bugfix
         let blk = &args[2];
-        let _rev = &args[3]; // Currently unused but reserved // bugfix
+        let rev = &args[3];
         let xor = &args[4];
 
-        // Ensure output directory exists
-        fs::create_dir_all("out").unwrap();
+        ensure_out_dir();
 
-        // Run block analyzer; exit with JSON error if it fails
-        let report = chainlens::btc::block::analyze_block_file_first_block(blk, xor)
-            .unwrap_or_else(|e| {
-                let err = serde_json::json!({
-                    "ok": false,
-                    "error": { "code": "BLOCK_PARSE_ERROR", "message": e }
-                });
-                println!("{}", serde_json::to_string_pretty(&err).unwrap());
-                std::process::exit(1);
+        let reports =
+            chainlens::btc::block::analyze_block_file(blk, rev, xor).unwrap_or_else(|e| {
+                print_err_and_exit("BLOCK_PARSE_ERROR", e, 1);
             });
 
-        // Build output file path based on block hash
-        let out_path = format!("out/{}.json", report.block_header.block_hash);
+        for report in reports {
+            let out_path = format!("out/{}.json", report.block_header.block_hash);
+            let json = serde_json::to_string_pretty(&report).unwrap();
+            if let Err(e) = fs::write(&out_path, &json) {
+                print_err_and_exit("IO_ERROR", format!("write {out_path} failed: {e}"), 1);
+            }
+        }
 
-        // Convert report to pretty JSON
-        let json = serde_json::to_string_pretty(&report).unwrap();
-
-        // Write JSON file to disk
-        fs::write(&out_path, &json).unwrap();
-
-        // Print JSON to stdout
-        println!("{json}");
-
-        // Exit early (do not run tx mode)
-        return;
+        std::process::exit(0);
     }
 
-    ///////////////////////////////////////////////////////////
     // --- Transaction mode ---
-    ///////////////////////////////////////////////////////////
-
-    // If not enough arguments, print usage and exit
     if args.len() < 2 {
-        eprintln!("usage:\n  chainlens_cli <fixture.json>\n  chainlens_cli --block <blk.dat> <rev.dat> <xor.dat>");
-        std::process::exit(2);
+        print_err_and_exit(
+            "INVALID_ARGS",
+            "usage: chainlens_cli <fixture.json>  OR  chainlens_cli --block <blk*.dat> <rev*.dat> <xor.dat>",
+            1,
+        );
     }
 
-    // Path to fixture JSON file
     let path = &args[1];
 
-    // Read fixture file into string
     let s = fs::read_to_string(path).unwrap_or_else(|e| {
-        eprintln!("failed to read fixture {}: {}", path, e);
-        std::process::exit(2);
+        print_err_and_exit("IO_ERROR", format!("failed to read fixture {path}: {e}"), 1);
     });
 
-    // Deserialize JSON string into FixtureTx struct
-    let fx: FixtureTx = serde_json::from_str(&s).unwrap_or_else(|e| {
-        eprintln!("invalid fixture json: {}", e);
-        std::process::exit(2);
+    // Determine whether to print stdout (only when there is no "mode" field).
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap_or_else(|e| {
+        print_err_and_exit("INVALID_FIXTURE", format!("invalid fixture json: {e}"), 1);
+    });
+    let print_stdout = v.get("mode").is_none();
+
+    let fx: FixtureTx = serde_json::from_value(v).unwrap_or_else(|e| {
+        print_err_and_exit("INVALID_FIXTURE", format!("invalid tx fixture: {e}"), 1);
     });
 
-    // Convert fixture prevouts into internal Prevout format
-    let prevouts: Vec<Prevout> = fx.prevouts.into_iter().map(|p| Prevout {
-        txid_hex: p.txid,
-        vout: p.vout,
-        value_sats: p.value_sats,
-        script_pubkey_hex: p.script_pubkey_hex,
-    }).collect();
+    let prevouts: Vec<Prevout> = fx
+        .prevouts
+        .into_iter()
+        .map(|p| Prevout {
+            txid_hex: p.txid,
+            vout: p.vout,
+            value_sats: p.value_sats,
+            script_pubkey_hex: p.script_pubkey_hex,
+        })
+        .collect();
 
-    // Run transaction analyzer
-    let report = match analyze_tx(&fx.network, &fx.raw_tx, &prevouts) {
-        Ok(r) => r,
-        Err(e) => {
-            // If analyzer fails, print JSON error and exit
-            let err = serde_json::json!({
-                "ok": false,
-                "error": { "code": "PARSE_ERROR", "message": e }
-            });
-            println!("{}", serde_json::to_string_pretty(&err).unwrap());
-            std::process::exit(1);
-        }
-    };
+    let report = analyze_tx(&fx.network, &fx.raw_tx, &prevouts)
+        .unwrap_or_else(|e| print_err_and_exit("PARSE_ERROR", e, 1));
 
-    // Ensure output directory exists
-    let out_dir = Path::new("out");
-    let _ = fs::create_dir_all(out_dir);
+    ensure_out_dir();
 
-    // Convert report to pretty JSON
     let json = serde_json::to_string_pretty(&report).unwrap();
+    let out_path = Path::new("out").join(format!("{}.json", report.txid));
+    if let Err(e) = fs::write(&out_path, &json) {
+        print_err_and_exit("IO_ERROR", format!("write {:?} failed: {e}", out_path), 1);
+    }
 
-    // Build output path using transaction ID
-    let out_path = out_dir.join(format!("{}.json", report.txid));
+    if print_stdout {
+        println!("{}", json);
+    }
 
-    // Write JSON report to disk (ignore errors)
-    let _ = fs::write(&out_path, &json);
-
-    // Print JSON report to stdout
-    println!("{}", json);
+    std::process::exit(0);
 }

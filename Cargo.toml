@@ -1,17 +1,31 @@
 [package]
-name = "chainlens"        # Projektname / Crate-Name
-version = "0.1.0"         # Aktuelle Version (semver)
-edition = "2021"          # Rust Sprach-Edition
+name = "chainlens"
+version = "0.1.0"
+edition = "2021"
 
 [dependencies]
-sha2 = "0.10"             # SHA-Hashing (z.B. für Chain/Block-Logik)
-serde = { version = "1.0", features = ["derive"] }  # Serialisierung/Deserialisierung
-serde_json = "1.0"        # JSON Support für serde
+# Core
+sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Web server stack
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+axum = { version = "0.7", features = ["multipart"] }
+tower-http = { version = "0.5", features = ["trace"] }
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
+k256 = "0.13"
+
+[features]
+framing_fuzz = []
 
 [[bin]]
-name = "chainlens_cli"    # CLI-Tool
+name = "chainlens_cli"
 path = "src/bin/chainlens_cli.rs"
 
 [[bin]]
-name = "chainlens_web"    # Webserver / Web-Interface
+name = "chainlens_web"
 path = "src/bin/chainlens_web.rs"
