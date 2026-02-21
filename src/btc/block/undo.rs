@@ -259,36 +259,6 @@ pub(crate) fn extract_vin_count_from_slice(raw_tx: &[u8]) -> Result<u64, String>
     extract_vin_count(raw_tx)
 }
 
-pub(crate) fn extract_input_outpoints(raw_tx: &[u8]) -> Result<Vec<(String, u32)>, String> {
-    let mut c = parser::Cursor::new(raw_tx);
-    let _ver = c.take_u32_le()?;
-
-    let p = c.take_u8()?;
-    if p == 0x00 {
-        let _f = c.take_u8()?;
-    } else {
-        c.i -= 1;
-    }
-
-    let vin_n = parser::read_varint(&mut c)?;
-    let mut out = Vec::with_capacity(vin_n as usize);
-
-    for _ in 0..vin_n {
-        let prev_txid_le = c.take(32)?;
-        let vout = c.take_u32_le()?;
-
-        let mut h = [0u8; 32];
-        h.copy_from_slice(prev_txid_le);
-        out.push((parser::hash_to_display_hex(h), vout));
-
-        let script_len = parser::read_varint(&mut c)? as usize;
-        let _ = c.take(script_len)?;
-        let _seq = c.take(4)?;
-    }
-
-    Ok(out)
-}
-
 pub(crate) fn validate_undo_payload_against_block(block: &[u8], undo_payload: &[u8]) -> Result<(), String> {
     let mut bc = parser::Cursor::new(block);
 
