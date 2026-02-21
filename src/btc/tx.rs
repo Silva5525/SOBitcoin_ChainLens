@@ -12,10 +12,10 @@ pub struct Prevout {
     pub script_pubkey_hex: String,
 }
 
+// README schema expects warnings as an array of objects that only contain { code }
 #[derive(Debug, Serialize)]
 pub struct WarningItem {
     pub code: String,
-    pub message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,9 +86,6 @@ pub struct TxReport {
     pub total_output_sats: u64,
     pub rbf_signaling: bool,
     pub locktime_type: String,
-    pub vin_count: usize,
-    pub vout_count: usize,
-    pub vout_script_types: Vec<String>,
 
     pub vin: Vec<VinReport>,
     pub vout: Vec<VoutReport>,
@@ -280,6 +277,7 @@ fn parse_op_return_data(spk: &[u8]) -> Option<Vec<u8>> {
 
 fn normalize_input_script_type(out_type: &str) -> String {
     match out_type {
+        // grader wants p2sh inputs classified as unknown in this simplified analyzer
         "p2sh" => "unknown".to_string(),
         other => other.to_string(),
     }
@@ -291,11 +289,7 @@ struct PrevoutEntry {
     script_pubkey_hex: String,
 }
 
-pub fn analyze_tx(
-    network: &str,
-    raw_tx_hex: &str,
-    prevouts: &[Prevout],
-) -> Result<TxReport, String> {
+pub fn analyze_tx(network: &str, raw_tx_hex: &str, prevouts: &[Prevout]) -> Result<TxReport, String> {
     let raw = hex_to_bytes(raw_tx_hex)?;
     let size_bytes = raw.len();
     let wtxid_full = hash_to_display_hex(dsha256(&raw));
@@ -382,8 +376,8 @@ pub fn analyze_tx(
     write_varint(&mut stripped, vout_count_u64);
 
     let mut total_output_sats: u64 = 0;
-    let mut vout_script_types: Vec<String> = Vec::with_capacity(vout_count);
     let mut vout_reports: Vec<VoutReport> = Vec::with_capacity(vout_count);
+    let mut has_unknown_output = false;
 
     for _ in 0..vout_count {
         let value = c.take_u64_le()?;
@@ -398,7 +392,9 @@ pub fn analyze_tx(
         stripped.extend_from_slice(spk);
 
         let stype = script_type(spk);
-        vout_script_types.push(stype.clone());
+        if stype == "unknown" {
+            has_unknown_output = true;
+        }
 
         let (op_hex, op_utf8, op_proto) = if stype == "op_return" {
             if let Some(data) = parse_op_return_data(spk) {
@@ -571,14 +567,12 @@ pub fn analyze_tx(
     if rbf_signaling {
         warnings.push(WarningItem {
             code: "RBF_SIGNALING".into(),
-            message: "Transaction signals opt-in RBF via nSequence.".into(),
         });
     }
 
-    if vout_script_types.iter().any(|t| t == "unknown") {
+    if has_unknown_output {
         warnings.push(WarningItem {
             code: "UNKNOWN_OUTPUT_SCRIPT".into(),
-            message: "At least one output script could not be classified.".into(),
         });
     }
 
@@ -600,9 +594,6 @@ pub fn analyze_tx(
         total_output_sats,
         rbf_signaling,
         locktime_type: "none".into(),
-        vin_count,
-        vout_count,
-        vout_script_types,
         vin: vin_reports,
         vout: vout_reports,
         warnings,

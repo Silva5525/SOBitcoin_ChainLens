@@ -8,3 +8,5 @@ target/
 sample_fixture.json
 fixtures/blocks/*.dat.gz
 fixtures/blocks/*.dat
+tests/
+tests
