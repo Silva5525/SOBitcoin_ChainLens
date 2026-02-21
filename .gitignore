@@ -6,7 +6,5 @@ __pycache__/
 target/
 .env
 sample_fixture.json
-fixtures/blocks/*.dat.gz
-fixtures/blocks/*.dat
 tests/
 tests
