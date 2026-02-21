@@ -10,20 +10,116 @@ pub use report::{BlockHeaderReport, BlockReport, BlockStatsReport, CoinbaseRepor
 use std::collections::BTreeMap;
 use std::fs;
 
-use crate::btc::tx::{analyze_tx, Prevout};
+use crate::btc::tx::analyze_tx_from_bytes_ordered;
 
 use io::decode_blk_and_rev_best;
-use parser::{bytes_to_hex, hash_to_display_hex, merkle_root, parse_tx_raw_and_txid_le, Cursor};
-use undo::{extract_input_outpoints, extract_vin_count, parse_undo_payload_strict};
+use parser::{bytes_to_hex, hash_to_display_hex, merkle_root, Cursor};
+use undo::{extract_vin_count_from_slice, parse_undo_payload_strict};
 
 fn err(code: &str, msg: impl AsRef<str>) -> String {
     format!("{code}: {}", msg.as_ref())
 }
 
+/// Analyze all txs in a block (coinbase + non-coinbase) using undo prevouts.
+///
+/// Hot path: avoid per-tx `Vec<u8>` copies by passing `&block[start..end]` slices.
+/// Also uses bounded parallelism for non-coinbase txs.
+fn analyze_txs_with_undo_slices(
+    block: &[u8],
+    tx_ranges: &[(usize, usize)],
+    undo_prevouts: &[Vec<(u64, Vec<u8>)>],
+) -> Result<Vec<serde_json::Value>, String> {
+    if tx_ranges.is_empty() {
+        return Err(err("INVALID_BLOCK", "block has zero transactions"));
+    }
+    if tx_ranges.len().saturating_sub(1) != undo_prevouts.len() {
+        return Err(err(
+            "UNDO_MISMATCH",
+            format!(
+                "undo tx count mismatch: non_cb_txs={} undo_txs={}",
+                tx_ranges.len().saturating_sub(1),
+                undo_prevouts.len()
+            ),
+        ));
+    }
+
+    // Pre-size output and fill coinbase.
+    let mut out: Vec<serde_json::Value> = vec![serde_json::Value::Null; tx_ranges.len()];
+
+    let (cb_s, cb_e) = tx_ranges[0];
+    let coinbase_report = analyze_tx_from_bytes_ordered("mainnet", &block[cb_s..cb_e], &[])
+        .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
+    out[0] = serde_json::to_value(coinbase_report)
+        .map_err(|e| err("SERDE_FAILED", e.to_string()))?;
+
+    // For small blocks, sequential is faster (thread overhead dominates).
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    if threads <= 1 || tx_ranges.len() < 128 {
+        for i in 1..tx_ranges.len() {
+            let (s, e) = tx_ranges[i];
+            let per_in = &undo_prevouts[i - 1];
+            let rep = analyze_tx_from_bytes_ordered("mainnet", &block[s..e], per_in)
+                .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
+            out[i] = serde_json::to_value(rep).map_err(|e| err("SERDE_FAILED", e.to_string()))?;
+        }
+        return Ok(out);
+    }
+
+    // Parallel hot path.
+    let n = tx_ranges.len();
+    let work = n - 1;
+    let t = threads.min(work).max(1);
+    let chunk = (work + t - 1) / t;
+
+    std::thread::scope(|scope| -> Result<(), String> {
+        let mut handles = Vec::with_capacity(t);
+
+        for tid in 0..t {
+            let start_i = 1 + tid * chunk;
+            let end_i = (start_i + chunk).min(n);
+            if start_i >= end_i {
+                continue;
+            }
+
+            handles.push(scope.spawn(move || -> Result<Vec<(usize, serde_json::Value)>, String> {
+                let mut local: Vec<(usize, serde_json::Value)> = Vec::with_capacity(end_i - start_i);
+                for i in start_i..end_i {
+                    let (s, e) = tx_ranges[i];
+                    let per_in = &undo_prevouts[i - 1];
+
+                    let rep = analyze_tx_from_bytes_ordered("mainnet", &block[s..e], per_in)
+                        .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
+                    let v = serde_json::to_value(rep)
+                        .map_err(|e| err("SERDE_FAILED", e.to_string()))?;
+                    local.push((i, v));
+                }
+                Ok(local)
+            }));
+        }
+
+        for h in handles {
+            let local = h
+                .join()
+                .map_err(|_| err("THREAD_PANIC", "tx analysis thread panicked"))??;
+            for (i, v) in local {
+                out[i] = v;
+            }
+        }
+
+        Ok(())
+    })?;
+
+    Ok(out)
+}
+
 /// Block-mode entrypoint used by `cli.sh --block`.
 ///
 /// Reads blk/rev/xor files, decodes records, parses every block record, and writes one report per block.
-pub fn analyze_block_file(blk_path: &str, rev_path: &str, xor_path: &str) -> Result<Vec<BlockReport>, String> {
+pub fn analyze_block_file(
+    blk_path: &str,
+    rev_path: &str,
+    xor_path: &str,
+) -> Result<Vec<BlockReport>, String> {
     let key = fs::read(xor_path).map_err(|e| err("IO_ERROR", format!("read xor key failed: {e}")))?;
     let blk_raw = fs::read(blk_path).map_err(|e| err("IO_ERROR", format!("read blk failed: {e}")))?;
     let rev_raw = fs::read(rev_path).map_err(|e| err("IO_ERROR", format!("read rev failed: {e}")))?;
@@ -52,7 +148,7 @@ pub fn analyze_block_file_first_block(blk_path: &str, xor_path: &str) -> Result<
     let key = fs::read(xor_path).map_err(|e| err("IO_ERROR", format!("read xor key failed: {e}")))?;
     let blk_raw = fs::read(blk_path).map_err(|e| err("IO_ERROR", format!("read blk failed: {e}")))?;
 
-    let (blk_records, _rev_records) = io::decode_blk_best_to_records(blk_raw, &key)?;
+    let (blk_records, _blk) = io::decode_blk_best_to_records(blk_raw, &key)?;
 
     let first = blk_records
         .into_iter()
@@ -73,8 +169,18 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
     let mut hc = Cursor::new(&header);
 
     let version = hc.take_u32_le()?;
-    let prev = hc.take(32)?.to_vec();
-    let merkle = hc.take(32)?.to_vec();
+    let prev_le = {
+        let s = hc.take(32)?;
+        let mut a = [0u8; 32];
+        a.copy_from_slice(s);
+        a
+    };
+    let merkle_le = {
+        let s = hc.take(32)?;
+        let mut a = [0u8; 32];
+        a.copy_from_slice(s);
+        a
+    };
     let timestamp = hc.take_u32_le()?;
     let bits_u32 = hc.take_u32_le()?;
     let nonce = hc.take_u32_le()?;
@@ -83,34 +189,33 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
     let block_hash = hash_to_display_hex(block_hash_le);
 
     let prev_block_hash = {
-        let mut be = prev.clone();
+        let mut be = prev_le;
         be.reverse();
         bytes_to_hex(&be)
     };
     let merkle_root_hdr_display = {
-        let mut be = merkle.clone();
+        let mut be = merkle_le;
         be.reverse();
         bytes_to_hex(&be)
     };
 
-    // --- parse txs ---
+    // --- parse txs (NO raw tx copies) ---
     let tx_count = parser::read_varint(&mut bc)?;
 
     let mut txids_le: Vec<[u8; 32]> = Vec::with_capacity(tx_count as usize);
-    let mut raw_txs: Vec<Vec<u8>> = Vec::with_capacity(tx_count as usize);
+    let mut tx_ranges: Vec<(usize, usize)> = Vec::with_capacity(tx_count as usize);
 
     for _ in 0..tx_count {
-        let (raw, txid_le) = parse_tx_raw_and_txid_le(block, &mut bc)?;
+        let start = bc.pos();
+        let txid_le = parser::parse_tx_skip_and_txid_le(block, &mut bc)?;
+        let end = bc.pos();
         txids_le.push(txid_le);
-        raw_txs.push(raw);
+        tx_ranges.push((start, end));
     }
 
     // --- verify merkle ---
     let mr_calc = merkle_root(&txids_le);
-    let mut mr_hdr_le = [0u8; 32];
-    mr_hdr_le.copy_from_slice(&merkle);
-
-    if mr_calc != mr_hdr_le {
+    if mr_calc != merkle_le {
         return Err(err(
             "MERKLE_MISMATCH",
             format!(
@@ -121,56 +226,26 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
         ));
     }
 
-    if raw_txs.is_empty() {
+    if tx_ranges.is_empty() {
         return Err(err("INVALID_BLOCK", "block has zero transactions"));
     }
 
     // --- coinbase ---
-    let (coinbase_script, coinbase_outsum) = parser::coinbase_extract_script_and_outsum(&raw_txs[0])?;
+    let (cb_s, cb_e) = tx_ranges[0];
+    let (coinbase_script, coinbase_outsum) =
+        parser::coinbase_extract_script_and_outsum(&block[cb_s..cb_e])?;
     let bip34_height = parser::decode_bip34_height(&coinbase_script);
     let coinbase_script_hex = bytes_to_hex(&coinbase_script);
 
     // --- undo parse needs vin counts of non-coinbase txs ---
-    let mut vin_counts_non_cb: Vec<u64> = Vec::with_capacity(raw_txs.len().saturating_sub(1));
-    for raw in raw_txs.iter().skip(1) {
-        vin_counts_non_cb.push(extract_vin_count(raw)?);
+    let mut vin_counts_non_cb: Vec<u64> = Vec::with_capacity(tx_ranges.len().saturating_sub(1));
+    for &(s, e) in tx_ranges.iter().skip(1) {
+        vin_counts_non_cb.push(extract_vin_count_from_slice(&block[s..e])?);
     }
     let undo_prevouts = parse_undo_payload_strict(undo_payload, &vin_counts_non_cb)?;
 
-    // --- analyze txs (re-use tx analyzer) ---
-    let mut tx_reports_json: Vec<serde_json::Value> = Vec::with_capacity(raw_txs.len());
-
-    // coinbase analyzed without prevouts
-    let coinbase_hex = hex::encode(&raw_txs[0]);
-    let coinbase_report = analyze_tx("mainnet", &coinbase_hex, &Vec::<Prevout>::new())
-        .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
-    tx_reports_json.push(serde_json::to_value(coinbase_report).map_err(|e| err("SERDE_FAILED", e.to_string()))?);
-
-    for (i, raw) in raw_txs.iter().enumerate().skip(1) {
-        let outpoints = extract_input_outpoints(raw)?;
-        let per_in = &undo_prevouts[i - 1];
-
-        if outpoints.len() != per_in.len() {
-            return Err(err(
-                "UNDO_MISMATCH",
-                format!("tx[{i}] inputs={} undo_inputs={}", outpoints.len(), per_in.len()),
-            ));
-        }
-
-        let mut prevs: Vec<Prevout> = Vec::with_capacity(outpoints.len());
-        for ((txid_hex, vout), (value_sats, spk_bytes)) in outpoints.into_iter().zip(per_in.iter()) {
-            prevs.push(Prevout {
-                txid_hex,
-                vout,
-                value_sats: *value_sats,
-                script_pubkey_hex: bytes_to_hex(spk_bytes),
-            });
-        }
-
-        let raw_hex = hex::encode(raw);
-        let rep = analyze_tx("mainnet", &raw_hex, &prevs).map_err(|e| err("ANALYZE_TX_FAILED", e))?;
-        tx_reports_json.push(serde_json::to_value(rep).map_err(|e| err("SERDE_FAILED", e.to_string()))?);
-    }
+    // --- analyze txs (bounded parallelism, slices) ---
+    let tx_reports_json = analyze_txs_with_undo_slices(block, &tx_ranges, &undo_prevouts)?;
 
     // --- block stats ---
     let mut total_fees: u64 = 0;
@@ -193,7 +268,11 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
 
         if let Some(vout) = txv.get("vout").and_then(|x| x.as_array()) {
             for o in vout {
-                let k = o.get("script_type").and_then(|x| x.as_str()).unwrap_or("unknown").to_string();
+                let k = o
+                    .get("script_type")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
                 *script_summary.entry(k).or_insert(0) += 1;
             }
         }
@@ -229,16 +308,14 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
             total_fees_sats: total_fees,
             total_weight,
             avg_fee_rate_sat_vb,
-            script_type_summary: serde_json::to_value(script_summary).unwrap_or_else(|_| serde_json::json!({})),
+            script_type_summary: serde_json::to_value(script_summary)
+                .unwrap_or_else(|_| serde_json::json!({})),
         },
     })
 }
 
 /// Legacy entrypoint kept for the web's "first block" demo mode.
 fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockReport, String> {
-    // This keeps behavior identical to your current file: it can run with empty undo.
-    // If undo is present and non-empty, we parse it and do full analysis.
-
     let mut bc = Cursor::new(block);
     if bc.remaining() < 80 {
         return Err(err("INVALID_BLOCK", "block payload too small for header"));
@@ -248,8 +325,18 @@ fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockR
     let mut hc = Cursor::new(&header);
 
     let version = hc.take_u32_le()?;
-    let prev = hc.take(32)?.to_vec();
-    let merkle = hc.take(32)?.to_vec();
+    let prev_le = {
+        let s = hc.take(32)?;
+        let mut a = [0u8; 32];
+        a.copy_from_slice(s);
+        a
+    };
+    let merkle_le = {
+        let s = hc.take(32)?;
+        let mut a = [0u8; 32];
+        a.copy_from_slice(s);
+        a
+    };
     let timestamp = hc.take_u32_le()?;
     let bits_u32 = hc.take_u32_le()?;
     let nonce = hc.take_u32_le()?;
@@ -258,12 +345,12 @@ fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockR
     let block_hash = hash_to_display_hex(block_hash_le);
 
     let prev_block_hash = {
-        let mut be = prev.clone();
+        let mut be = prev_le;
         be.reverse();
         bytes_to_hex(&be)
     };
     let merkle_root_hdr_display = {
-        let mut be = merkle.clone();
+        let mut be = merkle_le;
         be.reverse();
         bytes_to_hex(&be)
     };
@@ -271,19 +358,18 @@ fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockR
     let tx_count = parser::read_varint(&mut bc)?;
 
     let mut txids_le: Vec<[u8; 32]> = Vec::with_capacity(tx_count as usize);
-    let mut raw_txs: Vec<Vec<u8>> = Vec::with_capacity(tx_count as usize);
+    let mut tx_ranges: Vec<(usize, usize)> = Vec::with_capacity(tx_count as usize);
 
     for _ in 0..tx_count {
-        let (raw, txid_le) = parse_tx_raw_and_txid_le(block, &mut bc)?;
+        let start = bc.pos();
+        let txid_le = parser::parse_tx_skip_and_txid_le(block, &mut bc)?;
+        let end = bc.pos();
         txids_le.push(txid_le);
-        raw_txs.push(raw);
+        tx_ranges.push((start, end));
     }
 
     let mr_calc = merkle_root(&txids_le);
-    let mut mr_hdr_le = [0u8; 32];
-    mr_hdr_le.copy_from_slice(&merkle);
-
-    if mr_calc != mr_hdr_le {
+    if mr_calc != merkle_le {
         return Err(err(
             "MERKLE_MISMATCH",
             format!(
@@ -294,61 +380,32 @@ fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockR
         ));
     }
 
-    if raw_txs.is_empty() {
+    if tx_ranges.is_empty() {
         return Err(err("INVALID_BLOCK", "block has zero transactions"));
     }
 
-    let (coinbase_script, coinbase_outsum) = parser::coinbase_extract_script_and_outsum(&raw_txs[0])?;
+    let (cb_s, cb_e) = tx_ranges[0];
+    let (coinbase_script, coinbase_outsum) =
+        parser::coinbase_extract_script_and_outsum(&block[cb_s..cb_e])?;
     let bip34_height = parser::decode_bip34_height(&coinbase_script);
     let coinbase_script_hex = bytes_to_hex(&coinbase_script);
 
-    let mut vin_counts_non_cb: Vec<u64> = Vec::with_capacity(raw_txs.len().saturating_sub(1));
-    for raw in raw_txs.iter().skip(1) {
-        vin_counts_non_cb.push(extract_vin_count(raw)?);
-    }
-
-    let undo_prevouts = if undo_payload.is_empty() {
-        Vec::new()
-    } else {
-        parse_undo_payload_strict(undo_payload, &vin_counts_non_cb)?
-    };
-
-    let mut tx_reports_json: Vec<serde_json::Value> = Vec::with_capacity(raw_txs.len());
-
-    let coinbase_hex = hex::encode(&raw_txs[0]);
-    let coinbase_report = analyze_tx("mainnet", &coinbase_hex, &Vec::<Prevout>::new())
-        .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
-    tx_reports_json.push(serde_json::to_value(coinbase_report).map_err(|e| err("SERDE_FAILED", e.to_string()))?);
-
-    for (i, raw) in raw_txs.iter().enumerate().skip(1) {
-        if undo_payload.is_empty() {
+    let tx_reports_json = if undo_payload.is_empty() {
+        if tx_ranges.len() > 1 {
             return Err(err("UNDO_MISSING", "undo payload required for non-coinbase tx analysis"));
         }
-
-        let outpoints = extract_input_outpoints(raw)?;
-        let per_in = &undo_prevouts[i - 1];
-
-        if outpoints.len() != per_in.len() {
-            return Err(err(
-                "UNDO_MISMATCH",
-                format!("tx[{i}] inputs={} undo_inputs={}", outpoints.len(), per_in.len()),
-            ));
+        let coinbase_report = analyze_tx_from_bytes_ordered("mainnet", &block[cb_s..cb_e], &[])
+            .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
+        vec![serde_json::to_value(coinbase_report)
+            .map_err(|e| err("SERDE_FAILED", e.to_string()))?]
+    } else {
+        let mut vin_counts_non_cb: Vec<u64> = Vec::with_capacity(tx_ranges.len().saturating_sub(1));
+        for &(s, e) in tx_ranges.iter().skip(1) {
+            vin_counts_non_cb.push(extract_vin_count_from_slice(&block[s..e])?);
         }
-
-        let mut prevs: Vec<Prevout> = Vec::with_capacity(outpoints.len());
-        for ((txid_hex, vout), (value_sats, spk_bytes)) in outpoints.into_iter().zip(per_in.iter()) {
-            prevs.push(Prevout {
-                txid_hex,
-                vout,
-                value_sats: *value_sats,
-                script_pubkey_hex: bytes_to_hex(spk_bytes),
-            });
-        }
-
-        let raw_hex = hex::encode(raw);
-        let rep = analyze_tx("mainnet", &raw_hex, &prevs).map_err(|e| err("ANALYZE_TX_FAILED", e))?;
-        tx_reports_json.push(serde_json::to_value(rep).map_err(|e| err("SERDE_FAILED", e.to_string()))?);
-    }
+        let undo_prevouts = parse_undo_payload_strict(undo_payload, &vin_counts_non_cb)?;
+        analyze_txs_with_undo_slices(block, &tx_ranges, &undo_prevouts)?
+    };
 
     let mut total_fees: u64 = 0;
     let mut total_weight: u64 = 0;
@@ -370,7 +427,11 @@ fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockR
 
         if let Some(vout) = txv.get("vout").and_then(|x| x.as_array()) {
             for o in vout {
-                let k = o.get("script_type").and_then(|x| x.as_str()).unwrap_or("unknown").to_string();
+                let k = o
+                    .get("script_type")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
                 *script_summary.entry(k).or_insert(0) += 1;
             }
         }
@@ -406,8 +467,8 @@ fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockR
             total_fees_sats: total_fees,
             total_weight,
             avg_fee_rate_sat_vb,
-            script_type_summary: serde_json::to_value(script_summary).unwrap_or_else(|_| serde_json::json!({})),
+            script_type_summary: serde_json::to_value(script_summary)
+                .unwrap_or_else(|_| serde_json::json!({})),
         },
     })
 }
-

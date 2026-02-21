@@ -217,6 +217,93 @@ pub(crate) fn parse_tx_raw_and_txid_le(block: &[u8], bc: &mut Cursor) -> Result<
     Ok((raw, txid_le))
 }
 
+pub(crate) fn parse_tx_skip_and_txid_le(
+    block: &[u8],
+    bc: &mut Cursor,
+) -> Result<[u8; 32], String> {
+    let start = bc.pos();
+
+    let version = bc.take_u32_le()?;
+    let mut segwit = false;
+
+    let mut stripped: Vec<u8> = Vec::new();
+    stripped.extend_from_slice(&version.to_le_bytes());
+
+    let peek = bc.take_u8()?;
+    if peek == 0x00 {
+        let flag = bc.take_u8()?;
+        if flag != 0x01 {
+            return Err(err("INVALID_TX", "invalid segwit flag"));
+        }
+        segwit = true;
+    } else {
+        bc.i -= 1;
+    }
+
+    let vin_count = read_varint(bc)?;
+    ensure_len("tx", "vin_count", vin_count, 50_000)?;
+    write_varint(&mut stripped, vin_count);
+
+    for _ in 0..vin_count {
+        let prev_txid = bc.take(32)?;
+        let vout = bc.take(4)?;
+        stripped.extend_from_slice(prev_txid);
+        stripped.extend_from_slice(vout);
+
+        let script_len = read_varint(bc)?;
+        ensure_len("tx", "script_sig_len", script_len, 1_000_000)?;
+        write_varint(&mut stripped, script_len);
+        let script = bc.take(script_len as usize)?;
+        stripped.extend_from_slice(script);
+
+        let seq = bc.take(4)?;
+        stripped.extend_from_slice(seq);
+    }
+
+    let vout_count = read_varint(bc)?;
+    ensure_len("tx", "vout_count", vout_count, 50_000)?;
+    write_varint(&mut stripped, vout_count);
+
+    for _ in 0..vout_count {
+        let value = bc.take(8)?;
+        stripped.extend_from_slice(value);
+
+        let spk_len = read_varint(bc)?;
+        ensure_len("tx", "script_pubkey_len", spk_len, 10_000)?;
+        write_varint(&mut stripped, spk_len);
+        let spk = bc.take(spk_len as usize)?;
+        stripped.extend_from_slice(spk);
+    }
+
+    if segwit {
+        for _ in 0..vin_count {
+            let n_items_u64 = read_varint(bc)?;
+            ensure_len("tx", "witness_item_count", n_items_u64, 10_000)?;
+            let n_items = n_items_u64 as usize;
+
+            for _ in 0..n_items {
+                let item_len_u64 = read_varint(bc)?;
+                ensure_len("tx", "witness_item_len", item_len_u64, 4_000_000)?;
+
+                if item_len_u64 > (usize::MAX as u64) {
+                    return Err(err("INSANE_LEN", "witness_item_len does not fit usize"));
+                }
+                let item_len = item_len_u64 as usize;
+                let _ = bc.take(item_len)?;
+            }
+        }
+    }
+
+    let lock = bc.take(4)?;
+    stripped.extend_from_slice(lock);
+
+    let end = bc.pos();
+    let raw_slice = &block[start..end];
+
+    let txid_le = if segwit { dsha256(&stripped) } else { dsha256(raw_slice) };
+    Ok(txid_le)
+}
+
 pub(crate) fn decode_bip34_height(coinbase_script: &[u8]) -> u64 {
     if coinbase_script.is_empty() {
         return 0;

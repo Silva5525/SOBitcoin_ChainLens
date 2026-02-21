@@ -255,6 +255,10 @@ pub(crate) fn extract_vin_count(raw_tx: &[u8]) -> Result<u64, String> {
     parser::read_varint(&mut c)
 }
 
+pub(crate) fn extract_vin_count_from_slice(raw_tx: &[u8]) -> Result<u64, String> {
+    extract_vin_count(raw_tx)
+}
+
 pub(crate) fn extract_input_outpoints(raw_tx: &[u8]) -> Result<Vec<(String, u32)>, String> {
     let mut c = parser::Cursor::new(raw_tx);
     let _ver = c.take_u32_le()?;
