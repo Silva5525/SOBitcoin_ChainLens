@@ -1,3 +1,5 @@
+// src/btc/tx.rs
+
 use ahash::AHashMap;
 use bech32::{ToBase32, Variant};
 use bs58;
@@ -703,7 +705,7 @@ fn is_p2tr_spk(spk: &[u8]) -> bool {
 fn classify_input_spend(
     prevout_spk: &[u8],
     script_sig: &[u8],
-    witness_items: &[Vec<u8>],
+    witness_items: &[&[u8]],
     include_witness_script_asm: bool,
 ) -> (String, Option<String>) {
     // Returns (script_type, witness_script_asm).
@@ -862,7 +864,7 @@ impl Hash for PrevoutKey {
 fn analyze_tx_from_bytes_ordered_impl(
     network: &str,
     raw: &[u8],
-    prevouts_ordered: &[(u64, Vec<u8>)],
+    prevouts_ordered: &[(u64, &[u8])],
     flags: TxComputeFlags,
 ) -> Result<TxReport, String> {
     #[inline]
@@ -919,7 +921,7 @@ fn analyze_tx_from_bytes_ordered_impl(
     let mut vin_outpoints: Vec<(String, u32)> = Vec::with_capacity(vin_count);
     let mut vin_script_sig_hex: Vec<String> = Vec::with_capacity(vin_count);
     let mut vin_script_sig_asm: Vec<String> = Vec::with_capacity(vin_count);
-    let mut vin_script_sig_bytes: Vec<Vec<u8>> = Vec::with_capacity(vin_count);
+    let mut vin_script_sig_bytes: Vec<&[u8]> = Vec::with_capacity(vin_count);
     let mut vin_sequences: Vec<u32> = Vec::with_capacity(vin_count);
 
     let mut rbf_signaling = false;
@@ -967,7 +969,7 @@ fn analyze_tx_from_bytes_ordered_impl(
         } else {
             String::new()
         });
-        vin_script_sig_bytes.push(script_sig.to_vec());
+        vin_script_sig_bytes.push(script_sig);
 
         let sequence = c.take_u32_le()?;
         if let Some(h) = txid_hasher.as_mut() {
@@ -1072,19 +1074,19 @@ fn analyze_tx_from_bytes_ordered_impl(
 
     // --- Witness ---
     let mut witnesses: Vec<Vec<String>> = vec![Vec::new(); vin_count];
-    let mut witnesses_bytes: Vec<Vec<Vec<u8>>> = vec![Vec::new(); vin_count];
+    let mut witnesses_bytes: Vec<Vec<&[u8]>> = vec![Vec::new(); vin_count];
     if segwit {
         for (idx, slot) in witnesses.iter_mut().enumerate() {
             let n_stack = read_varint(&mut c)? as usize;
             let mut items_hex: Vec<String> = Vec::with_capacity(n_stack);
-            let mut items_bytes: Vec<Vec<u8>> = Vec::with_capacity(n_stack);
+            let mut items_bytes: Vec<&[u8]> = Vec::with_capacity(n_stack);
             for _ in 0..n_stack {
                 let item_len = read_varint(&mut c)? as usize;
                 let item = c.take(item_len)?;
                 if flags.include_witness_hex {
                     items_hex.push(bytes_to_hex(item));
                 }
-                items_bytes.push(item.to_vec());
+                items_bytes.push(item);
             }
             *slot = if flags.include_witness_hex { items_hex } else { Vec::new() };
             witnesses_bytes[idx] = items_bytes;
@@ -1172,11 +1174,11 @@ fn analyze_tx_from_bytes_ordered_impl(
             continue;
         }
 
-        let (val, spk_bytes) = &prevouts_ordered[i];
-        total_input_sats = total_input_sats.saturating_add(*val);
+        let (val, spk_bytes) = prevouts_ordered[i];
+        total_input_sats = total_input_sats.saturating_add(val);
 
         let (in_type, witness_script_asm) =
-            classify_input_spend(spk_bytes, &script_sig_b, &witness_b, flags.include_script_asm);
+            classify_input_spend(spk_bytes, script_sig_b, witness_b.as_slice(), flags.include_script_asm);
 
         vin_reports.push(VinReport {
             txid: txid_in,
@@ -1193,7 +1195,7 @@ fn analyze_tx_from_bytes_ordered_impl(
                 None
             },
             prevout: PrevoutInfo {
-                value_sats: *val,
+                value_sats: val,
                 script_pubkey_hex: if flags.include_script_hex {
                     bytes_to_hex(spk_bytes)
                 } else {
@@ -1308,7 +1310,7 @@ fn analyze_tx_from_bytes_ordered_impl(
 pub fn analyze_tx_from_bytes_ordered(
     network: &str,
     raw: &[u8],
-    prevouts_ordered: &[(u64, Vec<u8>)],
+    prevouts_ordered: &[(u64, &[u8])],
 ) -> Result<TxReport, String> {
     analyze_tx_from_bytes_ordered_impl(network, raw, prevouts_ordered, TxComputeFlags::FULL)
 }
@@ -1320,7 +1322,7 @@ pub fn analyze_tx_from_bytes_ordered(
 pub fn analyze_tx_from_bytes_ordered_lite(
     network: &str,
     raw: &[u8],
-    prevouts_ordered: &[(u64, Vec<u8>)],
+    prevouts_ordered: &[(u64, &[u8])],
 ) -> Result<TxReport, String> {
     analyze_tx_from_bytes_ordered_impl(network, raw, prevouts_ordered, TxComputeFlags::LITE)
 }
@@ -1380,7 +1382,10 @@ pub fn analyze_tx(network: &str, raw_tx_hex: &str, prevouts: &[Prevout]) -> Resu
 
     // Coinbase txs don't require prevouts.
     if coinbase {
-        return analyze_tx_from_bytes_ordered(network, &raw, &[]);
+        {
+        let empty: &[(u64, &[u8])] = &[];
+        return analyze_tx_from_bytes_ordered(network, &raw, empty);
+    }
     }
 
     if prevouts.len() != keys.len() {
@@ -1440,5 +1445,12 @@ pub fn analyze_tx(network: &str, raw_tx_hex: &str, prevouts: &[Prevout]) -> Resu
     }
 
     // --- 4) Run the ordered, allocation-lean analyzer ---
-    analyze_tx_from_bytes_ordered(network, &raw, &prevouts_ordered)
+    {
+        // Convert owned scripts to borrowed slices for the zero-copy core analyzer.
+        let borrowed: Vec<(u64, &[u8])> = prevouts_ordered
+            .iter()
+            .map(|(v, spk)| (*v, spk.as_slice()))
+            .collect();
+        analyze_tx_from_bytes_ordered(network, &raw, &borrowed)
+    }
 }

@@ -7,6 +7,38 @@ use k256::PublicKey;
 
 type UndoPrevouts = Vec<Vec<(u64, Vec<u8>)>>;
 
+// Zero-copy representation for scriptPubKey bytes in undo payload.
+// Some scripts are stored raw inside the undo payload; others are stored in a compressed form and
+// must be expanded. Expanded scripts are appended into a shared arena buffer.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ScriptSrc {
+    Undo,
+    Arena,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScriptSlice {
+    pub src: ScriptSrc,
+    pub start: usize,
+    pub len: usize,
+}
+
+#[allow(dead_code)]
+impl ScriptSlice {
+    #[inline]
+    pub fn as_slice<'a>(&self, undo_payload: &'a [u8], arena: &'a [u8]) -> &'a [u8] {
+        match self.src {
+            ScriptSrc::Undo => &undo_payload[self.start..self.start + self.len],
+            ScriptSrc::Arena => &arena[self.start..self.start + self.len],
+        }
+    }
+}
+
+#[allow(dead_code)]
+type UndoPrevoutsSlices = Vec<Vec<(u64, ScriptSlice)>>;
+
 fn err(code: &str, msg: impl AsRef<str>) -> String {
     format!("{code}: {}", msg.as_ref())
 }
@@ -146,6 +178,77 @@ fn read_compressed_script(c: &mut parser::Cursor) -> Result<Vec<u8>, String> {
     }
 }
 
+// Zero-copy variant: returns a ScriptSlice into either undo_payload (raw scripts) or the arena
+// (expanded standard scripts). No per-script Vec allocations.
+#[allow(dead_code)]
+fn read_compressed_script_slice(c: &mut parser::Cursor, arena: &mut Vec<u8>) -> Result<ScriptSlice, String> {
+    // ScriptCompressor uses Bitcoin Core base-128 VarInt (not CompactSize).
+    let nsize = read_varint_core(c)?;
+
+    match nsize {
+        0 => {
+            // P2PKH
+            let h160 = c.take(20)?;
+            let start = arena.len();
+            arena.extend_from_slice(&[0x76, 0xa9, 0x14]);
+            arena.extend_from_slice(h160);
+            arena.extend_from_slice(&[0x88, 0xac]);
+            let len = arena.len() - start;
+            Ok(ScriptSlice { src: ScriptSrc::Arena, start, len })
+        }
+        1 => {
+            // P2SH
+            let h160 = c.take(20)?;
+            let start = arena.len();
+            arena.extend_from_slice(&[0xa9, 0x14]);
+            arena.extend_from_slice(h160);
+            arena.push(0x87);
+            let len = arena.len() - start;
+            Ok(ScriptSlice { src: ScriptSrc::Arena, start, len })
+        }
+        2 | 3 => {
+            // P2PK (compressed pubkey)
+            let x = c.take(32)?;
+            let prefix = if nsize == 2 { 0x02 } else { 0x03 };
+            let start = arena.len();
+            arena.push(0x21);
+            arena.push(prefix);
+            arena.extend_from_slice(x);
+            arena.push(0xac);
+            let len = arena.len() - start;
+            Ok(ScriptSlice { src: ScriptSrc::Arena, start, len })
+        }
+        4 | 5 => {
+            // P2PK (uncompressed pubkey)
+            let x = c.take(32)?;
+            let y_is_odd = nsize == 5;
+            let pubkey65 = decompress_uncompressed_pubkey_from_x(x, y_is_odd)?;
+            let start = arena.len();
+            arena.push(0x41);
+            arena.extend_from_slice(&pubkey65);
+            arena.push(0xac);
+            let len = arena.len() - start;
+            Ok(ScriptSlice { src: ScriptSrc::Arena, start, len })
+        }
+        _ => {
+            if nsize < 6 {
+                return Err(err("INVALID_SCRIPT_COMPRESSION", "nsize < 6 unexpected"));
+            }
+
+            let raw_len_u64 = nsize - 6;
+            ensure_len("undo", "compressed_script_raw_len", raw_len_u64, 100_000)?;
+
+            let raw_len: usize = usize::try_from(raw_len_u64)
+                .map_err(|_| err("LEN_OVERFLOW", format!("raw_len too large for usize: {raw_len_u64}")))?;
+
+            // Raw script is already present in the undo payload; return a view into it.
+            let start = c.pos();
+            let _ = c.take(raw_len)?;
+            Ok(ScriptSlice { src: ScriptSrc::Undo, start, len: raw_len })
+        }
+    }
+}
+
 fn read_one_inundo(rc: &mut parser::Cursor) -> Result<(u64, Vec<u8>), String> {
     let ncode = read_varint_core(rc)?;
     let height = ncode >> 1;
@@ -160,6 +263,26 @@ fn read_one_inundo(rc: &mut parser::Cursor) -> Result<(u64, Vec<u8>), String> {
 
     if spk.len() > 100_000 {
         return Err(err("INSANE_LEN", format!("spk too large: {}", spk.len())));
+    }
+
+    Ok((value_sats, spk))
+}
+
+#[allow(dead_code)]
+fn read_one_inundo_slice(rc: &mut parser::Cursor, arena: &mut Vec<u8>) -> Result<(u64, ScriptSlice), String> {
+    let ncode = read_varint_core(rc)?;
+    let height = ncode >> 1;
+
+    if height > 0 {
+        let _tx_version = read_varint_core(rc)?;
+    }
+
+    let comp_amt = read_varint_core(rc)?;
+    let spk = read_compressed_script_slice(rc, arena)?;
+    let value_sats = decompress_amount(comp_amt);
+
+    if spk.len > 100_000 {
+        return Err(err("INSANE_LEN", format!("spk too large: {}", spk.len)));
     }
 
     Ok((value_sats, spk))
@@ -229,9 +352,95 @@ fn read_undo_for_block_from_cursor(
     Ok(all)
 }
 
-pub(crate) fn parse_undo_payload_strict(undo_payload: &[u8], vin_counts_non_cb: &[u64]) -> Result<UndoPrevouts, String> {
+#[allow(dead_code)]
+fn read_undo_for_block_from_cursor_slices(
+    rc: &mut parser::Cursor,
+    vin_counts_non_cb: &[u64],
+    arena: &mut Vec<u8>,
+) -> Result<UndoPrevoutsSlices, String> {
+    let n_txundo = read_compactsize(rc)?;
+    ensure_len("undo", "n_txundo", n_txundo, 200_000)?;
+
+    let expected = vin_counts_non_cb.len() as u64;
+
+    let mut has_cb_undo = false;
+    if n_txundo == expected {
+        // ok
+    } else if n_txundo == expected.saturating_add(1) {
+        has_cb_undo = true;
+    } else {
+        return Err(err(
+            "UNDO_MISMATCH",
+            format!(
+                "undo txundo count mismatch: undo={}, expected={} (or {} if coinbase included)",
+                n_txundo,
+                expected,
+                expected.saturating_add(1)
+            ),
+        ));
+    }
+
+    if has_cb_undo {
+        let cb_vin_n = read_compactsize(rc)?;
+        if cb_vin_n != 0 {
+            return Err(err(
+                "UNDO_MISMATCH",
+                format!("coinbase undo present but vin_n != 0: got={cb_vin_n}"),
+            ));
+        }
+    }
+
+    let mut all: UndoPrevoutsSlices = Vec::with_capacity(vin_counts_non_cb.len());
+
+    for (txundo_idx, &vin_expected) in vin_counts_non_cb.iter().enumerate() {
+        let vin_n = read_compactsize(rc)?;
+        ensure_len("undo", "vin_count", vin_n, 100_000)?;
+
+        if vin_n != vin_expected {
+            return Err(err(
+                "UNDO_MISMATCH",
+                format!(
+                    "undo vin count mismatch: txundo_idx={} undo={} expected={}",
+                    txundo_idx, vin_n, vin_expected
+                ),
+            ));
+        }
+
+        let mut ins: Vec<(u64, ScriptSlice)> = Vec::with_capacity(vin_n as usize);
+        for _ in 0..(vin_n as usize) {
+            ins.push(read_one_inundo_slice(rc, arena)?);
+        }
+        all.push(ins);
+    }
+
+    Ok(all)
+}
+
+pub(crate) fn parse_undo_payload_strict(
+    undo_payload: &[u8],
+    vin_counts_non_cb: &[u64],
+) -> Result<UndoPrevouts, String> {
     let mut uc = parser::Cursor::new(undo_payload);
     let v = read_undo_for_block_from_cursor(&mut uc, vin_counts_non_cb)?;
+    if uc.remaining() != 0 {
+        return Err(err(
+            "UNDO_TRAILING_BYTES",
+            format!("undo payload has {} trailing bytes", uc.remaining()),
+        ));
+    }
+    Ok(v)
+}
+
+// Zero-copy strict parser: returns ScriptSlice references that can be materialized as &[u8]
+// using ScriptSlice::as_slice(undo_payload, arena).
+#[allow(dead_code)]
+pub(crate) fn parse_undo_payload_strict_slices(
+    undo_payload: &[u8],
+    vin_counts_non_cb: &[u64],
+    arena: &mut Vec<u8>,
+) -> Result<UndoPrevoutsSlices, String> {
+    let mut uc = parser::Cursor::new(undo_payload);
+    let v = read_undo_for_block_from_cursor_slices(&mut uc, vin_counts_non_cb, arena)?;
     if uc.remaining() != 0 {
         return Err(err(
             "UNDO_TRAILING_BYTES",

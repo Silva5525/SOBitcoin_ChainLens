@@ -14,7 +14,7 @@ use crate::btc::tx::{analyze_tx_from_bytes_ordered, analyze_tx_from_bytes_ordere
 
 use io::decode_blk_and_rev_best;
 use parser::{bytes_to_hex, hash_to_display_hex, merkle_root, Cursor};
-use undo::{extract_vin_count_from_slice, parse_undo_payload_strict};
+use undo::{extract_vin_count_from_slice, parse_undo_payload_strict_slices};
 
 fn err(code: &str, msg: impl AsRef<str>) -> String {
     format!("{code}: {}", msg.as_ref())
@@ -38,7 +38,7 @@ fn txid_display_hex_to_le(s: &str) -> Result<[u8; 32], String> {
 fn analyze_txs_with_undo_slices(
     block: &[u8],
     tx_ranges: &[(usize, usize)],
-    undo_prevouts: &[Vec<(u64, Vec<u8>)>],
+    undo_prevouts: &[Vec<(u64, &[u8])>],
 ) -> Result<Vec<crate::btc::tx::TxReport>, String> {
     use crate::btc::tx::TxReport;
 
@@ -62,7 +62,8 @@ fn analyze_txs_with_undo_slices(
     out.resize_with(tx_ranges.len(), || None);
 
     let (cb_s, cb_e) = tx_ranges[0];
-    let coinbase_report = analyze_tx_from_bytes_ordered_lite("mainnet", &block[cb_s..cb_e], &[])
+    let empty: &[(u64, &[u8])] = &[];
+    let coinbase_report = analyze_tx_from_bytes_ordered_lite("mainnet", &block[cb_s..cb_e], empty)
         .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
     out[0] = Some(coinbase_report);
 
@@ -176,7 +177,8 @@ pub fn analyze_block_file_first_block(blk_path: &str, xor_path: &str) -> Result<
         .next()
         .ok_or_else(|| err("INVALID_BLOCK", "no block records"))?;
 
-    analyze_one_block_payload(&blk_buf[first.clone()], &[])
+    let empty: &[(u64, &[u8])] = &[];
+    analyze_one_block_payload(&blk_buf[first.clone()], empty)
 }
 
 fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Result<BlockReport, String> {
@@ -249,7 +251,19 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
     let bip34_height = parser::decode_bip34_height(&coinbase_script);
     let coinbase_script_hex = bytes_to_hex(&coinbase_script);
 
-    let undo_prevouts = parse_undo_payload_strict(undo_payload, &vin_counts_non_cb)?;
+    // Parse undo as zero-copy script slices (raw scripts point into undo payload; expanded scripts live in arena).
+    let mut undo_arena: Vec<u8> = Vec::new();
+    let undo_prevouts_slices = parse_undo_payload_strict_slices(undo_payload, &vin_counts_non_cb, &mut undo_arena)?;
+
+    // Materialize borrowed script slices for the tx analyzer (no script copies).
+    let undo_prevouts: Vec<Vec<(u64, &[u8])>> = undo_prevouts_slices
+        .iter()
+        .map(|txu| {
+            txu.iter()
+                .map(|(v, spk_slice)| (*v, spk_slice.as_slice(undo_payload, &undo_arena)))
+                .collect()
+        })
+        .collect();
 
     // --- analyze txs (bounded parallelism, slices) ---
     let tx_reports = analyze_txs_with_undo_slices(block, &tx_ranges, &undo_prevouts)?;
@@ -330,7 +344,7 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
 }
 
 /// Legacy entrypoint kept for the web's "first block" demo mode.
-fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockReport, String> {
+fn analyze_one_block_payload(block: &[u8], undo_payload: &[(u64, &[u8])]) -> Result<BlockReport, String> {
     // NOTE: left as legacy for now; consider mirroring the record_rev path for speed.
     // (This function currently uses parse_tx_skip_and_txid_le + early merkle check.)
 
@@ -412,7 +426,8 @@ fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockR
         if tx_ranges.len() > 1 {
             return Err(err("UNDO_MISSING", "undo payload required for non-coinbase tx analysis"));
         }
-        let coinbase_report = analyze_tx_from_bytes_ordered("mainnet", &block[cb_s..cb_e], &[])
+        let empty: &[(u64, &[u8])] = &[];
+        let coinbase_report = analyze_tx_from_bytes_ordered("mainnet", &block[cb_s..cb_e], empty)
             .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
         vec![coinbase_report]
     } else {
