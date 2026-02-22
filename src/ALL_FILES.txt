@@ -1,0 +1,3233 @@
+
+
+# =================== lib.rs
+
+// This is the library entry point (crate root).
+// Anything declared `pub` here becomes accessible to binaries
+// and external crates via `use chainlens::...`.
+pub mod btc;
+
+
+# =================== bin/chainlens_cli.rs
+
+// src/bin/chainlens_cli.rs
+
+use serde::Deserialize;
+use std::{
+    fs::{self, File},
+    io::{self, BufWriter, Write},
+    path::Path,
+};
+
+use chainlens::btc::tx::{analyze_tx, Prevout};
+
+#[derive(Deserialize)]
+struct FixturePrevout {
+    txid: String,
+    vout: u32,
+    value_sats: u64,
+    script_pubkey_hex: String,
+}
+
+#[derive(Deserialize)]
+struct FixtureTx {
+    network: String,
+    raw_tx: String,
+    prevouts: Vec<FixturePrevout>,
+}
+
+fn print_err_and_exit(code: &str, message: impl Into<String>, exit_code: i32) -> ! {
+    let err = serde_json::json!({
+        "ok": false,
+        "error": { "code": code, "message": message.into() }
+    });
+
+    // Keep error output human-friendly.
+    println!("{}", serde_json::to_string_pretty(&err).unwrap());
+    std::process::exit(exit_code);
+}
+
+fn ensure_out_dir() {
+    if let Err(e) = fs::create_dir_all("out") {
+        print_err_and_exit("IO_ERROR", format!("create out/ failed: {e}"), 1);
+    }
+}
+
+fn write_json_file<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), io::Error> {
+    let f = File::create(path)?;
+    let mut w = BufWriter::new(f);
+    serde_json::to_writer(&mut w, value)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    w.write_all(b"\n")?;
+    w.flush()?;
+    Ok(())
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    // --- Block mode ---
+    if args.len() >= 5 && args[1] == "--block" {
+        let blk = &args[2];
+        let rev = &args[3];
+        let xor = &args[4];
+
+        ensure_out_dir();
+
+        let reports = chainlens::btc::block::analyze_block_file(blk, rev, xor)
+            .unwrap_or_else(|e| print_err_and_exit("BLOCK_PARSE_ERROR", e, 1));
+
+        for report in reports {
+            let out_path = Path::new("out").join(format!("{}.json", report.block_header.block_hash));
+            if let Err(e) = write_json_file(&out_path, &report) {
+                print_err_and_exit(
+                    "IO_ERROR",
+                    format!("write {:?} failed: {e}", out_path),
+                    1,
+                );
+            }
+        }
+
+        std::process::exit(0);
+    }
+
+    // --- Transaction mode ---
+    if args.len() < 2 {
+        print_err_and_exit(
+            "INVALID_ARGS",
+            "usage: chainlens_cli <fixture.json>  OR  chainlens_cli --block <blk*.dat> <rev*.dat> <xor.dat>",
+            1,
+        );
+    }
+
+    let path = &args[1];
+
+    let s = fs::read_to_string(path)
+        .unwrap_or_else(|e| print_err_and_exit("IO_ERROR", format!("failed to read fixture {path}: {e}"), 1));
+
+    // Determine whether to print stdout (only when there is no "mode" field).
+    let v: serde_json::Value = serde_json::from_str(&s)
+        .unwrap_or_else(|e| print_err_and_exit("INVALID_FIXTURE", format!("invalid fixture json: {e}"), 1));
+    let print_stdout = v.get("mode").is_none();
+
+    let fx: FixtureTx = serde_json::from_value(v)
+        .unwrap_or_else(|e| print_err_and_exit("INVALID_FIXTURE", format!("invalid tx fixture: {e}"), 1));
+
+    let prevouts: Vec<Prevout> = fx
+        .prevouts
+        .into_iter()
+        .map(|p| Prevout {
+            txid_hex: p.txid,
+            vout: p.vout,
+            value_sats: p.value_sats,
+            script_pubkey_hex: p.script_pubkey_hex,
+        })
+        .collect();
+
+    let report = analyze_tx(&fx.network, &fx.raw_tx, &prevouts)
+        .unwrap_or_else(|e| print_err_and_exit("PARSE_ERROR", e, 1));
+
+    ensure_out_dir();
+
+    let out_path = Path::new("out").join(format!("{}.json", report.txid));
+    if let Err(e) = write_json_file(&out_path, &report) {
+        print_err_and_exit("IO_ERROR", format!("write {:?} failed: {e}", out_path), 1);
+    }
+
+    if print_stdout {
+        // Printing to stdout can be compact; graders parse JSON regardless.
+        println!("{}", serde_json::to_string(&report).unwrap());
+    }
+
+    std::process::exit(0);
+}
+
+
+# =================== bin/chainlens_web.rs
+
+// src/bin/chainlens_web.rs
+
+use axum::{
+    extract::{Multipart, State},
+    http::{header, StatusCode},
+    response::{Html, IntoResponse},
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::{net::SocketAddr, sync::Arc};
+use tempfile::tempdir;
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::EnvFilter;
+
+use chainlens::btc::block::analyze_block_file;
+use chainlens::btc::tx::{analyze_tx, Prevout};
+
+#[derive(Debug, Deserialize)]
+struct FixturePrevout {
+    txid: String,
+    vout: u32,
+    value_sats: u64,
+    script_pubkey_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TxFixture {
+    network: String,
+    raw_tx: String,
+    prevouts: Vec<FixturePrevout>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiError {
+    ok: bool,
+    error: ApiErrorInner,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiErrorInner {
+    code: String,
+    message: String,
+}
+
+fn api_err(code: &str, message: impl Into<String>) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiError {
+            ok: false,
+            error: ApiErrorInner {
+                code: code.to_string(),
+                message: message.into(),
+            },
+        }),
+    )
+}
+
+fn api_500(code: &str, message: impl Into<String>) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiError {
+            ok: false,
+            error: ApiErrorInner {
+                code: code.to_string(),
+                message: message.into(),
+            },
+        }),
+    )
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
+        .init();
+
+    let state = Arc::new(());
+
+    let app = Router::new()
+        .route("/", get(index))
+        .route("/api/health", get(health))
+        .route("/api/analyze", post(analyze_tx_fixture))
+        .route("/api/analyze/block", post(analyze_block_upload))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
+
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3000);
+
+    // Bind to 0.0.0.0 for container/test compatibility
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+
+    // Spec: print exactly one line containing the URL
+    println!("http://{}:{}", "127.0.0.1", port);
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("bind failed");
+    axum::serve(listener, app).await.expect("server failed");
+}
+
+async fn health() -> impl IntoResponse {
+    Json(json!({ "ok": true }))
+}
+
+async fn index() -> impl IntoResponse {
+    Html("Chain Lens Web API running. Use /api/health or POST /api/analyze.")
+}
+
+async fn analyze_tx_fixture(
+    State(_state): State<Arc<()>>,
+    Json(fx): Json<TxFixture>,
+) -> impl IntoResponse {
+    if fx.network.trim().is_empty() {
+        return api_err("INVALID_FIXTURE", "network must be non-empty").into_response();
+    }
+    if fx.raw_tx.trim().is_empty() {
+        return api_err("INVALID_FIXTURE", "raw_tx must be non-empty").into_response();
+    }
+
+    let prevouts: Vec<Prevout> = fx
+        .prevouts
+        .into_iter()
+        .map(|p| Prevout {
+            txid_hex: p.txid,
+            vout: p.vout,
+            value_sats: p.value_sats,
+            script_pubkey_hex: p.script_pubkey_hex,
+        })
+        .collect();
+
+    match analyze_tx(&fx.network, &fx.raw_tx, &prevouts) {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(report).unwrap()),
+        )
+            .into_response(),
+        Err(e) => api_err("ANALYZE_TX_FAILED", e).into_response(),
+    }
+}
+
+async fn analyze_block_upload(
+    State(_state): State<Arc<()>>,
+    mut mp: Multipart,
+) -> impl IntoResponse {
+    let dir = match tempdir() {
+        Ok(d) => d,
+        Err(e) => return api_500("TEMP_DIR_FAILED", e.to_string()).into_response(),
+    };
+
+    let mut blk_path: Option<std::path::PathBuf> = None;
+    let mut rev_path: Option<std::path::PathBuf> = None;
+    let mut xor_path: Option<std::path::PathBuf> = None;
+
+    loop {
+        match mp.next_field().await {
+            Ok(Some(field)) => {
+                let name = field.name().unwrap_or("").to_string();
+                let data = match field.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return api_err("MULTIPART_READ_FAILED", e.to_string())
+                            .into_response()
+                    }
+                };
+
+                let path = match name.as_str() {
+                    "blk" => dir.path().join("blk.dat"),
+                    "rev" => dir.path().join("rev.dat"),
+                    "xor" => dir.path().join("xor.dat"),
+                    _ => continue,
+                };
+
+                if let Err(e) = std::fs::write(&path, &data) {
+                    return api_500("FILE_WRITE_FAILED", e.to_string()).into_response();
+                }
+
+                match name.as_str() {
+                    "blk" => blk_path = Some(path),
+                    "rev" => rev_path = Some(path),
+                    "xor" => xor_path = Some(path),
+                    _ => {}
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                return api_err("MULTIPART_FAILED", e.to_string()).into_response();
+            }
+        }
+    }
+
+    let blk = match blk_path {
+        Some(p) => p,
+        None => return api_err("MISSING_FIELD", "missing multipart field: blk").into_response(),
+    };
+    let rev = match rev_path {
+        Some(p) => p,
+        None => return api_err("MISSING_FIELD", "missing multipart field: rev").into_response(),
+    };
+    let xor = match xor_path {
+        Some(p) => p,
+        None => return api_err("MISSING_FIELD", "missing multipart field: xor").into_response(),
+    };
+
+    match analyze_block_file(
+        blk.to_string_lossy().as_ref(),
+        rev.to_string_lossy().as_ref(),
+        xor.to_string_lossy().as_ref(),
+    ) {
+        Ok(reports) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+            Json(serde_json::to_value(reports).unwrap()),
+        )
+            .into_response(),
+        Err(e) => api_err("ANALYZE_BLOCK_FAILED", e).into_response(),
+    }
+}
+
+
+# =================== btc/block/io.rs
+
+// src/btc/block/io.rs
+
+use super::parser;
+use super::undo;
+
+use sha2::{Digest, Sha256};
+
+const MAGIC: [u8; 4] = [0xF9, 0xBE, 0xB4, 0xD9];
+
+fn err(code: &str, msg: impl AsRef<str>) -> String {
+    format!("{code}: {}", msg.as_ref())
+}
+
+fn key_is_all_zero(key: &[u8]) -> bool {
+    key.iter().all(|&b| b == 0)
+}
+
+/// A zero-copy record reference into a decoded dat buffer.
+pub(crate) type RecordRange = std::ops::Range<usize>;
+
+pub(crate) fn xor_decode_with_shift(mut data: Vec<u8>, key: &[u8], shift: usize) -> Vec<u8> {
+    if key.is_empty() {
+        return data;
+    }
+    let klen = key.len();
+    for (i, b) in data.iter_mut().enumerate() {
+        *b ^= key[(i + shift) % klen];
+    }
+    data
+}
+
+pub(crate) fn read_dat_records_strict(
+    buf: &[u8],
+    kind: &'static str,
+) -> Result<Vec<RecordRange>, String> {
+    // blk*.dat framing: MAGIC(4) | size(u32 LE) | payload(size)
+    let mut out: Vec<RecordRange> = Vec::new();
+    let mut i: usize = 0;
+
+    while i + 8 <= buf.len() {
+        if buf[i..i + 4] != MAGIC {
+            return Err(err(
+                "BAD_MAGIC",
+                format!(
+                    "{kind}: expected MAGIC at offset {i}, got {:02x?}",
+                    &buf[i..i + 4]
+                ),
+            ));
+        }
+
+        let size = u32::from_le_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]) as usize;
+        let payload_start = i + 8;
+        let payload_end = payload_start.saturating_add(size);
+
+        if payload_end > buf.len() {
+            return Err(err(
+                "TRUNCATED_RECORD",
+                format!(
+                    "{kind}: record payload truncated: need {size}, have {}",
+                    buf.len().saturating_sub(payload_start)
+                ),
+            ));
+        }
+
+        out.push(payload_start..payload_end);
+        i = payload_end;
+    }
+
+    if out.is_empty() {
+        return Err(err("NO_RECORDS_FOUND", format!("{kind}: no records found")));
+    }
+
+    Ok(out)
+}
+
+#[derive(Clone)]
+struct RevRecord {
+    undo_range: RecordRange,
+}
+
+fn read_rev_records_strict(buf: &[u8], kind: &'static str) -> Result<Vec<RevRecord>, String> {
+    // rev*.dat framing: MAGIC(4) | size(u32 LE) | undo_payload(size) | checksum(32)
+    let mut out: Vec<RevRecord> = Vec::new();
+    let mut i: usize = 0;
+
+    while i + 8 <= buf.len() {
+        if buf[i..i + 4] != MAGIC {
+            return Err(err(
+                "BAD_MAGIC",
+                format!(
+                    "{kind}: expected MAGIC at offset {i}, got {:02x?}",
+                    &buf[i..i + 4]
+                ),
+            ));
+        }
+
+        let size = u32::from_le_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]) as usize;
+        let payload_start = i + 8;
+        let payload_end = payload_start.saturating_add(size);
+        let checksum_end = payload_end.saturating_add(32);
+
+        if checksum_end > buf.len() {
+            return Err(err(
+                "TRUNCATED_RECORD",
+                format!(
+                    "{kind}: truncated record: need payload={size} + 32 checksum, have_remaining={}",
+                    buf.len().saturating_sub(payload_start)
+                ),
+            ));
+        }
+
+        let mut checksum = [0u8; 32];
+        checksum.copy_from_slice(&buf[payload_end..checksum_end]);
+
+        let undo_payload = &buf[payload_start..payload_end];
+        let computed = rev_checksum(undo_payload);
+        if computed != checksum {
+            return Err(err(
+                "BAD_UNDO_CHECKSUM",
+                format!("{kind}: rev record checksum mismatch at offset {i} (size={size})"),
+            ));
+        }
+
+        out.push(RevRecord {
+            undo_range: payload_start..payload_end,
+        });
+        i = checksum_end;
+    }
+
+    if out.is_empty() {
+        return Err(err("NO_RECORDS_FOUND", format!("{kind}: no records found")));
+    }
+
+    Ok(out)
+}
+
+fn dsha256_bytes(data: &[u8]) -> [u8; 32] {
+    let h1 = Sha256::digest(data);
+    let h2 = Sha256::digest(h1);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h2);
+    out
+}
+
+fn rev_checksum(undo_payload: &[u8]) -> [u8; 32] {
+    // Bitcoin Core rev*.dat checksum is dSHA256(serialized CBlockUndo record).
+    // It does NOT include any block hash or prev-hash material.
+    dsha256_bytes(undo_payload)
+}
+
+/// Pair rev-records to blk-records by index (Core-like ordering).
+///
+/// We do NOT attempt to "search" a matching rev record:
+/// the rev checksum is only an integrity check, not a block identifier.
+/// Any block↔undo mismatch is caught later by `validate_undo_payload_against_block`.
+fn pair_rev_to_blocks_by_checksum(
+    _blk_buf: &[u8],
+    blk_ranges: &[RecordRange],
+    _rev_buf: &[u8],
+    rev_records: &[RevRecord],
+) -> Result<Vec<RecordRange>, String> {
+    if rev_records.is_empty() {
+        return Err(err("REV_PAIRING_FAILED", "no rev records"));
+    }
+
+    if blk_ranges.len() != rev_records.len() {
+        return Err(err(
+            "RECORD_COUNT_MISMATCH",
+            format!("blk records={} rev records={}", blk_ranges.len(), rev_records.len()),
+        ));
+    }
+
+    // Core-like: record i in blk file corresponds to record i in rev file.
+    let mut out: Vec<RecordRange> = Vec::with_capacity(blk_ranges.len());
+    for rr in rev_records.iter() {
+        out.push(rr.undo_range.clone());
+    }
+    Ok(out)
+}
+
+fn validate_block_payload(block: &[u8]) -> Result<(), String> {
+    let mut bc = parser::Cursor::new(block);
+
+    if bc.remaining() < 80 {
+        return Err(err("INVALID_BLOCK", "block payload too small for header"));
+    }
+
+    // Avoid header Vec copy.
+    let header = bc.take(80)?;
+    let mut hc = parser::Cursor::new(header);
+
+    let _version = hc.take_u32_le()?;
+    let _prev = hc.take(32)?;
+
+    let merkle = {
+        let s = hc.take(32)?;
+        let mut a = [0u8; 32];
+        a.copy_from_slice(s);
+        a
+    };
+
+    let _ts = hc.take_u32_le()?;
+    let _bits = hc.take_u32_le()?;
+    let _nonce = hc.take_u32_le()?;
+
+    let tx_count = parser::read_varint(&mut bc)?;
+    if tx_count == 0 {
+        return Err(err("INVALID_BLOCK", "tx_count=0"));
+    }
+
+    // Hot path: avoid materializing raw tx bytes.
+    let mut txids_le: Vec<[u8; 32]> = Vec::with_capacity(tx_count as usize);
+    for _ in 0..tx_count {
+        let txid_le = parser::parse_tx_skip_and_txid_le(block, &mut bc)?;
+        txids_le.push(txid_le);
+    }
+
+    let mr_calc = parser::merkle_root(&txids_le);
+    if mr_calc != merkle {
+        return Err(err("MERKLE_MISMATCH", "merkle mismatch"));
+    }
+
+    Ok(())
+}
+
+fn decode_blk_best(blk_raw: Vec<u8>, key: &[u8]) -> Result<Vec<u8>, String> {
+    let blk = if key.is_empty() || key_is_all_zero(key) {
+        blk_raw
+    } else {
+        xor_decode_with_shift(blk_raw, key, 0)
+    };
+
+    let recs = read_dat_records_strict(&blk, "blk")?;
+    if recs.is_empty() {
+        return Err(err("BLK_DECODE_FAILED", "no blk records"));
+    }
+
+    // Validate first record as a cheap sanity check for key correctness.
+    let first = &blk[recs[0].clone()];
+    validate_block_payload(first).map_err(|e| err("BLK_DECODE_FAILED", e))?;
+    Ok(blk)
+}
+
+pub(crate) fn decode_blk_best_to_records(
+    blk_raw: Vec<u8>,
+    key: &[u8],
+) -> Result<(Vec<u8>, Vec<RecordRange>), String> {
+    let blk = decode_blk_best(blk_raw, key)?;
+    let blk_ranges = read_dat_records_strict(&blk, "blk")?;
+    Ok((blk, blk_ranges))
+}
+
+fn decode_rev_records_against_blocks(
+    rev_raw: Vec<u8>,
+    key: &[u8],
+    blk_buf: &[u8],
+    blk_ranges: &[RecordRange],
+) -> Result<(Vec<u8>, Vec<RecordRange>), String> {
+    let mut rev = rev_raw;
+    if !key.is_empty() && !key_is_all_zero(key) {
+        rev = xor_decode_with_shift(rev, key, 0);
+    }
+
+    let rev_records = read_rev_records_strict(&rev, "rev")?;
+    if rev_records.len() != blk_ranges.len() {
+        return Err(err(
+            "RECORD_COUNT_MISMATCH",
+            format!("rev records={} blk records={}", rev_records.len(), blk_ranges.len()),
+        ));
+    }
+
+    let paired_undo_ranges =
+        pair_rev_to_blocks_by_checksum(blk_buf, blk_ranges, &rev, &rev_records)?;
+
+    for (i, (br, ur)) in blk_ranges
+        .iter()
+        .zip(paired_undo_ranges.iter())
+        .enumerate()
+    {
+        let block = &blk_buf[br.clone()];
+        let undo_payload = &rev[ur.clone()];
+        undo::validate_undo_payload_against_block(block, undo_payload).map_err(|e| {
+            err(
+                "UNDO_BLOCK_PAIR_MISMATCH",
+                format!("record[{i}] undo did not validate against block: {e}"),
+            )
+        })?;
+    }
+
+    Ok((rev, paired_undo_ranges))
+}
+
+pub(crate) fn decode_blk_and_rev_best(
+    blk_raw: Vec<u8>,
+    rev_raw: Vec<u8>,
+    key: &[u8],
+) -> Result<(Vec<u8>, Vec<RecordRange>, Vec<u8>, Vec<RecordRange>), String> {
+    let blk = decode_blk_best(blk_raw, key)?;
+    let blk_ranges = read_dat_records_strict(&blk, "blk")?;
+    let (rev, undo_ranges) = decode_rev_records_against_blocks(rev_raw, key, &blk, &blk_ranges)?;
+    Ok((blk, blk_ranges, rev, undo_ranges))
+}
+
+
+# =================== btc/block/mod.rs
+
+// src/btc/block/mod.rs
+
+mod report;
+mod io;
+mod parser;
+mod undo;
+
+pub use report::{BlockHeaderReport, BlockReport, BlockStatsReport, CoinbaseReport};
+
+use std::collections::BTreeMap;
+use std::fs;
+
+use crate::btc::tx::analyze_tx_from_bytes_ordered;
+
+use io::decode_blk_and_rev_best;
+use parser::{bytes_to_hex, hash_to_display_hex, merkle_root, Cursor};
+use undo::{extract_vin_count_from_slice, parse_undo_payload_strict};
+
+fn err(code: &str, msg: impl AsRef<str>) -> String {
+    format!("{code}: {}", msg.as_ref())
+}
+
+fn txid_display_hex_to_le(s: &str) -> Result<[u8; 32], String> {
+    let mut be = [0u8; 32];
+    let raw = hex::decode(s).map_err(|_| err("INVALID_TXID", "txid is not valid hex"))?;
+    if raw.len() != 32 {
+        return Err(err("INVALID_TXID", "txid wrong length"));
+    }
+    be.copy_from_slice(&raw);
+    be.reverse(); // display hex = BE, merkle uses LE
+    Ok(be)
+}
+
+/// Analyze all txs in a block (coinbase + non-coinbase) using undo prevouts.
+///
+/// Hot path: avoid per-tx `Vec<u8>` copies by passing `&block[start..end]` slices.
+/// Also uses bounded parallelism for non-coinbase txs.
+fn analyze_txs_with_undo_slices(
+    block: &[u8],
+    tx_ranges: &[(usize, usize)],
+    undo_prevouts: &[Vec<(u64, Vec<u8>)>],
+) -> Result<Vec<crate::btc::tx::TxReport>, String> {
+    use crate::btc::tx::TxReport;
+
+    if tx_ranges.is_empty() {
+        return Err(err("INVALID_BLOCK", "block has zero transactions"));
+    }
+    if tx_ranges.len().saturating_sub(1) != undo_prevouts.len() {
+        return Err(err(
+            "UNDO_MISMATCH",
+            format!(
+                "undo tx count mismatch: non_cb_txs={} undo_txs={}",
+                tx_ranges.len().saturating_sub(1),
+                undo_prevouts.len()
+            ),
+        ));
+    }
+
+    // Pre-size output and fill coinbase.
+    // Note: `vec![None; n]` requires `Option<TxReport>: Clone` which we don't want.
+    let mut out: Vec<Option<TxReport>> = Vec::with_capacity(tx_ranges.len());
+    out.resize_with(tx_ranges.len(), || None);
+
+    let (cb_s, cb_e) = tx_ranges[0];
+    let coinbase_report = analyze_tx_from_bytes_ordered("mainnet", &block[cb_s..cb_e], &[])
+        .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
+    out[0] = Some(coinbase_report);
+
+    // For small blocks, sequential is faster (thread overhead dominates).
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    if threads <= 1 || tx_ranges.len() < 128 {
+        for i in 1..tx_ranges.len() {
+            let (s, e) = tx_ranges[i];
+            let per_in = &undo_prevouts[i - 1];
+            let rep = analyze_tx_from_bytes_ordered("mainnet", &block[s..e], per_in)
+                .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
+            out[i] = Some(rep);
+        }
+
+        return out
+            .into_iter()
+            .enumerate()
+            .map(|(i, x)| x.ok_or_else(|| err("INTERNAL", format!("missing tx report at index {i}"))))
+            .collect();
+    }
+
+    // Parallel hot path.
+    let n = tx_ranges.len();
+    let work = n - 1;
+    let t = threads.min(work).max(1);
+    let chunk = (work + t - 1) / t;
+
+    std::thread::scope(|scope| -> Result<(), String> {
+        let mut handles = Vec::with_capacity(t);
+
+        for tid in 0..t {
+            let start_i = 1 + tid * chunk;
+            let end_i = (start_i + chunk).min(n);
+            if start_i >= end_i {
+                continue;
+            }
+
+            handles.push(scope.spawn(move || -> Result<Vec<(usize, TxReport)>, String> {
+                let mut local: Vec<(usize, TxReport)> = Vec::with_capacity(end_i - start_i);
+                for i in start_i..end_i {
+                    let (s, e) = tx_ranges[i];
+                    let per_in = &undo_prevouts[i - 1];
+                    let rep = analyze_tx_from_bytes_ordered("mainnet", &block[s..e], per_in)
+                        .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
+                    local.push((i, rep));
+                }
+                Ok(local)
+            }));
+        }
+
+        for h in handles {
+            let local = h
+                .join()
+                .map_err(|_| err("THREAD_PANIC", "tx analysis thread panicked"))??;
+            for (i, rep) in local {
+                out[i] = Some(rep);
+            }
+        }
+
+        Ok(())
+    })?;
+
+    out.into_iter()
+        .enumerate()
+        .map(|(i, x)| x.ok_or_else(|| err("INTERNAL", format!("missing tx report at index {i}"))))
+        .collect()
+}
+
+/// Block-mode entrypoint used by `cli.sh --block`.
+///
+/// Reads blk/rev/xor files, decodes records, parses every block record, and writes one report per block.
+pub fn analyze_block_file(
+    blk_path: &str,
+    rev_path: &str,
+    xor_path: &str,
+) -> Result<Vec<BlockReport>, String> {
+    let key = fs::read(xor_path).map_err(|e| err("IO_ERROR", format!("read xor key failed: {e}")))?;
+    let blk_raw = fs::read(blk_path).map_err(|e| err("IO_ERROR", format!("read blk failed: {e}")))?;
+    let rev_raw = fs::read(rev_path).map_err(|e| err("IO_ERROR", format!("read rev failed: {e}")))?;
+
+    let (blk_buf, blk_ranges, rev_buf, undo_ranges) = decode_blk_and_rev_best(blk_raw, rev_raw, &key)?;
+
+    if blk_ranges.len() != undo_ranges.len() {
+        return Err(err(
+            "RECORD_COUNT_MISMATCH",
+            format!("blk records={} rev records={}", blk_ranges.len(), undo_ranges.len()),
+        ));
+    }
+
+    let mut out = Vec::with_capacity(blk_ranges.len());
+    for (br, ur) in blk_ranges.iter().zip(undo_ranges.iter()) {
+        let block = &blk_buf[br.clone()];
+        let undo_payload = &rev_buf[ur.clone()];
+        out.push(analyze_one_block_payload_record_rev(block, undo_payload)?);
+    }
+
+    Ok(out)
+}
+
+/// Backwards-compatible helper for the web app (analyze first block only).
+///
+/// NOTE: This reads *only* blk+xor. For full block-mode the web endpoint should call `analyze_block_file`.
+pub fn analyze_block_file_first_block(blk_path: &str, xor_path: &str) -> Result<BlockReport, String> {
+    let key = fs::read(xor_path).map_err(|e| err("IO_ERROR", format!("read xor key failed: {e}")))?;
+    let blk_raw = fs::read(blk_path).map_err(|e| err("IO_ERROR", format!("read blk failed: {e}")))?;
+
+    let (blk_buf, blk_ranges) = io::decode_blk_best_to_records(blk_raw, &key)?;
+
+    let first = blk_ranges
+        .into_iter()
+        .next()
+        .ok_or_else(|| err("INVALID_BLOCK", "no block records"))?;
+
+    analyze_one_block_payload(&blk_buf[first.clone()], &[])
+}
+
+fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Result<BlockReport, String> {
+    // --- parse header ---
+    let mut bc = Cursor::new(block);
+    if bc.remaining() < 80 {
+        return Err(err("INVALID_BLOCK", "block payload too small for header"));
+    }
+
+    // zero-copy: header ist jetzt ein Slice
+    let header = bc.take(80)?;
+    let mut hc = Cursor::new(header);
+
+    let version = hc.take_u32_le()?;
+    let prev_le = {
+        let s = hc.take(32)?;
+        let mut a = [0u8; 32];
+        a.copy_from_slice(s);
+        a
+    };
+    let merkle_le = {
+        let s = hc.take(32)?;
+        let mut a = [0u8; 32];
+        a.copy_from_slice(s);
+        a
+    };
+    let timestamp = hc.take_u32_le()?;
+    let bits_u32 = hc.take_u32_le()?;
+    let nonce = hc.take_u32_le()?;
+
+    let block_hash_le = parser::dsha256(header);
+    let block_hash = hash_to_display_hex(block_hash_le);
+
+    let prev_block_hash = {
+        let mut be = prev_le;
+        be.reverse();
+        bytes_to_hex(&be)
+    };
+    let merkle_root_hdr_display = {
+        let mut be = merkle_le;
+        be.reverse();
+        bytes_to_hex(&be)
+    };
+
+    // --- parse txs (NO raw tx copies) ---
+    let tx_count = parser::read_varint(&mut bc)?;
+
+    let mut tx_ranges: Vec<(usize, usize)> = Vec::with_capacity(tx_count as usize);
+    for _ in 0..tx_count {
+        let start = bc.pos();
+        parser::parse_tx_skip(block, &mut bc)?;
+        let end = bc.pos();
+        tx_ranges.push((start, end));
+    }
+
+    if tx_ranges.is_empty() {
+        return Err(err("INVALID_BLOCK", "block has zero transactions"));
+    }
+
+    // Build vin counts for non-coinbase txs (needed for undo parsing)
+    let mut vin_counts_non_cb: Vec<u64> = Vec::with_capacity(tx_ranges.len().saturating_sub(1));
+    for &(s, e) in tx_ranges.iter().skip(1) {
+        vin_counts_non_cb.push(extract_vin_count_from_slice(&block[s..e])?);
+    }
+
+    // --- coinbase ---
+    let (cb_s, cb_e) = tx_ranges[0];
+    let (coinbase_script, coinbase_outsum) =
+        parser::coinbase_extract_script_and_outsum(&block[cb_s..cb_e])?;
+    let bip34_height = parser::decode_bip34_height(&coinbase_script);
+    let coinbase_script_hex = bytes_to_hex(&coinbase_script);
+
+    let undo_prevouts = parse_undo_payload_strict(undo_payload, &vin_counts_non_cb)?;
+
+    // --- analyze txs (bounded parallelism, slices) ---
+    let tx_reports = analyze_txs_with_undo_slices(block, &tx_ranges, &undo_prevouts)?;
+
+    // Merkle check *after* tx analysis (txids come from TxReport)
+    let mut txids_le: Vec<[u8; 32]> = Vec::with_capacity(tx_reports.len());
+    for tx in &tx_reports {
+        txids_le.push(txid_display_hex_to_le(&tx.txid)?);
+    }
+
+    let mr_calc = merkle_root(&txids_le);
+    if mr_calc != merkle_le {
+        return Err(err(
+            "MERKLE_MISMATCH",
+            format!(
+                "header={} computed={}",
+                merkle_root_hdr_display,
+                hash_to_display_hex(mr_calc)
+            ),
+        ));
+    }
+
+    // --- block stats ---
+    let mut total_fees: u64 = 0;
+    let mut total_weight: u64 = 0;
+    let mut total_vbytes_non_cb: u64 = 0;
+    let mut script_summary: BTreeMap<String, u64> = BTreeMap::new();
+
+    for (idx, tx) in tx_reports.iter().enumerate() {
+        total_weight = total_weight.saturating_add(tx.weight as u64);
+
+        if idx != 0 {
+            if tx.fee_sats > 0 {
+                total_fees = total_fees.saturating_add(tx.fee_sats as u64);
+            }
+            total_vbytes_non_cb = total_vbytes_non_cb.saturating_add(tx.vbytes as u64);
+        }
+
+        for o in &tx.vout {
+            let k = if o.script_type.is_empty() { "unknown" } else { &o.script_type };
+            *script_summary.entry(k.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    let avg_fee_rate_sat_vb = if total_vbytes_non_cb == 0 {
+        0.0
+    } else {
+        (total_fees as f64) / (total_vbytes_non_cb as f64)
+    };
+
+    Ok(BlockReport {
+        ok: true,
+        mode: "block",
+        block_header: BlockHeaderReport {
+            version,
+            prev_block_hash,
+            merkle_root: merkle_root_hdr_display,
+            merkle_root_valid: true,
+            timestamp,
+            bits: format!("{bits_u32:08x}"),
+            nonce,
+            block_hash,
+        },
+        tx_count,
+        coinbase: CoinbaseReport {
+            bip34_height,
+            coinbase_script_hex,
+            total_output_sats: coinbase_outsum,
+        },
+        transactions: tx_reports,
+        block_stats: BlockStatsReport {
+            total_fees_sats: total_fees,
+            total_weight,
+            avg_fee_rate_sat_vb,
+            script_type_summary: script_summary,
+        },
+    })
+}
+
+/// Legacy entrypoint kept for the web's "first block" demo mode.
+fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockReport, String> {
+    // NOTE: left as legacy for now; consider mirroring the record_rev path for speed.
+    // (This function currently uses parse_tx_skip_and_txid_le + early merkle check.)
+
+    let mut bc = Cursor::new(block);
+    if bc.remaining() < 80 {
+        return Err(err("INVALID_BLOCK", "block payload too small for header"));
+    }
+
+    let header = bc.take(80)?.to_vec();
+    let mut hc = Cursor::new(&header);
+
+    let version = hc.take_u32_le()?;
+    let prev_le = {
+        let s = hc.take(32)?;
+        let mut a = [0u8; 32];
+        a.copy_from_slice(s);
+        a
+    };
+    let merkle_le = {
+        let s = hc.take(32)?;
+        let mut a = [0u8; 32];
+        a.copy_from_slice(s);
+        a
+    };
+    let timestamp = hc.take_u32_le()?;
+    let bits_u32 = hc.take_u32_le()?;
+    let nonce = hc.take_u32_le()?;
+
+    let block_hash_le = parser::dsha256(&header);
+    let block_hash = hash_to_display_hex(block_hash_le);
+
+    let prev_block_hash = {
+        let mut be = prev_le;
+        be.reverse();
+        bytes_to_hex(&be)
+    };
+    let merkle_root_hdr_display = {
+        let mut be = merkle_le;
+        be.reverse();
+        bytes_to_hex(&be)
+    };
+
+    let tx_count = parser::read_varint(&mut bc)?;
+
+    let mut txids_le: Vec<[u8; 32]> = Vec::with_capacity(tx_count as usize);
+    let mut tx_ranges: Vec<(usize, usize)> = Vec::with_capacity(tx_count as usize);
+
+    for _ in 0..tx_count {
+        let start = bc.pos();
+        let txid_le = parser::parse_tx_skip_and_txid_le(block, &mut bc)?;
+        let end = bc.pos();
+        txids_le.push(txid_le);
+        tx_ranges.push((start, end));
+    }
+
+    let mr_calc = merkle_root(&txids_le);
+    if mr_calc != merkle_le {
+        return Err(err(
+            "MERKLE_MISMATCH",
+            format!(
+                "header={} computed={}",
+                merkle_root_hdr_display,
+                hash_to_display_hex(mr_calc)
+            ),
+        ));
+    }
+
+    if tx_ranges.is_empty() {
+        return Err(err("INVALID_BLOCK", "block has zero transactions"));
+    }
+
+    let (cb_s, cb_e) = tx_ranges[0];
+    let (coinbase_script, coinbase_outsum) =
+        parser::coinbase_extract_script_and_outsum(&block[cb_s..cb_e])?;
+    let bip34_height = parser::decode_bip34_height(&coinbase_script);
+    let coinbase_script_hex = bytes_to_hex(&coinbase_script);
+
+    let tx_reports: Vec<crate::btc::tx::TxReport> = if undo_payload.is_empty() {
+        if tx_ranges.len() > 1 {
+            return Err(err("UNDO_MISSING", "undo payload required for non-coinbase tx analysis"));
+        }
+        let coinbase_report = analyze_tx_from_bytes_ordered("mainnet", &block[cb_s..cb_e], &[])
+            .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
+        vec![coinbase_report]
+    } else {
+        // Legacy path lacks vin_counts; keep old behavior or refactor later.
+        return Err(err("UNDO_UNSUPPORTED", "legacy block demo does not support undo payload"));
+    };
+
+    let mut total_fees: u64 = 0;
+    let mut total_weight: u64 = 0;
+    let mut total_vbytes_non_cb: u64 = 0;
+    let mut script_summary: BTreeMap<String, u64> = BTreeMap::new();
+
+    for (idx, tx) in tx_reports.iter().enumerate() {
+        total_weight = total_weight.saturating_add(tx.weight as u64);
+
+        if idx != 0 {
+            if tx.fee_sats > 0 {
+                total_fees = total_fees.saturating_add(tx.fee_sats as u64);
+            }
+            total_vbytes_non_cb = total_vbytes_non_cb.saturating_add(tx.vbytes as u64);
+        }
+
+        for o in &tx.vout {
+            let k = if o.script_type.is_empty() { "unknown" } else { &o.script_type };
+            *script_summary.entry(k.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    let avg_fee_rate_sat_vb = if total_vbytes_non_cb == 0 {
+        0.0
+    } else {
+        (total_fees as f64) / (total_vbytes_non_cb as f64)
+    };
+
+    Ok(BlockReport {
+        ok: true,
+        mode: "block",
+        block_header: BlockHeaderReport {
+            version,
+            prev_block_hash,
+            merkle_root: merkle_root_hdr_display,
+            merkle_root_valid: true,
+            timestamp,
+            bits: format!("{bits_u32:08x}"),
+            nonce,
+            block_hash,
+        },
+        tx_count,
+        coinbase: CoinbaseReport {
+            bip34_height,
+            coinbase_script_hex,
+            total_output_sats: coinbase_outsum,
+        },
+        transactions: tx_reports,
+        block_stats: BlockStatsReport {
+            total_fees_sats: total_fees,
+            total_weight,
+            avg_fee_rate_sat_vb,
+            script_type_summary: script_summary,
+        },
+    })
+}
+
+# =================== btc/block/parser.rs
+
+// src/btc/block/parser.rs
+
+use sha2::{Digest, Sha256};
+
+fn err(code: &str, msg: impl AsRef<str>) -> String {
+    format!("{code}: {}", msg.as_ref())
+}
+
+pub(crate) fn ensure_len(kind: &str, field: &str, val: u64, max: u64) -> Result<(), String> {
+    if val > max {
+        return Err(err(
+            "INSANE_LEN",
+            format!("{kind}: {field} too large: {val} > {max}"),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) struct Cursor<'a> {
+    pub(crate) b: &'a [u8],
+    pub(crate) i: usize,
+}
+
+impl<'a> Cursor<'a> {
+    pub(crate) fn new(b: &'a [u8]) -> Self {
+        Self { b, i: 0 }
+    }
+    pub(crate) fn pos(&self) -> usize {
+        self.i
+    }
+    pub(crate) fn remaining(&self) -> usize {
+        self.b.len().saturating_sub(self.i)
+    }
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        if self.i + n > self.b.len() {
+            return Err(err(
+                "UNEXPECTED_EOF",
+                format!(
+                    "unexpected EOF at pos={} need={} have_remaining={}",
+                    self.i,
+                    n,
+                    self.b.len().saturating_sub(self.i)
+                ),
+            ));
+        }
+        let s = &self.b[self.i..self.i + n];
+        self.i += n;
+        Ok(s)
+    }
+    pub(crate) fn take_u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+    pub(crate) fn take_u16_le(&mut self) -> Result<u16, String> {
+        let s = self.take(2)?;
+        Ok(u16::from_le_bytes([s[0], s[1]]))
+    }
+    pub(crate) fn take_u32_le(&mut self) -> Result<u32, String> {
+        let s = self.take(4)?;
+        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    pub(crate) fn take_u64_le(&mut self) -> Result<u64, String> {
+        let s = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
+    }
+}
+
+pub(crate) fn bytes_to_hex(b: &[u8]) -> String {
+    hex::encode(b)
+}
+
+pub(crate) fn dsha256(data: &[u8]) -> [u8; 32] {
+    let h1 = Sha256::digest(data);
+    let h2 = Sha256::digest(h1);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h2);
+    out
+}
+
+pub(crate) fn hash_to_display_hex(hash_le: [u8; 32]) -> String {
+    let mut be = hash_le;
+    be.reverse();
+    bytes_to_hex(&be)
+}
+
+pub(crate) fn read_varint(c: &mut Cursor) -> Result<u64, String> {
+    let first = c.take_u8()? as u64;
+    match first {
+        0x00..=0xfc => Ok(first),
+        0xfd => Ok(c.take_u16_le()? as u64),
+        0xfe => Ok(c.take_u32_le()? as u64),
+        0xff => Ok(c.take_u64_le()?),
+        _ => Err(err("INVALID_VARINT", "invalid varint prefix")),
+    }
+}
+
+#[inline]
+fn sha256d_finish(h: Sha256) -> [u8; 32] {
+    let h1 = h.finalize();
+    let h2 = Sha256::digest(h1);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h2);
+    out
+}
+
+#[inline]
+fn sha256_update_varint(h: &mut Sha256, n: u64) {
+    match n {
+        0x00..=0xfc => h.update([n as u8]),
+        0xfd..=0xffff => {
+            h.update([0xfd]);
+            h.update((n as u16).to_le_bytes());
+        }
+        0x1_0000..=0xffff_ffff => {
+            h.update([0xfe]);
+            h.update((n as u32).to_le_bytes());
+        }
+        _ => {
+            h.update([0xff]);
+            h.update(n.to_le_bytes());
+        }
+    }
+}
+
+pub(crate) fn merkle_root(txids_le: &[[u8; 32]]) -> [u8; 32] {
+    if txids_le.is_empty() {
+        return [0u8; 32];
+    }
+    let mut level: Vec<[u8; 32]> = txids_le.to_vec();
+    while level.len() > 1 {
+        if level.len() % 2 == 1 {
+            level.push(*level.last().unwrap());
+        }
+        let mut next = Vec::with_capacity(level.len() / 2);
+        for pair in level.chunks(2) {
+            let mut buf = [0u8; 64];
+            buf[..32].copy_from_slice(&pair[0]);
+            buf[32..].copy_from_slice(&pair[1]);
+            next.push(dsha256(&buf));
+        }
+        level = next;
+    }
+    level[0]
+}
+
+pub(crate) fn parse_tx_skip_and_txid_le(
+    block: &[u8],
+    bc: &mut Cursor,
+) -> Result<[u8; 32], String> {
+    let start = bc.pos();
+
+    let version = bc.take_u32_le()?;
+
+    let peek = bc.take_u8()?;
+    let segwit = if peek == 0x00 {
+        let flag = bc.take_u8()?;
+        if flag != 0x01 {
+            return Err(err("INVALID_TX", "invalid segwit flag"));
+        }
+        true
+    } else {
+        bc.i -= 1;
+        false
+    };
+
+    if !segwit {
+        let vin_count = read_varint(bc)?;
+        ensure_len("tx", "vin_count", vin_count, 50_000)?;
+        for _ in 0..vin_count {
+            let _ = bc.take(32)?;
+            let _ = bc.take(4)?;
+            let script_len = read_varint(bc)?;
+            ensure_len("tx", "script_sig_len", script_len, 1_000_000)?;
+            let _ = bc.take(script_len as usize)?;
+            let _ = bc.take(4)?;
+        }
+
+        let vout_count = read_varint(bc)?;
+        ensure_len("tx", "vout_count", vout_count, 50_000)?;
+        for _ in 0..vout_count {
+            let _ = bc.take(8)?;
+            let spk_len = read_varint(bc)?;
+            ensure_len("tx", "script_pubkey_len", spk_len, 10_000)?;
+            let _ = bc.take(spk_len as usize)?;
+        }
+
+        let _ = bc.take(4)?; // locktime
+        let end = bc.pos();
+        return Ok(dsha256(&block[start..end]));
+    }
+
+    // Segwit: stream stripped serialization directly into hasher.
+    let mut h = Sha256::new();
+    h.update(version.to_le_bytes());
+
+    let vin_count = read_varint(bc)?;
+    ensure_len("tx", "vin_count", vin_count, 50_000)?;
+    sha256_update_varint(&mut h, vin_count);
+
+    for _ in 0..vin_count {
+        let prev_txid = bc.take(32)?;
+        let vout = bc.take(4)?;
+        h.update(prev_txid);
+        h.update(vout);
+
+        let script_len = read_varint(bc)?;
+        ensure_len("tx", "script_sig_len", script_len, 1_000_000)?;
+        sha256_update_varint(&mut h, script_len);
+        let script = bc.take(script_len as usize)?;
+        h.update(script);
+
+        let seq = bc.take(4)?;
+        h.update(seq);
+    }
+
+    let vout_count = read_varint(bc)?;
+    ensure_len("tx", "vout_count", vout_count, 50_000)?;
+    sha256_update_varint(&mut h, vout_count);
+
+    for _ in 0..vout_count {
+        let value = bc.take(8)?;
+        h.update(value);
+
+        let spk_len = read_varint(bc)?;
+        ensure_len("tx", "script_pubkey_len", spk_len, 10_000)?;
+        sha256_update_varint(&mut h, spk_len);
+        let spk = bc.take(spk_len as usize)?;
+        h.update(spk);
+    }
+
+    // Skip witness (not hashed into txid).
+    for _ in 0..vin_count {
+        let n_items = read_varint(bc)?;
+        ensure_len("tx", "witness_item_count", n_items, 10_000)?;
+        for _ in 0..n_items {
+            let item_len = read_varint(bc)?;
+            ensure_len("tx", "witness_item_len", item_len, 4_000_000)?;
+            let _ = bc.take(item_len as usize)?;
+        }
+    }
+
+    let lock = bc.take(4)?;
+    h.update(lock);
+
+    Ok(sha256d_finish(h))
+}
+
+pub(crate) fn parse_tx_skip(_block: &[u8], bc: &mut Cursor) -> Result<(), String> {
+    let _version = bc.take_u32_le()?;
+
+    // Detect segwit marker/flag.
+    let peek = bc.take_u8()?;
+    let segwit = if peek == 0x00 {
+        let flag = bc.take_u8()?;
+        if flag != 0x01 {
+            return Err(err("INVALID_TX", "invalid segwit flag"));
+        }
+        true
+    } else {
+        bc.i -= 1;
+        false
+    };
+
+    // vin
+    let vin_count_u64 = read_varint(bc)?;
+    ensure_len("tx", "vin_count", vin_count_u64, 50_000)?;
+    let vin_count = vin_count_u64 as usize;
+
+    for _ in 0..vin_count {
+        let _ = bc.take(32)?; // prev txid
+        let _ = bc.take(4)?;  // vout
+        let script_len_u64 = read_varint(bc)?;
+        ensure_len("tx", "script_sig_len", script_len_u64, 1_000_000)?;
+        let _ = bc.take(script_len_u64 as usize)?; // scriptSig
+        let _ = bc.take(4)?; // sequence
+    }
+
+    // vout
+    let vout_count_u64 = read_varint(bc)?;
+    ensure_len("tx", "vout_count", vout_count_u64, 50_000)?;
+    let vout_count = vout_count_u64 as usize;
+
+    for _ in 0..vout_count {
+        let _ = bc.take(8)?; // value
+        let spk_len_u64 = read_varint(bc)?;
+        ensure_len("tx", "script_pubkey_len", spk_len_u64, 10_000)?;
+        let _ = bc.take(spk_len_u64 as usize)?; // scriptPubKey
+    }
+
+    // witness (only present in segwit txs)
+    if segwit {
+        for _ in 0..vin_count {
+            let n_items_u64 = read_varint(bc)?;
+            ensure_len("tx", "witness_item_count", n_items_u64, 10_000)?;
+            let n_items = n_items_u64 as usize;
+
+            for _ in 0..n_items {
+                let item_len_u64 = read_varint(bc)?;
+                ensure_len("tx", "witness_item_len", item_len_u64, 4_000_000)?;
+                let _ = bc.take(item_len_u64 as usize)?;
+            }
+        }
+    }
+
+    let _locktime = bc.take(4)?;
+    Ok(())
+}
+
+pub(crate) fn decode_bip34_height(coinbase_script: &[u8]) -> u64 {
+    if coinbase_script.is_empty() {
+        return 0;
+    }
+    let n = coinbase_script[0] as usize;
+    if n == 0 || 1 + n > coinbase_script.len() || n > 8 {
+        return 0;
+    }
+    let mut val: u64 = 0;
+    for (i, b) in coinbase_script[1..1 + n].iter().enumerate() {
+        val |= (*b as u64) << (8 * i);
+    }
+    val
+}
+
+pub(crate) fn coinbase_extract_script_and_outsum(
+    raw_tx: &[u8],
+) -> Result<(Vec<u8>, u64), String> {
+    let mut c = Cursor::new(raw_tx);
+    let _version = c.take_u32_le()?;
+
+    let p = c.take_u8()?;
+    if p == 0x00 {
+        let _ = c.take_u8()?;
+    } else {
+        c.i -= 1;
+    }
+
+    let vin_n = read_varint(&mut c)?;
+    if vin_n != 1 {
+        return Err(err("INVALID_COINBASE", "coinbase must have exactly 1 input"));
+    }
+
+    let prev = c.take(32)?;
+    let vout = c.take_u32_le()?;
+    if prev.iter().any(|&b| b != 0) || vout != 0xffff_ffff {
+        return Err(err(
+            "INVALID_COINBASE",
+            "coinbase input outpoint must be (32x00, vout=0xffffffff)",
+        ));
+    }
+
+    let script_len = read_varint(&mut c)? as usize;
+    let script = c.take(script_len)?.to_vec();
+
+    let _ = c.take(4)?;
+
+    let vout_n = read_varint(&mut c)?;
+    let mut outsum: u64 = 0;
+    for _ in 0..vout_n {
+        let value = c.take_u64_le()?;
+        outsum = outsum.saturating_add(value);
+        let spk_len = read_varint(&mut c)? as usize;
+        let _ = c.take(spk_len)?;
+    }
+
+    Ok((script, outsum))
+}
+
+
+# =================== btc/block/undo.rs
+
+// src/btc/block/undo.rs
+
+use super::parser;
+
+use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::PublicKey;
+
+type UndoPrevouts = Vec<Vec<(u64, Vec<u8>)>>;
+
+fn err(code: &str, msg: impl AsRef<str>) -> String {
+    format!("{code}: {}", msg.as_ref())
+}
+
+fn ensure_len(kind: &str, field: &str, val: u64, max: u64) -> Result<(), String> {
+    parser::ensure_len(kind, field, val, max)
+}
+
+fn read_varint_core(c: &mut parser::Cursor) -> Result<u64, String> {
+    // Bitcoin Core base-128 VarInt encoding (serialize.h)
+    let mut n: u64 = 0;
+    loop {
+        let ch = c.take_u8()? as u64;
+        let data = ch & 0x7f;
+        n = (n << 7) | data;
+        if (ch & 0x80) != 0 {
+            n = n.checked_add(1).ok_or_else(|| err("VARINT_OVERFLOW", "core varint overflow"))?;
+            continue;
+        }
+        return Ok(n);
+    }
+}
+
+fn read_compactsize(c: &mut parser::Cursor) -> Result<u64, String> {
+    // Bitcoin CompactSize
+    let first = c.take_u8()?;
+    match first {
+        0x00..=0xfc => Ok(first as u64),
+        0xfd => Ok(c.take_u16_le()? as u64),
+        0xfe => Ok(c.take_u32_le()? as u64),
+        0xff => Ok(c.take_u64_le()?),
+    }
+}
+
+fn decompress_amount(x: u64) -> u64 {
+    if x == 0 {
+        return 0;
+    }
+    let mut x = x - 1;
+    let e = (x % 10) as u32;
+    x /= 10;
+
+    let mut n: u64;
+    if e < 9 {
+        let d = (x % 9) + 1;
+        x /= 9;
+        n = x * 10 + d;
+    } else {
+        n = x + 1;
+    }
+
+    for _ in 0..e {
+        n *= 10;
+    }
+    n
+}
+
+fn decompress_uncompressed_pubkey_from_x(x32: &[u8], y_is_odd: bool) -> Result<Vec<u8>, String> {
+    if x32.len() != 32 {
+        return Err(err("INVALID_PUBKEY", "x32 must be 32 bytes"));
+    }
+
+    let mut comp = [0u8; 33];
+    comp[0] = if y_is_odd { 0x03 } else { 0x02 };
+    comp[1..].copy_from_slice(x32);
+
+    let pk = PublicKey::from_sec1_bytes(&comp)
+        .map_err(|_| err("INVALID_PUBKEY", "failed to decompress pubkey from x"))?;
+
+    let enc = pk.to_encoded_point(false);
+    let bytes = enc.as_bytes();
+    if bytes.len() != 65 || bytes[0] != 0x04 {
+        return Err(err("INVALID_PUBKEY", "unexpected uncompressed encoding"));
+    }
+
+    Ok(bytes.to_vec())
+}
+
+fn read_compressed_script(c: &mut parser::Cursor) -> Result<Vec<u8>, String> {
+    // ScriptCompressor uses Bitcoin Core base-128 VarInt (not CompactSize).
+    let nsize = read_varint_core(c)?;
+
+    match nsize {
+        0 => {
+            let h160 = c.take(20)?;
+            let mut spk = Vec::with_capacity(25);
+            spk.extend_from_slice(&[0x76, 0xa9, 0x14]);
+            spk.extend_from_slice(h160);
+            spk.extend_from_slice(&[0x88, 0xac]);
+            Ok(spk)
+        }
+        1 => {
+            let h160 = c.take(20)?;
+            let mut spk = Vec::with_capacity(23);
+            spk.extend_from_slice(&[0xa9, 0x14]);
+            spk.extend_from_slice(h160);
+            spk.push(0x87);
+            Ok(spk)
+        }
+        2 | 3 => {
+            let x = c.take(32)?;
+            let prefix = if nsize == 2 { 0x02 } else { 0x03 };
+            let mut pubkey = Vec::with_capacity(33);
+            pubkey.push(prefix);
+            pubkey.extend_from_slice(x);
+
+            let mut spk = Vec::with_capacity(35);
+            spk.push(0x21);
+            spk.extend_from_slice(&pubkey);
+            spk.push(0xac);
+            Ok(spk)
+        }
+        4 | 5 => {
+            let x = c.take(32)?;
+            let y_is_odd = nsize == 5;
+            let pubkey65 = decompress_uncompressed_pubkey_from_x(x, y_is_odd)?;
+
+            let mut spk = Vec::with_capacity(67);
+            spk.push(0x41);
+            spk.extend_from_slice(&pubkey65);
+            spk.push(0xac);
+            Ok(spk)
+        }
+        _ => {
+            if nsize < 6 {
+                return Err(err("INVALID_SCRIPT_COMPRESSION", "nsize < 6 unexpected"));
+            }
+
+            let raw_len_u64 = nsize - 6;
+            ensure_len("undo", "compressed_script_raw_len", raw_len_u64, 100_000)?;
+
+            let raw_len: usize = usize::try_from(raw_len_u64)
+                .map_err(|_| err("LEN_OVERFLOW", format!("raw_len too large for usize: {raw_len_u64}")))?;
+
+            Ok(c.take(raw_len)?.to_vec())
+        }
+    }
+}
+
+fn read_one_inundo(rc: &mut parser::Cursor) -> Result<(u64, Vec<u8>), String> {
+    let ncode = read_varint_core(rc)?;
+    let height = ncode >> 1;
+
+    if height > 0 {
+        let _tx_version = read_varint_core(rc)?;
+    }
+
+    let comp_amt = read_varint_core(rc)?;
+    let spk = read_compressed_script(rc)?;
+    let value_sats = decompress_amount(comp_amt);
+
+    if spk.len() > 100_000 {
+        return Err(err("INSANE_LEN", format!("spk too large: {}", spk.len())));
+    }
+
+    Ok((value_sats, spk))
+}
+
+fn read_undo_for_block_from_cursor(
+    rc: &mut parser::Cursor,
+    vin_counts_non_cb: &[u64],
+) -> Result<UndoPrevouts, String> {
+    // CBlockUndo: CompactSize(nTxUndo)
+    // Usually tx_count - 1, but some fixtures include an extra empty CTxUndo for coinbase.
+    let n_txundo = read_compactsize(rc)?;
+    ensure_len("undo", "n_txundo", n_txundo, 200_000)?;
+
+    let expected = vin_counts_non_cb.len() as u64;
+
+    let mut has_cb_undo = false;
+    if n_txundo == expected {
+        // ok
+    } else if n_txundo == expected.saturating_add(1) {
+        has_cb_undo = true;
+    } else {
+        return Err(err(
+            "UNDO_MISMATCH",
+            format!(
+                "undo txundo count mismatch: undo={}, expected={} (or {} if coinbase included)",
+                n_txundo,
+                expected,
+                expected.saturating_add(1)
+            ),
+        ));
+    }
+
+    if has_cb_undo {
+        let cb_vin_n = read_compactsize(rc)?;
+        if cb_vin_n != 0 {
+            return Err(err(
+                "UNDO_MISMATCH",
+                format!("coinbase undo present but vin_n != 0: got={cb_vin_n}"),
+            ));
+        }
+    }
+
+    let mut all: UndoPrevouts = Vec::with_capacity(vin_counts_non_cb.len());
+
+    for (txundo_idx, &vin_expected) in vin_counts_non_cb.iter().enumerate() {
+        let vin_n = read_compactsize(rc)?;
+        ensure_len("undo", "vin_count", vin_n, 100_000)?;
+
+        if vin_n != vin_expected {
+            return Err(err(
+                "UNDO_MISMATCH",
+                format!(
+                    "undo vin count mismatch: txundo_idx={} undo={} expected={}",
+                    txundo_idx, vin_n, vin_expected
+                ),
+            ));
+        }
+
+        let mut ins = Vec::with_capacity(vin_n as usize);
+        for _ in 0..(vin_n as usize) {
+            ins.push(read_one_inundo(rc)?);
+        }
+        all.push(ins);
+    }
+
+    Ok(all)
+}
+
+pub(crate) fn parse_undo_payload_strict(undo_payload: &[u8], vin_counts_non_cb: &[u64]) -> Result<UndoPrevouts, String> {
+    let mut uc = parser::Cursor::new(undo_payload);
+    let v = read_undo_for_block_from_cursor(&mut uc, vin_counts_non_cb)?;
+    if uc.remaining() != 0 {
+        return Err(err(
+            "UNDO_TRAILING_BYTES",
+            format!("undo payload has {} trailing bytes", uc.remaining()),
+        ));
+    }
+    Ok(v)
+}
+
+pub(crate) fn extract_vin_count(raw_tx: &[u8]) -> Result<u64, String> {
+    let mut c = parser::Cursor::new(raw_tx);
+    let _ver = c.take_u32_le()?;
+
+    let p = c.take_u8()?;
+    if p == 0x00 {
+        let _f = c.take_u8()?;
+    } else {
+        c.i -= 1;
+    }
+
+    parser::read_varint(&mut c)
+}
+
+pub(crate) fn extract_vin_count_from_slice(raw_tx: &[u8]) -> Result<u64, String> {
+    extract_vin_count(raw_tx)
+}
+
+pub(crate) fn validate_undo_payload_against_block(
+    block: &[u8],
+    undo_payload: &[u8],
+) -> Result<(), String> {
+    let mut bc = parser::Cursor::new(block);
+
+    if bc.remaining() < 80 {
+        return Err(err("INVALID_BLOCK", "block payload too small for header"));
+    }
+
+    // Skip header (no allocation)
+    let _header = bc.take(80)?;
+
+    let tx_count = parser::read_varint(&mut bc)?;
+    if tx_count == 0 {
+        return Err(err("INVALID_BLOCK", "block has zero transactions"));
+    }
+
+    // We only need vin-counts for non-coinbase txs.
+    // Parse each tx as a slice range without copying.
+    let mut vin_counts_non_cb: Vec<u64> =
+        Vec::with_capacity((tx_count as usize).saturating_sub(1));
+
+    for tx_idx in 0..(tx_count as usize) {
+        let start = bc.pos();
+        let _txid_le = parser::parse_tx_skip_and_txid_le(block, &mut bc)?;
+        let end = bc.pos();
+
+        if tx_idx == 0 {
+            // coinbase: ignore
+            continue;
+        }
+
+        vin_counts_non_cb.push(extract_vin_count_from_slice(&block[start..end])?);
+    }
+
+    // Validate that undo payload parses cleanly against computed vin counts
+    let _ = parse_undo_payload_strict(undo_payload, &vin_counts_non_cb)?;
+    Ok(())
+}
+
+
+# =================== btc/block/report.rs
+
+// src/btc/block/report.rs
+
+use serde::Serialize;
+use std::collections::BTreeMap;
+
+use crate::btc::tx::TxReport;
+
+#[derive(Debug, Serialize)]
+pub struct BlockReport {
+    pub ok: bool,
+    /// Always "block" in block parsing mode.
+    pub mode: &'static str,
+    pub block_header: BlockHeaderReport,
+    pub tx_count: u64,
+    pub coinbase: CoinbaseReport,
+    pub transactions: Vec<TxReport>,
+    pub block_stats: BlockStatsReport,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BlockHeaderReport {
+    pub version: u32,
+    pub prev_block_hash: String,
+    pub merkle_root: String,
+    pub merkle_root_valid: bool,
+    pub timestamp: u32,
+    pub bits: String,
+    pub nonce: u32,
+    pub block_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CoinbaseReport {
+    pub bip34_height: u64,
+    pub coinbase_script_hex: String,
+    pub total_output_sats: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BlockStatsReport {
+    pub total_fees_sats: u64,
+    pub total_weight: u64,
+    pub avg_fee_rate_sat_vb: f64,
+    /// Map of script_type -> count. Using BTreeMap keeps JSON output deterministic.
+    pub script_type_summary: BTreeMap<String, u64>,
+}
+
+
+# =================== btc/mod.rs
+
+// src/btc/mod.rs
+
+// This module organizes Bitcoin functionality.
+// Submodules define transaction and block analysis.
+// Accessible as `chainlens::btc::tx` and `chainlens::btc::block`.
+pub mod block;
+pub mod tx;
+
+
+# =================== btc/tx.rs
+
+// src/btc/tx.rs
+
+use ahash::AHashMap;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::hash::{Hash, Hasher};
+
+#[derive(Debug, Clone)]
+pub struct Prevout {
+    pub txid_hex: String,
+    pub vout: u32,
+    pub value_sats: u64,
+    pub script_pubkey_hex: String,
+}
+
+// README schema expects warnings as an array of objects that only contain { code }
+#[derive(Debug, Serialize)]
+pub struct WarningItem {
+    pub code: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SegwitSavings {
+    pub witness_bytes: usize,
+    pub non_witness_bytes: usize,
+    pub total_bytes: usize,
+    pub weight_actual: usize,
+    pub weight_if_legacy: usize,
+    pub savings_pct: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PrevoutInfo {
+    pub value_sats: u64,
+    pub script_pubkey_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RelativeTimelock {
+    pub enabled: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>, // "blocks" | "time"
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<u64>, // blocks OR seconds
+}
+
+#[derive(Debug, Serialize)]
+pub struct VinReport {
+    pub txid: String,
+    pub vout: u32,
+    pub sequence: u32,
+    pub script_sig_hex: String,
+    pub script_asm: String,
+    pub witness: Vec<String>,
+    /// Only present for p2wsh and p2sh-p2wsh spends (disassembly of the witnessScript).
+    pub witness_script_asm: Option<String>,
+    pub script_type: String,
+    pub address: Option<String>,
+    pub prevout: PrevoutInfo,
+    pub relative_timelock: RelativeTimelock,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VoutReport {
+    pub n: u32,
+    pub value_sats: u64,
+    pub script_pubkey_hex: String,
+    pub script_asm: String,
+    pub script_type: String,
+    pub address: Option<String>,
+
+    pub op_return_data_hex: Option<String>,
+    pub op_return_data_utf8: Option<String>,
+    pub op_return_protocol: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TxReport {
+    pub ok: bool,
+    pub network: String,
+    pub segwit: bool,
+    pub txid: String,
+    pub wtxid: Option<String>,
+    pub version: u32,
+    pub locktime: u32,
+    pub locktime_value: u32,
+    pub size_bytes: usize,
+    pub weight: usize,
+    pub vbytes: usize,
+    pub fee_sats: i64,
+    pub fee_rate_sat_vb: f64,
+    pub total_input_sats: u64,
+    pub total_output_sats: u64,
+    pub rbf_signaling: bool,
+    pub locktime_type: String,
+
+    pub vin: Vec<VinReport>,
+    pub vout: Vec<VoutReport>,
+    pub warnings: Vec<WarningItem>,
+    pub segwit_savings: Option<SegwitSavings>,
+}
+
+struct Cursor<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Self { b, i: 0 }
+    }
+
+    fn backtrack_1(&mut self) -> Result<(), String> {
+        if self.i == 0 {
+            return Err("cursor underflow".into());
+        }
+        self.i -= 1;
+        Ok(())
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        if self.i + n > self.b.len() {
+            return Err("unexpected EOF".into());
+        }
+        let s = &self.b[self.i..self.i + n];
+        self.i += n;
+        Ok(s)
+    }
+
+    fn take_u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn take_u32_le(&mut self) -> Result<u32, String> {
+        let s = self.take(4)?;
+        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    fn take_u64_le(&mut self) -> Result<u64, String> {
+        let s = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
+    }
+
+    fn remaining(&self) -> usize {
+        self.b.len().saturating_sub(self.i)
+    }
+}
+
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
+    hex::decode(hex).map_err(|_| "invalid hex".to_string())
+}
+
+fn bytes_to_hex(b: &[u8]) -> String {
+    hex::encode(b)
+}
+
+fn dsha256(data: &[u8]) -> [u8; 32] {
+    let h1 = Sha256::digest(data);
+    let h2 = Sha256::digest(h1);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h2);
+    out
+}
+
+fn hash_to_display_hex(hash_le: [u8; 32]) -> String {
+    let mut be = hash_le;
+    be.reverse();
+    bytes_to_hex(&be)
+}
+
+/// Streaming double-SHA256 writer (lets us compute txid without allocating a "stripped" buffer).
+struct Dsha256Writer {
+    h: Sha256,
+    len: usize,
+}
+
+impl Dsha256Writer {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            h: Sha256::new(),
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        self.h.update(bytes);
+        self.len += bytes.len();
+    }
+
+    #[inline]
+    fn finish(self) -> [u8; 32] {
+        let h1 = self.h.finalize();
+        let h2 = Sha256::digest(h1);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&h2);
+        out
+    }
+}
+
+#[inline]
+fn write_varint_hasher(out: &mut Dsha256Writer, n: u64) {
+    match n {
+        0x00..=0xfc => out.write(&[n as u8]),
+        0xfd..=0xffff => {
+            let b0 = 0xfdu8;
+            let le = (n as u16).to_le_bytes();
+            out.write(&[b0]);
+            out.write(&le);
+        }
+        0x1_0000..=0xffff_ffff => {
+            let b0 = 0xfeu8;
+            let le = (n as u32).to_le_bytes();
+            out.write(&[b0]);
+            out.write(&le);
+        }
+        _ => {
+            let b0 = 0xffu8;
+            let le = n.to_le_bytes();
+            out.write(&[b0]);
+            out.write(&le);
+        }
+    }
+}
+
+fn read_varint(c: &mut Cursor) -> Result<u64, String> {
+    let n = c.take_u8()? as u64;
+    match n {
+        0x00..=0xfc => Ok(n),
+        0xfd => {
+            let s = c.take(2)?;
+            Ok(u16::from_le_bytes([s[0], s[1]]) as u64)
+        }
+        0xfe => Ok(c.take_u32_le()? as u64),
+        0xff => Ok(c.take_u64_le()?),
+        _ => Err("invalid varint prefix".into()),
+    }
+}
+
+fn script_type(spk: &[u8]) -> String {
+    if spk.len() == 25
+        && spk[0] == 0x76
+        && spk[1] == 0xa9
+        && spk[2] == 0x14
+        && spk[23] == 0x88
+        && spk[24] == 0xac
+    {
+        return "p2pkh".into();
+    }
+    if spk.len() == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87 {
+        return "p2sh".into();
+    }
+    if spk.len() == 22 && spk[0] == 0x00 && spk[1] == 0x14 {
+        return "p2wpkh".into();
+    }
+    if spk.len() == 34 && spk[0] == 0x00 && spk[1] == 0x20 {
+        return "p2wsh".into();
+    }
+    if spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20 {
+        return "p2tr".into();
+    }
+    if !spk.is_empty() && spk[0] == 0x6a {
+        return "op_return".into();
+    }
+    "unknown".into()
+}
+
+fn parse_op_return_data(spk: &[u8]) -> Option<Vec<u8>> {
+    // scriptPubKey for OP_RETURN outputs is typically:
+    // OP_RETURN <pushdata...> [<pushdata...> ...]
+    // Requirement: concatenate *all* data pushes after OP_RETURN, in order.
+    if spk.is_empty() || spk[0] != 0x6a {
+        return None;
+    }
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut i: usize = 1; // after OP_RETURN
+
+    while i < spk.len() {
+        let op = spk[i];
+        i += 1;
+
+        // OP_0 pushes an empty vector.
+        if op == 0x00 {
+            continue;
+        }
+
+        let (n, is_push) = match op {
+            0x01..=0x4b => (op as usize, true),
+            0x4c => {
+                if i + 1 > spk.len() {
+                    return None;
+                }
+                let n = spk[i] as usize;
+                i += 1;
+                (n, true)
+            }
+            0x4d => {
+                if i + 2 > spk.len() {
+                    return None;
+                }
+                let n = u16::from_le_bytes([spk[i], spk[i + 1]]) as usize;
+                i += 2;
+                (n, true)
+            }
+            0x4e => {
+                if i + 4 > spk.len() {
+                    return None;
+                }
+                let n = u32::from_le_bytes([spk[i], spk[i + 1], spk[i + 2], spk[i + 3]]) as usize;
+                i += 4;
+                (n, true)
+            }
+            _ => (0, false),
+        };
+
+        // Stop at first non-push opcode (requirement only concerns pushes).
+        if !is_push {
+            break;
+        }
+
+        if i + n > spk.len() {
+            return None;
+        }
+
+        out.extend_from_slice(&spk[i..i + n]);
+        i += n;
+    }
+
+    Some(out)
+}
+
+#[inline]
+fn opcode_name(op: u8) -> String {
+    // Bitcoin Core Script opcode names.
+    // Unknown / undefined opcodes must render as OP_UNKNOWN_0xNN.
+    let s: Option<&'static str> = match op {
+        0x00 => Some("OP_0"),
+        0x4c => Some("OP_PUSHDATA1"),
+        0x4d => Some("OP_PUSHDATA2"),
+        0x4e => Some("OP_PUSHDATA4"),
+        0x4f => Some("OP_1NEGATE"),
+        0x50 => Some("OP_RESERVED"),
+        0x51 => Some("OP_1"),
+        0x52 => Some("OP_2"),
+        0x53 => Some("OP_3"),
+        0x54 => Some("OP_4"),
+        0x55 => Some("OP_5"),
+        0x56 => Some("OP_6"),
+        0x57 => Some("OP_7"),
+        0x58 => Some("OP_8"),
+        0x59 => Some("OP_9"),
+        0x5a => Some("OP_10"),
+        0x5b => Some("OP_11"),
+        0x5c => Some("OP_12"),
+        0x5d => Some("OP_13"),
+        0x5e => Some("OP_14"),
+        0x5f => Some("OP_15"),
+        0x60 => Some("OP_16"),
+        0x61 => Some("OP_NOP"),
+        0x62 => Some("OP_VER"),
+        0x63 => Some("OP_IF"),
+        0x64 => Some("OP_NOTIF"),
+        0x65 => Some("OP_VERIF"),
+        0x66 => Some("OP_VERNOTIF"),
+        0x67 => Some("OP_ELSE"),
+        0x68 => Some("OP_ENDIF"),
+        0x69 => Some("OP_VERIFY"),
+        0x6a => Some("OP_RETURN"),
+        0x6b => Some("OP_TOALTSTACK"),
+        0x6c => Some("OP_FROMALTSTACK"),
+        0x6d => Some("OP_2DROP"),
+        0x6e => Some("OP_2DUP"),
+        0x6f => Some("OP_3DUP"),
+        0x70 => Some("OP_2OVER"),
+        0x71 => Some("OP_2ROT"),
+        0x72 => Some("OP_2SWAP"),
+        0x73 => Some("OP_IFDUP"),
+        0x74 => Some("OP_DEPTH"),
+        0x75 => Some("OP_DROP"),
+        0x76 => Some("OP_DUP"),
+        0x77 => Some("OP_NIP"),
+        0x78 => Some("OP_OVER"),
+        0x79 => Some("OP_PICK"),
+        0x7a => Some("OP_ROLL"),
+        0x7b => Some("OP_ROT"),
+        0x7c => Some("OP_SWAP"),
+        0x7d => Some("OP_TUCK"),
+        0x7e => Some("OP_CAT"),
+        0x7f => Some("OP_SUBSTR"),
+        0x80 => Some("OP_LEFT"),
+        0x81 => Some("OP_RIGHT"),
+        0x82 => Some("OP_SIZE"),
+        0x83 => Some("OP_INVERT"),
+        0x84 => Some("OP_AND"),
+        0x85 => Some("OP_OR"),
+        0x86 => Some("OP_XOR"),
+        0x87 => Some("OP_EQUAL"),
+        0x88 => Some("OP_EQUALVERIFY"),
+        0x89 => Some("OP_RESERVED1"),
+        0x8a => Some("OP_RESERVED2"),
+        0x8b => Some("OP_1ADD"),
+        0x8c => Some("OP_1SUB"),
+        0x8d => Some("OP_2MUL"),
+        0x8e => Some("OP_2DIV"),
+        0x8f => Some("OP_NEGATE"),
+        0x90 => Some("OP_ABS"),
+        0x91 => Some("OP_NOT"),
+        0x92 => Some("OP_0NOTEQUAL"),
+        0x93 => Some("OP_ADD"),
+        0x94 => Some("OP_SUB"),
+        0x95 => Some("OP_MUL"),
+        0x96 => Some("OP_DIV"),
+        0x97 => Some("OP_MOD"),
+        0x98 => Some("OP_LSHIFT"),
+        0x99 => Some("OP_RSHIFT"),
+        0x9a => Some("OP_BOOLAND"),
+        0x9b => Some("OP_BOOLOR"),
+        0x9c => Some("OP_NUMEQUAL"),
+        0x9d => Some("OP_NUMEQUALVERIFY"),
+        0x9e => Some("OP_NUMNOTEQUAL"),
+        0x9f => Some("OP_LESSTHAN"),
+        0xa0 => Some("OP_GREATERTHAN"),
+        0xa1 => Some("OP_LESSTHANOREQUAL"),
+        0xa2 => Some("OP_GREATERTHANOREQUAL"),
+        0xa3 => Some("OP_MIN"),
+        0xa4 => Some("OP_MAX"),
+        0xa5 => Some("OP_WITHIN"),
+        0xa6 => Some("OP_RIPEMD160"),
+        0xa7 => Some("OP_SHA1"),
+        0xa8 => Some("OP_SHA256"),
+        0xa9 => Some("OP_HASH160"),
+        0xaa => Some("OP_HASH256"),
+        0xab => Some("OP_CODESEPARATOR"),
+        0xac => Some("OP_CHECKSIG"),
+        0xad => Some("OP_CHECKSIGVERIFY"),
+        0xae => Some("OP_CHECKMULTISIG"),
+        0xaf => Some("OP_CHECKMULTISIGVERIFY"),
+        0xb0 => Some("OP_NOP1"),
+        0xb1 => Some("OP_CHECKLOCKTIMEVERIFY"),
+        0xb2 => Some("OP_CHECKSEQUENCEVERIFY"),
+        0xb3 => Some("OP_NOP4"),
+        0xb4 => Some("OP_NOP5"),
+        0xb5 => Some("OP_NOP6"),
+        0xb6 => Some("OP_NOP7"),
+        0xb7 => Some("OP_NOP8"),
+        0xb8 => Some("OP_NOP9"),
+        0xb9 => Some("OP_NOP10"),
+        0xba => Some("OP_CHECKSIGADD"),
+        0xfd => Some("OP_PUBKEYHASH"),
+        0xfe => Some("OP_PUBKEY"),
+        0xff => Some("OP_INVALIDOPCODE"),
+        _ => None,
+    };
+
+    if let Some(name) = s {
+        name.to_string()
+    } else {
+        format!("OP_UNKNOWN_0x{:02x}", op)
+    }
+}
+
+fn disasm_script(script: &[u8]) -> String {
+    if script.is_empty() {
+        return String::new();
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut i: usize = 0;
+
+    while i < script.len() {
+        let op = script[i];
+        i += 1;
+
+        // Direct push
+        if (0x01..=0x4b).contains(&op) {
+            let n = op as usize;
+            if i + n > script.len() {
+                break;
+            }
+            out.push(format!("OP_PUSHBYTES_{} {}", n, bytes_to_hex(&script[i..i + n])));
+            i += n;
+            continue;
+        }
+
+        match op {
+            0x00 => out.push("OP_0".to_string()),
+            0x4c => {
+                if i + 1 > script.len() {
+                    break;
+                }
+                let n = script[i] as usize;
+                i += 1;
+                if i + n > script.len() {
+                    break;
+                }
+                out.push(format!("OP_PUSHDATA1 {}", bytes_to_hex(&script[i..i + n])));
+                i += n;
+            }
+            0x4d => {
+                if i + 2 > script.len() {
+                    break;
+                }
+                let n = u16::from_le_bytes([script[i], script[i + 1]]) as usize;
+                i += 2;
+                if i + n > script.len() {
+                    break;
+                }
+                out.push(format!("OP_PUSHDATA2 {}", bytes_to_hex(&script[i..i + n])));
+                i += n;
+            }
+            0x4e => {
+                if i + 4 > script.len() {
+                    break;
+                }
+                let n = u32::from_le_bytes([script[i], script[i + 1], script[i + 2], script[i + 3]]) as usize;
+                i += 4;
+                if i + n > script.len() {
+                    break;
+                }
+                out.push(format!("OP_PUSHDATA4 {}", bytes_to_hex(&script[i..i + n])));
+                i += n;
+            }
+            _ => out.push(opcode_name(op)),
+        }
+    }
+
+    out.join(" ")
+}
+
+fn extract_last_push(script: &[u8]) -> Option<&[u8]> {
+    // Returns the data bytes of the last push in a script (used for P2SH redeemScript detection).
+    // Only considers canonical push opcodes (direct pushes and PUSHDATA1/2/4).
+    let mut i = 0usize;
+    let mut last: Option<&[u8]> = None;
+
+    while i < script.len() {
+        let op = script[i];
+        i += 1;
+
+        let n_opt: Option<usize> = match op {
+            0x01..=0x4b => Some(op as usize),
+            0x4c => {
+                if i + 1 > script.len() {
+                    return None;
+                }
+                let n = script[i] as usize;
+                i += 1;
+                Some(n)
+            }
+            0x4d => {
+                if i + 2 > script.len() {
+                    return None;
+                }
+                let n = u16::from_le_bytes([script[i], script[i + 1]]) as usize;
+                i += 2;
+                Some(n)
+            }
+            0x4e => {
+                if i + 4 > script.len() {
+                    return None;
+                }
+                let n = u32::from_le_bytes([script[i], script[i + 1], script[i + 2], script[i + 3]]) as usize;
+                i += 4;
+                Some(n)
+            }
+            0x00 => Some(0),
+            _ => None,
+        };
+
+        let Some(n) = n_opt else {
+            continue;
+        };
+
+        if i + n > script.len() {
+            return None;
+        }
+        let data = &script[i..i + n];
+        i += n;
+        last = Some(data);
+    }
+
+    last
+}
+
+#[inline]
+fn is_p2pkh_spk(spk: &[u8]) -> bool {
+    spk.len() == 25
+        && spk[0] == 0x76
+        && spk[1] == 0xa9
+        && spk[2] == 0x14
+        && spk[23] == 0x88
+        && spk[24] == 0xac
+}
+
+#[inline]
+fn is_p2sh_spk(spk: &[u8]) -> bool {
+    spk.len() == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87
+}
+
+#[inline]
+fn is_p2wpkh_spk(spk: &[u8]) -> bool {
+    spk.len() == 22 && spk[0] == 0x00 && spk[1] == 0x14
+}
+
+#[inline]
+fn is_p2wsh_spk(spk: &[u8]) -> bool {
+    spk.len() == 34 && spk[0] == 0x00 && spk[1] == 0x20
+}
+
+#[inline]
+fn is_p2tr_spk(spk: &[u8]) -> bool {
+    spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20
+}
+
+fn classify_input_spend(
+    prevout_spk: &[u8],
+    script_sig: &[u8],
+    witness_items: &[Vec<u8>],
+) -> (String, Option<String>) {
+    // Returns (script_type, witness_script_asm).
+    // witness_script_asm is only set for p2wsh and p2sh-p2wsh per README.
+
+    if is_p2pkh_spk(prevout_spk) {
+        return ("p2pkh".to_string(), None);
+    }
+    if is_p2wpkh_spk(prevout_spk) {
+        return ("p2wpkh".to_string(), None);
+    }
+    if is_p2wsh_spk(prevout_spk) {
+        let ws_asm = witness_items.last().map(|b| disasm_script(b));
+        return ("p2wsh".to_string(), ws_asm);
+    }
+    if is_p2tr_spk(prevout_spk) {
+        if witness_items.len() == 1 && witness_items[0].len() == 64 {
+            return ("p2tr_keypath".to_string(), None);
+        }
+        if let Some(last) = witness_items.last() {
+            if !last.is_empty() && (last[0] == 0xc0 || last[0] == 0xc1) {
+                return ("p2tr_scriptpath".to_string(), None);
+            }
+        }
+        return ("unknown".to_string(), None);
+    }
+    if is_p2sh_spk(prevout_spk) {
+        let Some(rs) = extract_last_push(script_sig) else {
+            return ("unknown".to_string(), None);
+        };
+        if is_p2wpkh_spk(rs) {
+            return ("p2sh-p2wpkh".to_string(), None);
+        }
+        if is_p2wsh_spk(rs) {
+            let ws_asm = witness_items.last().map(|b| disasm_script(b));
+            return ("p2sh-p2wsh".to_string(), ws_asm);
+        }
+        return ("unknown".to_string(), None);
+    }
+
+    ("unknown".to_string(), None)
+}
+
+#[inline]
+fn locktime_type(locktime: u32) -> String {
+    if locktime == 0 {
+        return "none".into();
+    }
+    // Consensus convention: < 500_000_000 => block height, else unix timestamp
+    if locktime < 500_000_000 {
+        "block_height".into()
+    } else {
+        "unix_timestamp".into()
+    }
+}
+
+#[inline]
+fn relative_timelock(version: u32, sequence: u32) -> RelativeTimelock {
+    // BIP68 only applies to tx version >= 2
+    if version < 2 {
+        return RelativeTimelock {
+            enabled: false,
+            r#type: None,
+            value: None,
+        };
+    }
+
+    // Disable flag (bit 31) => disabled
+    if (sequence & (1u32 << 31)) != 0 {
+        return RelativeTimelock {
+            enabled: false,
+            r#type: None,
+            value: None,
+        };
+    }
+
+    // Low 16 bits are the value
+    let v = (sequence & 0x0000_ffff) as u64;
+
+    // Type flag (bit 22): 0 = blocks, 1 = time (512-second units)
+    if (sequence & (1u32 << 22)) != 0 {
+        RelativeTimelock {
+            enabled: true,
+            r#type: Some("time".into()),
+            value: Some(v * 512),
+        }
+    } else {
+        RelativeTimelock {
+            enabled: true,
+            r#type: Some("blocks".into()),
+            value: Some(v),
+        }
+    }
+}
+
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct PrevoutKey {
+    // txid in little-endian bytes (matches tx serialization)
+    txid_le: [u8; 32],
+    vout: u32,
+}
+
+impl Hash for PrevoutKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write(&self.txid_le);
+        state.write_u32(self.vout);
+    }
+}
+
+/// Fast path for block-mode: analyze a transaction from raw bytes and an *ordered* prevout list.
+///
+/// `prevouts_ordered` must be in the same order as the transaction inputs (vin order).
+/// Each entry is `(value_sats, script_pubkey_bytes)`.
+///
+/// This avoids hex decoding/encoding and avoids building a prevout HashMap.
+pub fn analyze_tx_from_bytes_ordered(
+    network: &str,
+    raw: &[u8],
+    prevouts_ordered: &[(u64, Vec<u8>)],
+) -> Result<TxReport, String> {
+    #[inline]
+    fn txid_le_slice_to_display_hex(txid_le: &[u8]) -> String {
+        let mut be = [0u8; 32];
+        be.copy_from_slice(txid_le);
+        be.reverse();
+        hex::encode(be)
+    }
+
+    let size_bytes = raw.len();
+    let mut c = Cursor::new(raw);
+
+    // --- Header / segwit detection ---
+    let version = c.take_u32_le()?;
+
+    let mut segwit = false;
+    let peek = c.take_u8()?;
+    if peek == 0x00 {
+        let flag = c.take_u8()?;
+        if flag != 0x01 {
+            return Err("invalid segwit flag".into());
+        }
+        segwit = true;
+    } else {
+        c.backtrack_1()?;
+    }
+
+    // For legacy txs, txid is just dSHA256(raw) and wtxid must be null.
+    // For segwit txs, wtxid is dSHA256(raw) and txid is dSHA256(stripped).
+    let (wtxid_full, mut txid_hasher) = if segwit {
+        (Some(hash_to_display_hex(dsha256(raw))), Some(Dsha256Writer::new()))
+    } else {
+        (None, None)
+    };
+
+    if let Some(h) = txid_hasher.as_mut() {
+        h.write(&version.to_le_bytes());
+        // marker+flag are NOT included in txid serialization
+    }
+
+    // --- VIN ---
+    let vin_count_u64 = read_varint(&mut c)?;
+    let vin_count = vin_count_u64 as usize;
+    if let Some(h) = txid_hasher.as_mut() {
+        write_varint_hasher(h, vin_count_u64);
+    }
+
+    let mut vin_outpoints: Vec<(String, u32)> = Vec::with_capacity(vin_count);
+    let mut vin_script_sig_hex: Vec<String> = Vec::with_capacity(vin_count);
+    let mut vin_script_sig_asm: Vec<String> = Vec::with_capacity(vin_count);
+    let mut vin_script_sig_bytes: Vec<Vec<u8>> = Vec::with_capacity(vin_count);
+    let mut vin_sequences: Vec<u32> = Vec::with_capacity(vin_count);
+
+    let mut rbf_signaling = false;
+    let mut coinbase = false;
+
+    for _ in 0..vin_count {
+        let prev_txid_le_bytes = c.take(32)?;
+        let prev_vout = c.take_u32_le()?;
+
+        if !coinbase
+            && vin_count == 1
+            && prev_vout == 0xffff_ffff
+            && prev_txid_le_bytes.iter().all(|&b| b == 0)
+        {
+            coinbase = true;
+        }
+
+        if let Some(h) = txid_hasher.as_mut() {
+            // TxID serialization uses LE txid.
+            h.write(prev_txid_le_bytes);
+            h.write(&prev_vout.to_le_bytes());
+        }
+
+        // Human display uses BE.
+        let prev_txid_hex = txid_le_slice_to_display_hex(prev_txid_le_bytes);
+        vin_outpoints.push((prev_txid_hex, prev_vout));
+
+        let script_len_u64 = read_varint(&mut c)?;
+        let script_len = script_len_u64 as usize;
+        if let Some(h) = txid_hasher.as_mut() {
+            write_varint_hasher(h, script_len_u64);
+        }
+
+        let script_sig = c.take(script_len)?;
+        if let Some(h) = txid_hasher.as_mut() {
+            h.write(script_sig);
+        }
+        vin_script_sig_hex.push(bytes_to_hex(script_sig));
+        vin_script_sig_asm.push(disasm_script(script_sig));
+        vin_script_sig_bytes.push(script_sig.to_vec());
+
+        let sequence = c.take_u32_le()?;
+        if let Some(h) = txid_hasher.as_mut() {
+            h.write(&sequence.to_le_bytes());
+        }
+        vin_sequences.push(sequence);
+
+        if sequence < 0xffff_fffe {
+            rbf_signaling = true;
+        }
+    }
+
+    // --- VOUT ---
+    let vout_count_u64 = read_varint(&mut c)?;
+    let vout_count = vout_count_u64 as usize;
+    if let Some(h) = txid_hasher.as_mut() {
+        write_varint_hasher(h, vout_count_u64);
+    }
+
+    let mut total_output_sats: u64 = 0;
+    let mut vout_reports: Vec<VoutReport> = Vec::with_capacity(vout_count);
+    let mut has_unknown_output = false;
+
+    for _ in 0..vout_count {
+        let value = c.take_u64_le()?;
+        total_output_sats = total_output_sats.saturating_add(value);
+        if let Some(h) = txid_hasher.as_mut() {
+            h.write(&value.to_le_bytes());
+        }
+
+        let spk_len_u64 = read_varint(&mut c)?;
+        let spk_len = spk_len_u64 as usize;
+        if let Some(h) = txid_hasher.as_mut() {
+            write_varint_hasher(h, spk_len_u64);
+        }
+
+        let spk = c.take(spk_len)?;
+        if let Some(h) = txid_hasher.as_mut() {
+            h.write(spk);
+        }
+
+        let stype = script_type(spk);
+        if stype == "unknown" {
+            has_unknown_output = true;
+        }
+
+        let (op_hex, op_utf8, op_proto) = if stype == "op_return" {
+            // Concatenate all pushes after OP_RETURN per README requirements.
+            if let Some(data) = parse_op_return_data(spk) {
+                let h = bytes_to_hex(&data);
+                let u = std::str::from_utf8(&data).ok().map(|s| s.to_string());
+
+                let proto = if data.starts_with(&[0x6f, 0x6d, 0x6e, 0x69]) {
+                    "omni"
+                } else if data.starts_with(&[0x01, 0x09, 0xf9, 0x11, 0x02]) {
+                    "opentimestamps"
+                } else {
+                    "unknown"
+                };
+
+                (Some(h), u, Some(proto.to_string()))
+            } else {
+                // bare OP_RETURN or malformed push encoding
+                (Some(String::new()), None, Some("unknown".to_string()))
+            }
+        } else {
+            (None, None, None)
+        };
+
+        vout_reports.push(VoutReport {
+            n: vout_reports.len() as u32,
+            value_sats: value,
+            script_pubkey_hex: bytes_to_hex(spk),
+            script_asm: disasm_script(spk),
+            script_type: stype,
+            address: None,
+            op_return_data_hex: op_hex,
+            op_return_data_utf8: op_utf8,
+            op_return_protocol: op_proto,
+        });
+    }
+
+    // --- Witness ---
+    let mut witnesses: Vec<Vec<String>> = vec![Vec::new(); vin_count];
+    let mut witnesses_bytes: Vec<Vec<Vec<u8>>> = vec![Vec::new(); vin_count];
+    if segwit {
+        for (idx, slot) in witnesses.iter_mut().enumerate() {
+            let n_stack = read_varint(&mut c)? as usize;
+            let mut items_hex: Vec<String> = Vec::with_capacity(n_stack);
+            let mut items_bytes: Vec<Vec<u8>> = Vec::with_capacity(n_stack);
+            for _ in 0..n_stack {
+                let item_len = read_varint(&mut c)? as usize;
+                let item = c.take(item_len)?;
+                items_hex.push(bytes_to_hex(item));
+                items_bytes.push(item.to_vec());
+            }
+            *slot = items_hex;
+            witnesses_bytes[idx] = items_bytes;
+        }
+    }
+
+    // locktime
+    let locktime = c.take_u32_le()?;
+    if let Some(h) = txid_hasher.as_mut() {
+        h.write(&locktime.to_le_bytes());
+    }
+
+    if c.remaining() != 0 {
+        return Err("trailing bytes after parsing".into());
+    }
+
+    // non-witness size is only meaningful for segwit txs (txid-hasher len).
+    let non_witness_size = if let Some(h) = txid_hasher.as_ref() {
+        h.len
+    } else {
+        size_bytes
+    };
+
+    let txid = if segwit {
+        hash_to_display_hex(txid_hasher.take().unwrap().finish())
+    } else {
+        // Legacy txid is the hash of the full raw tx.
+        hash_to_display_hex(dsha256(raw))
+    };
+
+    if segwit && !coinbase && prevouts_ordered.len() != vin_count {
+        return Err(format!(
+            "prevouts_ordered length mismatch: got {} expected {}",
+            prevouts_ordered.len(),
+            vin_count
+        ));
+    }
+
+    let mut total_input_sats: u64 = 0;
+    let mut vin_reports: Vec<VinReport> = Vec::with_capacity(vin_count);
+
+    if coinbase {
+        rbf_signaling = false;
+    }
+
+    // Build vin reports using moves (avoid clones).
+    let mut out_iter = vin_outpoints.into_iter();
+    let mut ss_iter = vin_script_sig_hex.into_iter();
+    let mut asm_iter = vin_script_sig_asm.into_iter();
+    let mut ssb_iter = vin_script_sig_bytes.into_iter();
+    let mut seq_iter = vin_sequences.into_iter();
+    let mut wit_iter = witnesses.into_iter();
+    let mut witb_iter = witnesses_bytes.into_iter();
+
+    for i in 0..vin_count {
+        let (txid_in, vout_in) = out_iter.next().unwrap();
+        let script_sig_hex = ss_iter.next().unwrap();
+        let script_asm = asm_iter.next().unwrap();
+        let sequence = seq_iter.next().unwrap();
+        let witness = wit_iter.next().unwrap();
+        let witness_b = witb_iter.next().unwrap();
+        let script_sig_b = ssb_iter.next().unwrap();
+
+        if coinbase {
+            vin_reports.push(VinReport {
+                txid: txid_in,
+                vout: vout_in,
+                sequence,
+                script_sig_hex,
+                script_asm,
+                witness,
+                witness_script_asm: None,
+                script_type: "unknown".to_string(),
+                address: None,
+                prevout: PrevoutInfo {
+                    value_sats: 0,
+                    script_pubkey_hex: String::new(),
+                },
+                relative_timelock: RelativeTimelock {
+                    enabled: false,
+                    r#type: None,
+                    value: None,
+                },
+            });
+            continue;
+        }
+
+        let (val, spk_bytes) = &prevouts_ordered[i];
+        total_input_sats = total_input_sats.saturating_add(*val);
+
+        let (in_type, witness_script_asm) = classify_input_spend(spk_bytes, &script_sig_b, &witness_b);
+
+        vin_reports.push(VinReport {
+            txid: txid_in,
+            vout: vout_in,
+            sequence,
+            script_sig_hex,
+            script_asm,
+            witness,
+            witness_script_asm,
+            script_type: in_type,
+            address: None,
+            prevout: PrevoutInfo {
+                value_sats: *val,
+                script_pubkey_hex: bytes_to_hex(spk_bytes),
+            },
+            relative_timelock: relative_timelock(version, sequence),
+        });
+    }
+
+    if coinbase {
+        total_input_sats = total_output_sats;
+    }
+
+    let mut fee_sats_i64 = (total_input_sats as i64) - (total_output_sats as i64);
+    if coinbase {
+        fee_sats_i64 = 0;
+    }
+
+    let (weight, vbytes, wtxid_opt, segwit_savings) = if segwit {
+        let witness_bytes = size_bytes.saturating_sub(non_witness_size);
+        let weight_actual = non_witness_size * 4 + witness_bytes;
+        let vbytes = weight_actual.div_ceil(4);
+
+        let weight_if_legacy = size_bytes * 4;
+        let savings_pct = if weight_if_legacy == 0 {
+            0.0
+        } else {
+            (1.0 - (weight_actual as f64 / weight_if_legacy as f64)) * 100.0
+        };
+
+        (
+            weight_actual,
+            vbytes,
+            wtxid_full,
+            Some(SegwitSavings {
+                witness_bytes,
+                non_witness_bytes: non_witness_size,
+                total_bytes: size_bytes,
+                weight_actual,
+                weight_if_legacy,
+                savings_pct: (savings_pct * 100.0).round() / 100.0,
+            }),
+        )
+    } else {
+        let weight = size_bytes * 4;
+        let vbytes = weight.div_ceil(4);
+        (weight, vbytes, None, None)
+    };
+
+    let fee_rate = if coinbase || vbytes == 0 {
+        0.0
+    } else {
+        (fee_sats_i64 as f64) / (vbytes as f64)
+    };
+    let fee_rate_2dp = (fee_rate * 100.0).round() / 100.0;
+
+    let mut warnings: Vec<WarningItem> = Vec::new();
+
+    if rbf_signaling {
+        warnings.push(WarningItem {
+            code: "RBF_SIGNALING".into(),
+        });
+    }
+
+    if has_unknown_output {
+        warnings.push(WarningItem {
+            code: "UNKNOWN_OUTPUT_SCRIPT".into(),
+        });
+    }
+
+    Ok(TxReport {
+        ok: true,
+        network: network.into(),
+        segwit,
+        txid,
+        wtxid: wtxid_opt,
+        version,
+        locktime,
+        locktime_value: locktime,
+        size_bytes,
+        weight,
+        vbytes,
+        fee_sats: fee_sats_i64,
+        fee_rate_sat_vb: fee_rate_2dp,
+        total_input_sats,
+        total_output_sats,
+        rbf_signaling,
+        locktime_type: locktime_type(locktime),
+        vin: vin_reports,
+        vout: vout_reports,
+        warnings,
+        segwit_savings,
+    })
+}
+
+pub fn analyze_tx(network: &str, raw_tx_hex: &str, prevouts: &[Prevout]) -> Result<TxReport, String> {
+    let raw = hex_to_bytes(raw_tx_hex)?;
+
+    // --- 1) First pass: parse only the input outpoints (vin order) ---
+    let mut c = Cursor::new(&raw);
+
+    // version
+    let _version = c.take_u32_le()?;
+
+    // segwit marker/flag (if present)
+    let peek = c.take_u8()?;
+    if peek == 0x00 {
+        let flag = c.take_u8()?;
+        if flag != 0x01 {
+            return Err("invalid segwit flag".into());
+        }
+    } else {
+        c.backtrack_1()?;
+    }
+
+    let vin_count_u64 = read_varint(&mut c)?;
+    let vin_count = vin_count_u64 as usize;
+
+    // Collect outpoints as (txid_le, vout) in vin order.
+    let mut coinbase = false;
+    let mut keys: Vec<PrevoutKey> = Vec::with_capacity(vin_count);
+
+    for vin_idx in 0..vin_count {
+        let prev_txid_le_bytes = c.take(32)?;
+        let prev_vout = c.take_u32_le()?;
+
+        if vin_idx == 0
+            && vin_count == 1
+            && prev_vout == 0xffff_ffff
+            && prev_txid_le_bytes.iter().all(|&b| b == 0)
+        {
+            coinbase = true;
+        }
+
+        let script_len = read_varint(&mut c)? as usize;
+        let _ = c.take(script_len)?; // scriptSig
+        let _sequence = c.take_u32_le()?; // sequence
+
+        if !coinbase {
+            let mut txid_le = [0u8; 32];
+            txid_le.copy_from_slice(prev_txid_le_bytes);
+            keys.push(PrevoutKey {
+                txid_le,
+                vout: prev_vout,
+            });
+        }
+    }
+
+    // Coinbase txs don't require prevouts.
+    if coinbase {
+        return analyze_tx_from_bytes_ordered(network, &raw, &[]);
+    }
+
+    if prevouts.len() != keys.len() {
+        return Err(format!(
+            "prevouts length mismatch: got {} expected {}",
+            prevouts.len(),
+            keys.len()
+        ));
+    }
+
+    // Helper: fixture prevout uses display big-endian txid; tx serialization uses little-endian.
+    #[inline]
+    fn prevout_key_from_hex(txid_hex: &str, vout: u32) -> Result<PrevoutKey, String> {
+        let mut be = hex_to_bytes(txid_hex)?;
+        if be.len() != 32 {
+            return Err("prevout txid must be 32 bytes".into());
+        }
+        be.reverse();
+        let mut txid_le = [0u8; 32];
+        txid_le.copy_from_slice(&be);
+        Ok(PrevoutKey { txid_le, vout })
+    }
+
+    // --- 2) Fast path: if fixture prevouts are already in vin order, avoid HashMap entirely ---
+    let mut ordered_ok = true;
+    for (i, p) in prevouts.iter().enumerate() {
+        let k = prevout_key_from_hex(&p.txid_hex, p.vout)?;
+        if k != keys[i] {
+            ordered_ok = false;
+            break;
+        }
+    }
+
+    let mut prevouts_ordered: Vec<(u64, Vec<u8>)> = Vec::with_capacity(keys.len());
+
+    if ordered_ok {
+        for p in prevouts {
+            prevouts_ordered.push((p.value_sats, hex_to_bytes(&p.script_pubkey_hex)?));
+        }
+    } else {
+        // --- 3) General path: build a fast hash map from outpoint -> (value, script_pubkey_bytes) ---
+        let mut prevmap: AHashMap<PrevoutKey, (u64, Vec<u8>)> =
+            AHashMap::with_capacity(prevouts.len().saturating_mul(2));
+
+        for p in prevouts {
+            let k = prevout_key_from_hex(&p.txid_hex, p.vout)?;
+            let spk_bytes = hex_to_bytes(&p.script_pubkey_hex)?;
+            prevmap.insert(k, (p.value_sats, spk_bytes));
+        }
+
+        for k in &keys {
+            let (value, spk) = prevmap
+                .remove(k)
+                .ok_or_else(|| "missing prevout".to_string())?;
+            prevouts_ordered.push((value, spk));
+        }
+    }
+
+    // --- 4) Run the ordered, allocation-lean analyzer ---
+    analyze_tx_from_bytes_ordered(network, &raw, &prevouts_ordered)
+}
+
+
+# =================== magic.sh
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage: ./concat_pro.sh [DIR]
+DIR="${1:-.}"
+DIR="${DIR%/}"  # strip trailing slash if any
+
+OUT_NAME="ALL_FILES.txt"
+OUT="$(pwd)/${OUT_NAME}"   # absolute path
+
+# 1) Filenames to exclude (basename matches)
+exclude_names=(
+  ".gitignore"
+  "Makefile"
+  "Dockerfile"
+  "Changelog.md"
+  "pyproject.toml"
+  "_init_.py"
+  ".env.example"
+  "uv.lock"
+  "test.csv"
+  "package-lock.json"
+  "train.csv"
+  "requirements.txt"
+  "AGENTS.md"
+  "${OUT_NAME}"
+)
+
+# 2) Extensions to exclude (case-insensitive, no leading dot)
+exclude_exts=(
+  "png"
+  "pdf"
+  "mp3"
+  "ico"
+  "zip"
+  "md"
+  "db"
+)
+
+# 3) Directories to exclude (any file under these is ignored)
+exclude_dirs=(
+  "node_modules"
+  ".git"
+  ".hg"
+  ".svn"
+  ".venv"
+  "venv"
+  "_pycache_"
+  ".pytest_cache"
+  ".mypy_cache"
+  "dist"
+  "build"
+  ".next"
+  ".turbo"
+  ".idea"
+)
+
+# ---- build the find command safely ----
+# We prune directories first to avoid walking into them at all.
+find_cmd=( find "$DIR" )
+
+for d in "${exclude_dirs[@]}"; do
+  find_cmd+=( -path "/${d}/" -prune -o )
+done
+
+# Base predicate for remaining paths: regular files only
+find_cmd+=( -type f )
+
+# Exclude the output file itself (anti-recursion)
+if [ -e "$OUT" ]; then
+  find_cmd+=( ! -samefile "$OUT" )
+fi
+
+# Exclude specific basenames
+for n in "${exclude_names[@]}"; do
+  find_cmd+=( ! -name "$n" )
+done
+
+# Exclude extensions
+for e in "${exclude_exts[@]}"; do
+  find_cmd+=( ! -iname "*.${e}" )
+done
+
+# ---- run and build the file ----
+: > "$OUT"
+
+while IFS= read -r -d '' f; do
+  rel="${f#"$DIR"/}"  # header path relative to DIR
+  printf "\n\n# =================== %s\n\n" "${rel:-$f}" >> "$OUT"
+  cat -- "$f" >> "$OUT"
+done < <("${find_cmd[@]}" -print0)

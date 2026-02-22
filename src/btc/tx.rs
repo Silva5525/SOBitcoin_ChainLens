@@ -38,6 +38,12 @@ pub struct PrevoutInfo {
 #[derive(Debug, Serialize)]
 pub struct RelativeTimelock {
     pub enabled: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>, // "blocks" | "time"
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<u64>, // blocks OR seconds
 }
 
 #[derive(Debug, Serialize)]
@@ -48,6 +54,8 @@ pub struct VinReport {
     pub script_sig_hex: String,
     pub script_asm: String,
     pub witness: Vec<String>,
+    /// Only present for p2wsh and p2sh-p2wsh spends (disassembly of the witnessScript).
+    pub witness_script_asm: Option<String>,
     pub script_type: String,
     pub address: Option<String>,
     pub prevout: PrevoutInfo,
@@ -263,53 +271,451 @@ fn script_type(spk: &[u8]) -> String {
 }
 
 fn parse_op_return_data(spk: &[u8]) -> Option<Vec<u8>> {
+    // scriptPubKey for OP_RETURN outputs is typically:
+    // OP_RETURN <pushdata...> [<pushdata...> ...]
+    // Requirement: concatenate *all* data pushes after OP_RETURN, in order.
     if spk.is_empty() || spk[0] != 0x6a {
         return None;
     }
-    if spk.len() < 2 {
-        return None;
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut i: usize = 1; // after OP_RETURN
+
+    while i < spk.len() {
+        let op = spk[i];
+        i += 1;
+
+        // OP_0 pushes an empty vector.
+        if op == 0x00 {
+            continue;
+        }
+
+        let (n, is_push) = match op {
+            0x01..=0x4b => (op as usize, true),
+            0x4c => {
+                if i + 1 > spk.len() {
+                    return None;
+                }
+                let n = spk[i] as usize;
+                i += 1;
+                (n, true)
+            }
+            0x4d => {
+                if i + 2 > spk.len() {
+                    return None;
+                }
+                let n = u16::from_le_bytes([spk[i], spk[i + 1]]) as usize;
+                i += 2;
+                (n, true)
+            }
+            0x4e => {
+                if i + 4 > spk.len() {
+                    return None;
+                }
+                let n = u32::from_le_bytes([spk[i], spk[i + 1], spk[i + 2], spk[i + 3]]) as usize;
+                i += 4;
+                (n, true)
+            }
+            _ => (0, false),
+        };
+
+        // Stop at first non-push opcode (requirement only concerns pushes).
+        if !is_push {
+            break;
+        }
+
+        if i + n > spk.len() {
+            return None;
+        }
+
+        out.extend_from_slice(&spk[i..i + n]);
+        i += n;
     }
 
-    let op = spk[1];
-    let (len, hdr) = match op {
-        0x01..=0x4b => (op as usize, 2),
-        0x4c => {
-            if spk.len() < 3 {
-                return None;
-            }
-            (spk[2] as usize, 3)
-        }
-        0x4d => {
-            if spk.len() < 4 {
-                return None;
-            }
-            (u16::from_le_bytes([spk[2], spk[3]]) as usize, 4)
-        }
-        0x4e => {
-            if spk.len() < 6 {
-                return None;
-            }
-            (
-                u32::from_le_bytes([spk[2], spk[3], spk[4], spk[5]]) as usize,
-                6,
-            )
-        }
-        _ => return None,
+    Some(out)
+}
+
+#[inline]
+fn opcode_name(op: u8) -> String {
+    // Bitcoin Core Script opcode names.
+    // Unknown / undefined opcodes must render as OP_UNKNOWN_0xNN.
+    let s: Option<&'static str> = match op {
+        0x00 => Some("OP_0"),
+        0x4c => Some("OP_PUSHDATA1"),
+        0x4d => Some("OP_PUSHDATA2"),
+        0x4e => Some("OP_PUSHDATA4"),
+        0x4f => Some("OP_1NEGATE"),
+        0x50 => Some("OP_RESERVED"),
+        0x51 => Some("OP_1"),
+        0x52 => Some("OP_2"),
+        0x53 => Some("OP_3"),
+        0x54 => Some("OP_4"),
+        0x55 => Some("OP_5"),
+        0x56 => Some("OP_6"),
+        0x57 => Some("OP_7"),
+        0x58 => Some("OP_8"),
+        0x59 => Some("OP_9"),
+        0x5a => Some("OP_10"),
+        0x5b => Some("OP_11"),
+        0x5c => Some("OP_12"),
+        0x5d => Some("OP_13"),
+        0x5e => Some("OP_14"),
+        0x5f => Some("OP_15"),
+        0x60 => Some("OP_16"),
+        0x61 => Some("OP_NOP"),
+        0x62 => Some("OP_VER"),
+        0x63 => Some("OP_IF"),
+        0x64 => Some("OP_NOTIF"),
+        0x65 => Some("OP_VERIF"),
+        0x66 => Some("OP_VERNOTIF"),
+        0x67 => Some("OP_ELSE"),
+        0x68 => Some("OP_ENDIF"),
+        0x69 => Some("OP_VERIFY"),
+        0x6a => Some("OP_RETURN"),
+        0x6b => Some("OP_TOALTSTACK"),
+        0x6c => Some("OP_FROMALTSTACK"),
+        0x6d => Some("OP_2DROP"),
+        0x6e => Some("OP_2DUP"),
+        0x6f => Some("OP_3DUP"),
+        0x70 => Some("OP_2OVER"),
+        0x71 => Some("OP_2ROT"),
+        0x72 => Some("OP_2SWAP"),
+        0x73 => Some("OP_IFDUP"),
+        0x74 => Some("OP_DEPTH"),
+        0x75 => Some("OP_DROP"),
+        0x76 => Some("OP_DUP"),
+        0x77 => Some("OP_NIP"),
+        0x78 => Some("OP_OVER"),
+        0x79 => Some("OP_PICK"),
+        0x7a => Some("OP_ROLL"),
+        0x7b => Some("OP_ROT"),
+        0x7c => Some("OP_SWAP"),
+        0x7d => Some("OP_TUCK"),
+        0x7e => Some("OP_CAT"),
+        0x7f => Some("OP_SUBSTR"),
+        0x80 => Some("OP_LEFT"),
+        0x81 => Some("OP_RIGHT"),
+        0x82 => Some("OP_SIZE"),
+        0x83 => Some("OP_INVERT"),
+        0x84 => Some("OP_AND"),
+        0x85 => Some("OP_OR"),
+        0x86 => Some("OP_XOR"),
+        0x87 => Some("OP_EQUAL"),
+        0x88 => Some("OP_EQUALVERIFY"),
+        0x89 => Some("OP_RESERVED1"),
+        0x8a => Some("OP_RESERVED2"),
+        0x8b => Some("OP_1ADD"),
+        0x8c => Some("OP_1SUB"),
+        0x8d => Some("OP_2MUL"),
+        0x8e => Some("OP_2DIV"),
+        0x8f => Some("OP_NEGATE"),
+        0x90 => Some("OP_ABS"),
+        0x91 => Some("OP_NOT"),
+        0x92 => Some("OP_0NOTEQUAL"),
+        0x93 => Some("OP_ADD"),
+        0x94 => Some("OP_SUB"),
+        0x95 => Some("OP_MUL"),
+        0x96 => Some("OP_DIV"),
+        0x97 => Some("OP_MOD"),
+        0x98 => Some("OP_LSHIFT"),
+        0x99 => Some("OP_RSHIFT"),
+        0x9a => Some("OP_BOOLAND"),
+        0x9b => Some("OP_BOOLOR"),
+        0x9c => Some("OP_NUMEQUAL"),
+        0x9d => Some("OP_NUMEQUALVERIFY"),
+        0x9e => Some("OP_NUMNOTEQUAL"),
+        0x9f => Some("OP_LESSTHAN"),
+        0xa0 => Some("OP_GREATERTHAN"),
+        0xa1 => Some("OP_LESSTHANOREQUAL"),
+        0xa2 => Some("OP_GREATERTHANOREQUAL"),
+        0xa3 => Some("OP_MIN"),
+        0xa4 => Some("OP_MAX"),
+        0xa5 => Some("OP_WITHIN"),
+        0xa6 => Some("OP_RIPEMD160"),
+        0xa7 => Some("OP_SHA1"),
+        0xa8 => Some("OP_SHA256"),
+        0xa9 => Some("OP_HASH160"),
+        0xaa => Some("OP_HASH256"),
+        0xab => Some("OP_CODESEPARATOR"),
+        0xac => Some("OP_CHECKSIG"),
+        0xad => Some("OP_CHECKSIGVERIFY"),
+        0xae => Some("OP_CHECKMULTISIG"),
+        0xaf => Some("OP_CHECKMULTISIGVERIFY"),
+        0xb0 => Some("OP_NOP1"),
+        0xb1 => Some("OP_CHECKLOCKTIMEVERIFY"),
+        0xb2 => Some("OP_CHECKSEQUENCEVERIFY"),
+        0xb3 => Some("OP_NOP4"),
+        0xb4 => Some("OP_NOP5"),
+        0xb5 => Some("OP_NOP6"),
+        0xb6 => Some("OP_NOP7"),
+        0xb7 => Some("OP_NOP8"),
+        0xb8 => Some("OP_NOP9"),
+        0xb9 => Some("OP_NOP10"),
+        0xba => Some("OP_CHECKSIGADD"),
+        0xfd => Some("OP_PUBKEYHASH"),
+        0xfe => Some("OP_PUBKEY"),
+        0xff => Some("OP_INVALIDOPCODE"),
+        _ => None,
     };
 
-    if hdr + len > spk.len() {
-        return None;
+    if let Some(name) = s {
+        name.to_string()
+    } else {
+        format!("OP_UNKNOWN_0x{:02x}", op)
     }
-    Some(spk[hdr..hdr + len].to_vec())
 }
 
-fn normalize_input_script_type(out_type: &str) -> String {
-    match out_type {
-        // grader wants p2sh inputs classified as unknown in this simplified analyzer
-        "p2sh" => "unknown".to_string(),
-        other => other.to_string(),
+fn disasm_script(script: &[u8]) -> String {
+    if script.is_empty() {
+        return String::new();
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut i: usize = 0;
+
+    while i < script.len() {
+        let op = script[i];
+        i += 1;
+
+        // Direct push
+        if (0x01..=0x4b).contains(&op) {
+            let n = op as usize;
+            if i + n > script.len() {
+                break;
+            }
+            out.push(format!("OP_PUSHBYTES_{} {}", n, bytes_to_hex(&script[i..i + n])));
+            i += n;
+            continue;
+        }
+
+        match op {
+            0x00 => out.push("OP_0".to_string()),
+            0x4c => {
+                if i + 1 > script.len() {
+                    break;
+                }
+                let n = script[i] as usize;
+                i += 1;
+                if i + n > script.len() {
+                    break;
+                }
+                out.push(format!("OP_PUSHDATA1 {}", bytes_to_hex(&script[i..i + n])));
+                i += n;
+            }
+            0x4d => {
+                if i + 2 > script.len() {
+                    break;
+                }
+                let n = u16::from_le_bytes([script[i], script[i + 1]]) as usize;
+                i += 2;
+                if i + n > script.len() {
+                    break;
+                }
+                out.push(format!("OP_PUSHDATA2 {}", bytes_to_hex(&script[i..i + n])));
+                i += n;
+            }
+            0x4e => {
+                if i + 4 > script.len() {
+                    break;
+                }
+                let n = u32::from_le_bytes([script[i], script[i + 1], script[i + 2], script[i + 3]]) as usize;
+                i += 4;
+                if i + n > script.len() {
+                    break;
+                }
+                out.push(format!("OP_PUSHDATA4 {}", bytes_to_hex(&script[i..i + n])));
+                i += n;
+            }
+            _ => out.push(opcode_name(op)),
+        }
+    }
+
+    out.join(" ")
+}
+
+fn extract_last_push(script: &[u8]) -> Option<&[u8]> {
+    // Returns the data bytes of the last push in a script (used for P2SH redeemScript detection).
+    // Only considers canonical push opcodes (direct pushes and PUSHDATA1/2/4).
+    let mut i = 0usize;
+    let mut last: Option<&[u8]> = None;
+
+    while i < script.len() {
+        let op = script[i];
+        i += 1;
+
+        let n_opt: Option<usize> = match op {
+            0x01..=0x4b => Some(op as usize),
+            0x4c => {
+                if i + 1 > script.len() {
+                    return None;
+                }
+                let n = script[i] as usize;
+                i += 1;
+                Some(n)
+            }
+            0x4d => {
+                if i + 2 > script.len() {
+                    return None;
+                }
+                let n = u16::from_le_bytes([script[i], script[i + 1]]) as usize;
+                i += 2;
+                Some(n)
+            }
+            0x4e => {
+                if i + 4 > script.len() {
+                    return None;
+                }
+                let n = u32::from_le_bytes([script[i], script[i + 1], script[i + 2], script[i + 3]]) as usize;
+                i += 4;
+                Some(n)
+            }
+            0x00 => Some(0),
+            _ => None,
+        };
+
+        let Some(n) = n_opt else {
+            continue;
+        };
+
+        if i + n > script.len() {
+            return None;
+        }
+        let data = &script[i..i + n];
+        i += n;
+        last = Some(data);
+    }
+
+    last
+}
+
+#[inline]
+fn is_p2pkh_spk(spk: &[u8]) -> bool {
+    spk.len() == 25
+        && spk[0] == 0x76
+        && spk[1] == 0xa9
+        && spk[2] == 0x14
+        && spk[23] == 0x88
+        && spk[24] == 0xac
+}
+
+#[inline]
+fn is_p2sh_spk(spk: &[u8]) -> bool {
+    spk.len() == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87
+}
+
+#[inline]
+fn is_p2wpkh_spk(spk: &[u8]) -> bool {
+    spk.len() == 22 && spk[0] == 0x00 && spk[1] == 0x14
+}
+
+#[inline]
+fn is_p2wsh_spk(spk: &[u8]) -> bool {
+    spk.len() == 34 && spk[0] == 0x00 && spk[1] == 0x20
+}
+
+#[inline]
+fn is_p2tr_spk(spk: &[u8]) -> bool {
+    spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20
+}
+
+fn classify_input_spend(
+    prevout_spk: &[u8],
+    script_sig: &[u8],
+    witness_items: &[Vec<u8>],
+) -> (String, Option<String>) {
+    // Returns (script_type, witness_script_asm).
+    // witness_script_asm is only set for p2wsh and p2sh-p2wsh per README.
+
+    if is_p2pkh_spk(prevout_spk) {
+        return ("p2pkh".to_string(), None);
+    }
+    if is_p2wpkh_spk(prevout_spk) {
+        return ("p2wpkh".to_string(), None);
+    }
+    if is_p2wsh_spk(prevout_spk) {
+        let ws_asm = witness_items.last().map(|b| disasm_script(b));
+        return ("p2wsh".to_string(), ws_asm);
+    }
+    if is_p2tr_spk(prevout_spk) {
+        if witness_items.len() == 1 && witness_items[0].len() == 64 {
+            return ("p2tr_keypath".to_string(), None);
+        }
+        if let Some(last) = witness_items.last() {
+            if !last.is_empty() && (last[0] == 0xc0 || last[0] == 0xc1) {
+                return ("p2tr_scriptpath".to_string(), None);
+            }
+        }
+        return ("unknown".to_string(), None);
+    }
+    if is_p2sh_spk(prevout_spk) {
+        let Some(rs) = extract_last_push(script_sig) else {
+            return ("unknown".to_string(), None);
+        };
+        if is_p2wpkh_spk(rs) {
+            return ("p2sh-p2wpkh".to_string(), None);
+        }
+        if is_p2wsh_spk(rs) {
+            let ws_asm = witness_items.last().map(|b| disasm_script(b));
+            return ("p2sh-p2wsh".to_string(), ws_asm);
+        }
+        return ("unknown".to_string(), None);
+    }
+
+    ("unknown".to_string(), None)
+}
+
+#[inline]
+fn locktime_type(locktime: u32) -> String {
+    if locktime == 0 {
+        return "none".into();
+    }
+    // Consensus convention: < 500_000_000 => block height, else unix timestamp
+    if locktime < 500_000_000 {
+        "block_height".into()
+    } else {
+        "unix_timestamp".into()
     }
 }
+
+#[inline]
+fn relative_timelock(version: u32, sequence: u32) -> RelativeTimelock {
+    // BIP68 only applies to tx version >= 2
+    if version < 2 {
+        return RelativeTimelock {
+            enabled: false,
+            r#type: None,
+            value: None,
+        };
+    }
+
+    // Disable flag (bit 31) => disabled
+    if (sequence & (1u32 << 31)) != 0 {
+        return RelativeTimelock {
+            enabled: false,
+            r#type: None,
+            value: None,
+        };
+    }
+
+    // Low 16 bits are the value
+    let v = (sequence & 0x0000_ffff) as u64;
+
+    // Type flag (bit 22): 0 = blocks, 1 = time (512-second units)
+    if (sequence & (1u32 << 22)) != 0 {
+        RelativeTimelock {
+            enabled: true,
+            r#type: Some("time".into()),
+            value: Some(v * 512),
+        }
+    } else {
+        RelativeTimelock {
+            enabled: true,
+            r#type: Some("blocks".into()),
+            value: Some(v),
+        }
+    }
+}
+
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct PrevoutKey {
@@ -345,15 +751,10 @@ pub fn analyze_tx_from_bytes_ordered(
     }
 
     let size_bytes = raw.len();
-    let wtxid_full = hash_to_display_hex(dsha256(raw));
-
     let mut c = Cursor::new(raw);
 
-    // Start streaming txid (non-witness serialization). If tx is legacy, we'll just use wtxid_full.
-    let mut txid_hasher = Dsha256Writer::new();
-
+    // --- Header / segwit detection ---
     let version = c.take_u32_le()?;
-    txid_hasher.write(&version.to_le_bytes());
 
     let mut segwit = false;
     let peek = c.take_u8()?;
@@ -363,18 +764,34 @@ pub fn analyze_tx_from_bytes_ordered(
             return Err("invalid segwit flag".into());
         }
         segwit = true;
-        // marker+flag are NOT included in txid serialization
     } else {
         c.backtrack_1()?;
     }
 
+    // For legacy txs, txid is just dSHA256(raw) and wtxid must be null.
+    // For segwit txs, wtxid is dSHA256(raw) and txid is dSHA256(stripped).
+    let (wtxid_full, mut txid_hasher) = if segwit {
+        (Some(hash_to_display_hex(dsha256(raw))), Some(Dsha256Writer::new()))
+    } else {
+        (None, None)
+    };
+
+    if let Some(h) = txid_hasher.as_mut() {
+        h.write(&version.to_le_bytes());
+        // marker+flag are NOT included in txid serialization
+    }
+
+    // --- VIN ---
     let vin_count_u64 = read_varint(&mut c)?;
     let vin_count = vin_count_u64 as usize;
-    write_varint_hasher(&mut txid_hasher, vin_count_u64);
+    if let Some(h) = txid_hasher.as_mut() {
+        write_varint_hasher(h, vin_count_u64);
+    }
 
-    // Keep only what we need, and avoid per-input Vec copies where possible.
     let mut vin_outpoints: Vec<(String, u32)> = Vec::with_capacity(vin_count);
     let mut vin_script_sig_hex: Vec<String> = Vec::with_capacity(vin_count);
+    let mut vin_script_sig_asm: Vec<String> = Vec::with_capacity(vin_count);
+    let mut vin_script_sig_bytes: Vec<Vec<u8>> = Vec::with_capacity(vin_count);
     let mut vin_sequences: Vec<u32> = Vec::with_capacity(vin_count);
 
     let mut rbf_signaling = false;
@@ -392,9 +809,11 @@ pub fn analyze_tx_from_bytes_ordered(
             coinbase = true;
         }
 
-        // TxID serialization uses LE txid.
-        txid_hasher.write(prev_txid_le_bytes);
-        txid_hasher.write(&prev_vout.to_le_bytes());
+        if let Some(h) = txid_hasher.as_mut() {
+            // TxID serialization uses LE txid.
+            h.write(prev_txid_le_bytes);
+            h.write(&prev_vout.to_le_bytes());
+        }
 
         // Human display uses BE.
         let prev_txid_hex = txid_le_slice_to_display_hex(prev_txid_le_bytes);
@@ -402,14 +821,22 @@ pub fn analyze_tx_from_bytes_ordered(
 
         let script_len_u64 = read_varint(&mut c)?;
         let script_len = script_len_u64 as usize;
-        write_varint_hasher(&mut txid_hasher, script_len_u64);
+        if let Some(h) = txid_hasher.as_mut() {
+            write_varint_hasher(h, script_len_u64);
+        }
 
         let script_sig = c.take(script_len)?;
-        txid_hasher.write(script_sig);
+        if let Some(h) = txid_hasher.as_mut() {
+            h.write(script_sig);
+        }
         vin_script_sig_hex.push(bytes_to_hex(script_sig));
+        vin_script_sig_asm.push(disasm_script(script_sig));
+        vin_script_sig_bytes.push(script_sig.to_vec());
 
         let sequence = c.take_u32_le()?;
-        txid_hasher.write(&sequence.to_le_bytes());
+        if let Some(h) = txid_hasher.as_mut() {
+            h.write(&sequence.to_le_bytes());
+        }
         vin_sequences.push(sequence);
 
         if sequence < 0xffff_fffe {
@@ -417,9 +844,12 @@ pub fn analyze_tx_from_bytes_ordered(
         }
     }
 
+    // --- VOUT ---
     let vout_count_u64 = read_varint(&mut c)?;
     let vout_count = vout_count_u64 as usize;
-    write_varint_hasher(&mut txid_hasher, vout_count_u64);
+    if let Some(h) = txid_hasher.as_mut() {
+        write_varint_hasher(h, vout_count_u64);
+    }
 
     let mut total_output_sats: u64 = 0;
     let mut vout_reports: Vec<VoutReport> = Vec::with_capacity(vout_count);
@@ -428,14 +858,20 @@ pub fn analyze_tx_from_bytes_ordered(
     for _ in 0..vout_count {
         let value = c.take_u64_le()?;
         total_output_sats = total_output_sats.saturating_add(value);
-        txid_hasher.write(&value.to_le_bytes());
+        if let Some(h) = txid_hasher.as_mut() {
+            h.write(&value.to_le_bytes());
+        }
 
         let spk_len_u64 = read_varint(&mut c)?;
         let spk_len = spk_len_u64 as usize;
-        write_varint_hasher(&mut txid_hasher, spk_len_u64);
+        if let Some(h) = txid_hasher.as_mut() {
+            write_varint_hasher(h, spk_len_u64);
+        }
 
         let spk = c.take(spk_len)?;
-        txid_hasher.write(spk);
+        if let Some(h) = txid_hasher.as_mut() {
+            h.write(spk);
+        }
 
         let stype = script_type(spk);
         if stype == "unknown" {
@@ -443,11 +879,22 @@ pub fn analyze_tx_from_bytes_ordered(
         }
 
         let (op_hex, op_utf8, op_proto) = if stype == "op_return" {
+            // Concatenate all pushes after OP_RETURN per README requirements.
             if let Some(data) = parse_op_return_data(spk) {
                 let h = bytes_to_hex(&data);
                 let u = std::str::from_utf8(&data).ok().map(|s| s.to_string());
-                (Some(h), u, Some("unknown".to_string()))
+
+                let proto = if data.starts_with(&[0x6f, 0x6d, 0x6e, 0x69]) {
+                    "omni"
+                } else if data.starts_with(&[0x01, 0x09, 0xf9, 0x11, 0x02]) {
+                    "opentimestamps"
+                } else {
+                    "unknown"
+                };
+
+                (Some(h), u, Some(proto.to_string()))
             } else {
+                // bare OP_RETURN or malformed push encoding
                 (Some(String::new()), None, Some("unknown".to_string()))
             }
         } else {
@@ -458,7 +905,7 @@ pub fn analyze_tx_from_bytes_ordered(
             n: vout_reports.len() as u32,
             value_sats: value,
             script_pubkey_hex: bytes_to_hex(spk),
-            script_asm: String::new(),
+            script_asm: disasm_script(spk),
             script_type: stype,
             address: None,
             op_return_data_hex: op_hex,
@@ -467,38 +914,50 @@ pub fn analyze_tx_from_bytes_ordered(
         });
     }
 
+    // --- Witness ---
     let mut witnesses: Vec<Vec<String>> = vec![Vec::new(); vin_count];
+    let mut witnesses_bytes: Vec<Vec<Vec<u8>>> = vec![Vec::new(); vin_count];
     if segwit {
-        for slot in witnesses.iter_mut() {
+        for (idx, slot) in witnesses.iter_mut().enumerate() {
             let n_stack = read_varint(&mut c)? as usize;
-            let mut items: Vec<String> = Vec::with_capacity(n_stack);
+            let mut items_hex: Vec<String> = Vec::with_capacity(n_stack);
+            let mut items_bytes: Vec<Vec<u8>> = Vec::with_capacity(n_stack);
             for _ in 0..n_stack {
                 let item_len = read_varint(&mut c)? as usize;
                 let item = c.take(item_len)?;
-                items.push(bytes_to_hex(item));
+                items_hex.push(bytes_to_hex(item));
+                items_bytes.push(item.to_vec());
             }
-            *slot = items;
+            *slot = items_hex;
+            witnesses_bytes[idx] = items_bytes;
         }
     }
 
+    // locktime
     let locktime = c.take_u32_le()?;
-    txid_hasher.write(&locktime.to_le_bytes());
+    if let Some(h) = txid_hasher.as_mut() {
+        h.write(&locktime.to_le_bytes());
+    }
 
     if c.remaining() != 0 {
         return Err("trailing bytes after parsing".into());
     }
 
-    // Capture non-witness size BEFORE finalizing the streaming hasher (single-pass).
-    let non_witness_size = txid_hasher.len;
-
-    let txid = if segwit {
-        hash_to_display_hex(txid_hasher.finish())
+    // non-witness size is only meaningful for segwit txs (txid-hasher len).
+    let non_witness_size = if let Some(h) = txid_hasher.as_ref() {
+        h.len
     } else {
-        // Legacy tx: txid == wtxid
-        wtxid_full.clone()
+        size_bytes
     };
 
-    if !coinbase && prevouts_ordered.len() != vin_count {
+    let txid = if segwit {
+        hash_to_display_hex(txid_hasher.take().unwrap().finish())
+    } else {
+        // Legacy txid is the hash of the full raw tx.
+        hash_to_display_hex(dsha256(raw))
+    };
+
+    if segwit && !coinbase && prevouts_ordered.len() != vin_count {
         return Err(format!(
             "prevouts_ordered length mismatch: got {} expected {}",
             prevouts_ordered.len(),
@@ -513,24 +972,44 @@ pub fn analyze_tx_from_bytes_ordered(
         rbf_signaling = false;
     }
 
+    // Build vin reports using moves (avoid clones).
+    let mut out_iter = vin_outpoints.into_iter();
+    let mut ss_iter = vin_script_sig_hex.into_iter();
+    let mut asm_iter = vin_script_sig_asm.into_iter();
+    let mut ssb_iter = vin_script_sig_bytes.into_iter();
+    let mut seq_iter = vin_sequences.into_iter();
+    let mut wit_iter = witnesses.into_iter();
+    let mut witb_iter = witnesses_bytes.into_iter();
+
     for i in 0..vin_count {
-        let (ref txid_in, vout_in) = vin_outpoints[i];
+        let (txid_in, vout_in) = out_iter.next().unwrap();
+        let script_sig_hex = ss_iter.next().unwrap();
+        let script_asm = asm_iter.next().unwrap();
+        let sequence = seq_iter.next().unwrap();
+        let witness = wit_iter.next().unwrap();
+        let witness_b = witb_iter.next().unwrap();
+        let script_sig_b = ssb_iter.next().unwrap();
 
         if coinbase {
             vin_reports.push(VinReport {
-                txid: txid_in.clone(),
+                txid: txid_in,
                 vout: vout_in,
-                sequence: vin_sequences[i],
-                script_sig_hex: vin_script_sig_hex[i].clone(),
-                script_asm: String::new(),
-                witness: witnesses[i].clone(),
+                sequence,
+                script_sig_hex,
+                script_asm,
+                witness,
+                witness_script_asm: None,
                 script_type: "unknown".to_string(),
                 address: None,
                 prevout: PrevoutInfo {
                     value_sats: 0,
                     script_pubkey_hex: String::new(),
                 },
-                relative_timelock: RelativeTimelock { enabled: false },
+                relative_timelock: RelativeTimelock {
+                    enabled: false,
+                    r#type: None,
+                    value: None,
+                },
             });
             continue;
         }
@@ -538,23 +1017,23 @@ pub fn analyze_tx_from_bytes_ordered(
         let (val, spk_bytes) = &prevouts_ordered[i];
         total_input_sats = total_input_sats.saturating_add(*val);
 
-        let out_type = script_type(spk_bytes);
-        let in_type = normalize_input_script_type(&out_type);
+        let (in_type, witness_script_asm) = classify_input_spend(spk_bytes, &script_sig_b, &witness_b);
 
         vin_reports.push(VinReport {
-            txid: txid_in.clone(),
+            txid: txid_in,
             vout: vout_in,
-            sequence: vin_sequences[i],
-            script_sig_hex: vin_script_sig_hex[i].clone(),
-            script_asm: String::new(),
-            witness: witnesses[i].clone(),
+            sequence,
+            script_sig_hex,
+            script_asm,
+            witness,
+            witness_script_asm,
             script_type: in_type,
             address: None,
             prevout: PrevoutInfo {
                 value_sats: *val,
                 script_pubkey_hex: bytes_to_hex(spk_bytes),
             },
-            relative_timelock: RelativeTimelock { enabled: false },
+            relative_timelock: relative_timelock(version, sequence),
         });
     }
 
@@ -582,7 +1061,7 @@ pub fn analyze_tx_from_bytes_ordered(
         (
             weight_actual,
             vbytes,
-            Some(wtxid_full),
+            wtxid_full,
             Some(SegwitSavings {
                 witness_bytes,
                 non_witness_bytes: non_witness_size,
@@ -636,7 +1115,7 @@ pub fn analyze_tx_from_bytes_ordered(
         total_input_sats,
         total_output_sats,
         rbf_signaling,
-        locktime_type: "none".into(),
+        locktime_type: locktime_type(locktime),
         vin: vin_reports,
         vout: vout_reports,
         warnings,
@@ -752,9 +1231,9 @@ pub fn analyze_tx(network: &str, raw_tx_hex: &str, prevouts: &[Prevout]) -> Resu
 
         for k in &keys {
             let (value, spk) = prevmap
-                .get(k)
+                .remove(k)
                 .ok_or_else(|| "missing prevout".to_string())?;
-            prevouts_ordered.push((*value, spk.clone()));
+            prevouts_ordered.push((value, spk));
         }
     }
 

@@ -246,10 +246,7 @@ pub(crate) fn parse_tx_skip_and_txid_le(
     Ok(sha256d_finish(h))
 }
 
-pub(crate) fn parse_tx_skip(block: &[u8], bc: &mut Cursor) -> Result<(), String> {
-    // keep the signature similar; `block` isn't needed, but we keep it to match call sites
-    let _ = block;
-
+pub(crate) fn parse_tx_skip(_block: &[u8], bc: &mut Cursor) -> Result<(), String> {
     let _version = bc.take_u32_le()?;
 
     // Detect segwit marker/flag.
@@ -261,41 +258,47 @@ pub(crate) fn parse_tx_skip(block: &[u8], bc: &mut Cursor) -> Result<(), String>
         }
         true
     } else {
-        bc.i -= 1; // unread the peek byte
+        bc.i -= 1;
         false
     };
 
     // vin
-    let vin_count = read_varint(bc)?;
-    ensure_len("tx", "vin_count", vin_count, 50_000)?;
+    let vin_count_u64 = read_varint(bc)?;
+    ensure_len("tx", "vin_count", vin_count_u64, 50_000)?;
+    let vin_count = vin_count_u64 as usize;
+
     for _ in 0..vin_count {
         let _ = bc.take(32)?; // prev txid
         let _ = bc.take(4)?;  // vout
-        let script_len = read_varint(bc)?;
-        ensure_len("tx", "script_sig_len", script_len, 1_000_000)?;
-        let _ = bc.take(script_len as usize)?; // scriptSig
+        let script_len_u64 = read_varint(bc)?;
+        ensure_len("tx", "script_sig_len", script_len_u64, 1_000_000)?;
+        let _ = bc.take(script_len_u64 as usize)?; // scriptSig
         let _ = bc.take(4)?; // sequence
     }
 
     // vout
-    let vout_count = read_varint(bc)?;
-    ensure_len("tx", "vout_count", vout_count, 50_000)?;
+    let vout_count_u64 = read_varint(bc)?;
+    ensure_len("tx", "vout_count", vout_count_u64, 50_000)?;
+    let vout_count = vout_count_u64 as usize;
+
     for _ in 0..vout_count {
         let _ = bc.take(8)?; // value
-        let spk_len = read_varint(bc)?;
-        ensure_len("tx", "script_pubkey_len", spk_len, 10_000)?;
-        let _ = bc.take(spk_len as usize)?; // scriptPubKey
+        let spk_len_u64 = read_varint(bc)?;
+        ensure_len("tx", "script_pubkey_len", spk_len_u64, 10_000)?;
+        let _ = bc.take(spk_len_u64 as usize)?; // scriptPubKey
     }
 
     // witness (only present in segwit txs)
     if segwit {
         for _ in 0..vin_count {
-            let n_items = read_varint(bc)?;
-            ensure_len("tx", "witness_item_count", n_items, 10_000)?;
+            let n_items_u64 = read_varint(bc)?;
+            ensure_len("tx", "witness_item_count", n_items_u64, 10_000)?;
+            let n_items = n_items_u64 as usize;
+
             for _ in 0..n_items {
-                let item_len = read_varint(bc)?;
-                ensure_len("tx", "witness_item_len", item_len, 4_000_000)?;
-                let _ = bc.take(item_len as usize)?;
+                let item_len_u64 = read_varint(bc)?;
+                ensure_len("tx", "witness_item_len", item_len_u64, 4_000_000)?;
+                let _ = bc.take(item_len_u64 as usize)?;
             }
         }
     }

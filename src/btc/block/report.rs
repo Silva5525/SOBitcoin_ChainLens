@@ -1,16 +1,19 @@
 // src/btc/block/report.rs
 
 use serde::Serialize;
+use std::collections::BTreeMap;
+
 use crate::btc::tx::TxReport;
 
 #[derive(Debug, Serialize)]
 pub struct BlockReport {
     pub ok: bool,
-    pub mode: String, // "block"
+    /// Always "block" in block parsing mode.
+    pub mode: &'static str,
     pub block_header: BlockHeaderReport,
     pub tx_count: u64,
     pub coinbase: CoinbaseReport,
-	pub transactions: Vec<TxReport>,
+    pub transactions: Vec<TxReport>,
     pub block_stats: BlockStatsReport,
 }
 
@@ -38,5 +41,6 @@ pub struct BlockStatsReport {
     pub total_fees_sats: u64,
     pub total_weight: u64,
     pub avg_fee_rate_sat_vb: f64,
-    pub script_type_summary: serde_json::Value,
+    /// Map of script_type -> count. Using BTreeMap keeps JSON output deterministic.
+    pub script_type_summary: BTreeMap<String, u64>,
 }
