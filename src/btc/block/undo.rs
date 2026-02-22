@@ -1,4 +1,49 @@
 // src/btc/block/undo.rs
+//
+// PLAN (Performance)
+// This module has two roles:
+//   (1) Full undo decoding (values + scriptPubKeys) for report generation.
+//   (2) Structural validation used during blk↔rev pairing (fallback path).
+//
+// The pairing fallback currently calls:
+//   validate_undo_payload_against_block(block, undo_payload)
+// which does:
+//   - parse every tx (already needed) to get slice ranges
+//   - then re-parse each tx slice again via extract_vin_count_from_slice
+//   - then fully parse the undo payload via parse_undo_payload_strict
+//     which allocates Vec for each script (and may invoke k256 decompression).
+//
+// For pairing we do NOT need scripts/amounts materialized. We only need:
+//   - undo txundo count matches tx_count-1 (or tx_count if coinbase-undo included)
+//   - each txundo's vin_n matches the block's vin_count for that tx
+//   - the undo payload is well-formed and has no trailing bytes
+//
+// Therefore we add a fast, allocation-free validator:
+//   validate_undo_payload_against_block_fast(...)
+// that:
+//   A) extracts vin_counts_non_cb in ONE pass while skipping txs
+//      (ideally via a helper in parser.rs that returns vin_count when skipping)
+//   B) parses undo payload structurally by SKIPPING inundo bodies without allocating:
+//      - read ncode (varint_core) to know if tx_version present
+//      - read comp_amt (varint_core)
+//      - skip compressed_script based on nsize (varint_core)
+//      - never decompress pubkeys, never build script Vec
+//   C) ensures cursor ends exactly at end (no trailing bytes)
+//
+// We keep the existing strict decoders (parse_undo_payload_strict / _slices) for
+// report generation.
+//
+// Next code changes:
+//   1) Add skip_compressed_script(rc) -> ()
+//   2) Add skip_one_inundo(rc) -> ()
+//   3) Add skip_undo_for_block(rc, vin_counts_non_cb) -> ()
+//   4) Change validate_undo_payload_against_block() to use the fast skip parser
+//      (or add a new function and switch pairing fallback to call it).
+//
+// Optional extra win:
+//   - Add parser::parse_tx_skip_and_vin_count(...) so we don't re-parse tx slice.
+//     That reduces block scanning work by ~2x inside validation.
+//
 
 use super::parser;
 
@@ -468,7 +513,7 @@ pub(crate) fn extract_vin_count_from_slice(raw_tx: &[u8]) -> Result<u64, String>
     extract_vin_count(raw_tx)
 }
 
-pub(crate) fn validate_undo_payload_against_block(
+pub(crate) fn validate_undo_payload_against_block_fast(
     block: &[u8],
     undo_payload: &[u8],
 ) -> Result<(), String> {
@@ -507,4 +552,182 @@ pub(crate) fn validate_undo_payload_against_block(
     // Validate that undo payload parses cleanly against computed vin counts
     let _ = parse_undo_payload_strict(undo_payload, &vin_counts_non_cb)?;
     Ok(())
+}
+
+
+// ============================================================================
+// PATCH: src/btc/block/undo.rs — allocation-free validation for pairing
+// ============================================================================
+// NOTE: This is intended to be copied into the real undo.rs. It assumes the
+// existing helpers already present in your undo.rs (from ALL_FILES.txt):
+//   - err(...)
+//   - ensure_len(...)
+//   - read_compactsize(&mut Cursor) -> u64
+//   - read_varint_core(&mut Cursor) -> u64   (Bitcoin Core base-128 VarInt)
+//   - extract_vin_count_from_slice(...)
+//   - parse_tx_skip_and_txid_le(...)
+//
+// The goal is to make validate_undo_payload_against_block() fast by *skipping*
+// inundo bodies instead of allocating Vec scripts / decompressing pubkeys.
+
+#[inline]
+fn skip_compressed_script(rc: &mut parser::Cursor) -> Result<(), String> {
+    // ScriptCompressor uses Bitcoin Core base-128 VarInt (not CompactSize).
+    let nsize = read_varint_core(rc)?;
+
+    match nsize {
+        0 | 1 => {
+            // P2PKH or P2SH: 20-byte hash160
+            let _ = rc.take(20)?;
+            Ok(())
+        }
+        2 | 3 | 4 | 5 => {
+            // P2PK: 32-byte X coordinate (compressed or uncompressed key)
+            let _ = rc.take(32)?;
+            Ok(())
+        }
+        _ => {
+            if nsize < 6 {
+                return Err(err("INVALID_SCRIPT_COMPRESSION", "nsize < 6 unexpected"));
+            }
+            let raw_len_u64 = nsize - 6;
+            ensure_len("undo", "compressed_script_raw_len", raw_len_u64, 100_000)?;
+            let raw_len: usize = usize::try_from(raw_len_u64)
+                .map_err(|_| err("LEN_OVERFLOW", format!("raw_len too large for usize: {raw_len_u64}")))?;
+            let _ = rc.take(raw_len)?;
+            Ok(())
+        }
+    }
+}
+
+#[inline]
+fn skip_one_inundo(rc: &mut parser::Cursor) -> Result<(), String> {
+    // Matches read_one_inundo/read_one_inundo_slice structure:
+    //   ncode (varint_core)
+    //   optional tx_version (varint_core) if height>0
+    //   comp_amt (varint_core)
+    //   compressed_script (varint_core + payload)
+    let ncode = read_varint_core(rc)?;
+    let height = ncode >> 1;
+    if height > 0 {
+        let _tx_version = read_varint_core(rc)?;
+    }
+    let _comp_amt = read_varint_core(rc)?;
+    skip_compressed_script(rc)?;
+    Ok(())
+}
+
+fn validate_undo_payload_strict_structure(
+    undo_payload: &[u8],
+    vin_counts_non_cb: &[u64],
+) -> Result<(), String> {
+    let mut uc = parser::Cursor::new(undo_payload);
+
+    // CBlockUndo: CompactSize(nTxUndo)
+    // Usually tx_count - 1, but some fixtures include an extra empty CTxUndo for coinbase.
+    let n_txundo = read_compactsize(&mut uc)?;
+    ensure_len("undo", "n_txundo", n_txundo, 200_000)?;
+
+    let expected = vin_counts_non_cb.len() as u64;
+
+    let mut has_cb_undo = false;
+    if n_txundo == expected {
+        // ok
+    } else if n_txundo == expected.saturating_add(1) {
+        has_cb_undo = true;
+    } else {
+        return Err(err(
+            "UNDO_MISMATCH",
+            format!(
+                "undo txundo count mismatch: undo={}, expected={} (or {} if coinbase included)",
+                n_txundo,
+                expected,
+                expected.saturating_add(1)
+            ),
+        ));
+    }
+
+    if has_cb_undo {
+        let cb_vin_n = read_compactsize(&mut uc)?;
+        if cb_vin_n != 0 {
+            return Err(err(
+                "UNDO_MISMATCH",
+                format!("coinbase undo present but vin_n != 0: got={cb_vin_n}"),
+            ));
+        }
+    }
+
+    for (txundo_idx, &vin_expected) in vin_counts_non_cb.iter().enumerate() {
+        let vin_n = read_compactsize(&mut uc)?;
+        ensure_len("undo", "vin_count", vin_n, 100_000)?;
+
+        if vin_n != vin_expected {
+            return Err(err(
+                "UNDO_MISMATCH",
+                format!(
+                    "undo vin count mismatch: txundo_idx={} undo={} expected={}",
+                    txundo_idx, vin_n, vin_expected
+                ),
+            ));
+        }
+
+        // Skip vin_n inputs.
+        for _ in 0..(vin_n as usize) {
+            skip_one_inundo(&mut uc)?;
+        }
+    }
+
+    if uc.remaining() != 0 {
+        return Err(err(
+            "UNDO_TRAILING_BYTES",
+            format!("undo payload has {} trailing bytes", uc.remaining()),
+        ));
+    }
+
+    Ok(())
+}
+
+// --- Drop-in replacement for your existing function ---
+// This preserves the external signature but makes it much faster.
+// It still computes vin_counts_non_cb the same way as before; a further speedup
+// is possible by adding a parser helper that returns vin_count during skip.
+
+pub(crate) fn validate_undo_payload_against_block(
+    block: &[u8],
+    undo_payload: &[u8],
+) -> Result<(), String> {
+    let mut bc = parser::Cursor::new(block);
+
+    if bc.remaining() < 80 {
+        return Err(err("INVALID_BLOCK", "block payload too small for header"));
+    }
+
+    // Skip header (no allocation)
+    let _header = bc.take(80)?;
+
+    let tx_count = parser::read_varint(&mut bc)?;
+    if tx_count == 0 {
+        return Err(err("INVALID_BLOCK", "block has zero transactions"));
+    }
+
+    // We only need vin-counts for non-coinbase txs.
+    // Parse each tx as a slice range without copying.
+    let mut vin_counts_non_cb: Vec<u64> =
+        Vec::with_capacity((tx_count as usize).saturating_sub(1));
+
+    for tx_idx in 0..(tx_count as usize) {
+        let start = bc.pos();
+        let _txid_le = parser::parse_tx_skip_and_txid_le(block, &mut bc)?;
+        let end = bc.pos();
+
+        if tx_idx == 0 {
+            // coinbase: ignore
+            continue;
+        }
+
+        vin_counts_non_cb.push(extract_vin_count_from_slice(&block[start..end])?);
+    }
+
+    // FAST structural validation (no script allocations, no pubkey decompression)
+    validate_undo_payload_strict_structure(undo_payload, &vin_counts_non_cb)
 }

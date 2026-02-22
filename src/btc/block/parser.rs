@@ -1,3 +1,4 @@
+
 // src/btc/block/parser.rs
 
 use sha2::{Digest, Sha256};
@@ -148,6 +149,19 @@ pub(crate) fn parse_tx_skip_and_txid_le(
     block: &[u8],
     bc: &mut Cursor,
 ) -> Result<[u8; 32], String> {
+    // Backwards-compatible wrapper.
+    let (txid, _vin_count) = parse_tx_skip_and_txid_le_and_vin_count(block, bc)?;
+    Ok(txid)
+}
+
+/// Skip a transaction in `block` at the current cursor position, returning both the txid (LE)
+/// and the vin_count.
+///
+/// This avoids a second parse when callers need vin_count (e.g. undo pairing/validation).
+pub(crate) fn parse_tx_skip_and_txid_le_and_vin_count(
+    block: &[u8],
+    bc: &mut Cursor,
+) -> Result<([u8; 32], u64), String> {
     let start = bc.pos();
 
     let version = bc.take_u32_le()?;
@@ -187,7 +201,7 @@ pub(crate) fn parse_tx_skip_and_txid_le(
 
         let _ = bc.take(4)?; // locktime
         let end = bc.pos();
-        return Ok(dsha256(&block[start..end]));
+        return Ok((dsha256(&block[start..end]), vin_count));
     }
 
     // Segwit: stream stripped serialization directly into hasher.
@@ -243,7 +257,66 @@ pub(crate) fn parse_tx_skip_and_txid_le(
     let lock = bc.take(4)?;
     h.update(lock);
 
-    Ok(sha256d_finish(h))
+    Ok((sha256d_finish(h), vin_count))
+}
+
+/// Skip a transaction and return only the vin_count.
+///
+/// This is cheaper than computing txid and is useful when callers only need
+/// input counts (e.g. undo parsing/validation).
+pub(crate) fn parse_tx_skip_and_vin_count(bc: &mut Cursor) -> Result<u64, String> {
+    let _version = bc.take_u32_le()?;
+
+    // Detect segwit marker/flag.
+    let peek = bc.take_u8()?;
+    let segwit = if peek == 0x00 {
+        let flag = bc.take_u8()?;
+        if flag != 0x01 {
+            return Err(err("INVALID_TX", "invalid segwit flag"));
+        }
+        true
+    } else {
+        bc.i -= 1;
+        false
+    };
+
+    // vin
+    let vin_count = read_varint(bc)?;
+    ensure_len("tx", "vin_count", vin_count, 50_000)?;
+    for _ in 0..vin_count {
+        let _ = bc.take(32)?;
+        let _ = bc.take(4)?;
+        let script_len = read_varint(bc)?;
+        ensure_len("tx", "script_sig_len", script_len, 1_000_000)?;
+        let _ = bc.take(script_len as usize)?;
+        let _ = bc.take(4)?;
+    }
+
+    // vout
+    let vout_count = read_varint(bc)?;
+    ensure_len("tx", "vout_count", vout_count, 50_000)?;
+    for _ in 0..vout_count {
+        let _ = bc.take(8)?;
+        let spk_len = read_varint(bc)?;
+        ensure_len("tx", "script_pubkey_len", spk_len, 10_000)?;
+        let _ = bc.take(spk_len as usize)?;
+    }
+
+    // witness (only present in segwit txs)
+    if segwit {
+        for _ in 0..vin_count {
+            let n_items = read_varint(bc)?;
+            ensure_len("tx", "witness_item_count", n_items, 10_000)?;
+            for _ in 0..n_items {
+                let item_len = read_varint(bc)?;
+                ensure_len("tx", "witness_item_len", item_len, 4_000_000)?;
+                let _ = bc.take(item_len as usize)?;
+            }
+        }
+    }
+
+    let _ = bc.take(4)?; // locktime
+    Ok(vin_count)
 }
 
 pub(crate) fn parse_tx_skip(_block: &[u8], bc: &mut Cursor) -> Result<(), String> {
