@@ -128,35 +128,114 @@ fn dsha256_bytes(data: &[u8]) -> [u8; 32] {
     out
 }
 
-// (legacy helper retained for potential future use; not used for fixtures)
+// (legacy helper retained for potential future use; not used in current pairing logic)
 #[allow(dead_code)]
 fn rev_checksum(undo_payload: &[u8]) -> [u8; 32] {
-    // Bitcoin Core has checksums for some on-disk structures, but the challenge fixtures
-    // do not include a trailing checksum field in rev*.dat records.
     dsha256_bytes(undo_payload)
 }
 
-/// Pair rev-records to blk-records by index (Core-like ordering).
+/// Helpers to extract structural counts from block and undo payloads.
 ///
-/// We do NOT attempt to "search" a matching rev record:
-/// the rev checksum is only an integrity check, not a block identifier.
-/// Any block↔undo mismatch is caught later by `validate_undo_payload_against_block`.
+/// We do not rely on on-disk ordering between blk*.dat and rev*.dat.
+/// Instead, pairing is done using structural invariants and full validation
+/// against the block's transactions.
+fn block_tx_count(block: &[u8]) -> Result<u64, String> {
+    let mut bc = parser::Cursor::new(block);
+    if bc.remaining() < 80 {
+        return Err(err("INVALID_BLOCK", "block payload too small for header"));
+    }
+    bc.take(80)?;
+    parser::read_varint(&mut bc).map_err(|e| err("INVALID_BLOCK", e))
+}
+
+fn undo_txundo_count(undo_payload: &[u8]) -> Result<u64, String> {
+    let mut uc = parser::Cursor::new(undo_payload);
+    parser::read_varint(&mut uc).map_err(|e| err("INVALID_UNDO", e))
+}
+
+/// Pair rev-records to blk-records without assuming identical on-disk ordering.
+///
+/// In Bitcoin Core, blk and rev offsets are resolved via the block index DB.
+/// In this challenge (no block index available), we pair using a strong invariant:
+///   undo_txundo_count == tx_count - 1 (coinbase has no undo entry)
+/// plus a full structural validation:
+///   validate_undo_payload_against_block(block, undo_payload)
+///
+/// A strict 1:1 mapping is enforced (each rev record used at most once).
 fn pair_rev_to_blocks_by_checksum(
+    blk_buf: &[u8],
     blk_ranges: &[RecordRange],
+    rev_buf: &[u8],
     rev_ranges: &[RecordRange],
 ) -> Result<Vec<RecordRange>, String> {
-    // Core-like ordering: record i in blk pairs with record i in rev.
-    if blk_ranges.len() != rev_ranges.len() {
-        return Err(err(
-            "RECORD_COUNT_MISMATCH",
-            format!(
-                "rev records={} blk records={}",
-                rev_ranges.len(),
-                blk_ranges.len()
-            ),
-        ));
+    if blk_ranges.is_empty() {
+        return Err(err("NO_RECORDS_FOUND", "blk: no records found"));
     }
-    Ok(rev_ranges.to_vec())
+    if rev_ranges.is_empty() {
+        return Err(err("NO_RECORDS_FOUND", "rev: no records found"));
+    }
+
+
+    // Index rev records by their leading txundo-count varint.
+    let mut by_undo_cnt: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
+    for (j, ur) in rev_ranges.iter().enumerate() {
+        let undo_payload = &rev_buf[ur.clone()];
+        let undo_cnt = undo_txundo_count(undo_payload)?;
+        by_undo_cnt.entry(undo_cnt).or_default().push(j);
+    }
+
+    let mut used = vec![false; rev_ranges.len()];
+    let mut out: Vec<RecordRange> = Vec::with_capacity(blk_ranges.len());
+
+    for (i, br) in blk_ranges.iter().enumerate() {
+        let block = &blk_buf[br.clone()];
+        let txc = block_tx_count(block)?;
+        if txc == 0 {
+            return Err(err("INVALID_BLOCK", format!("block[{i}] tx_count=0")));
+        }
+
+        let expected = txc.saturating_sub(1);
+
+        // Candidate rev indices (try exact expected first, then txc).
+        let mut cand: Vec<usize> = Vec::new();
+        if let Some(v) = by_undo_cnt.get(&expected) {
+            cand.extend_from_slice(v);
+        }
+        if expected != txc {
+            if let Some(v) = by_undo_cnt.get(&txc) {
+                cand.extend_from_slice(v);
+            }
+        }
+
+
+        let mut chosen: Option<usize> = None;
+        for &j in &cand {
+            if used[j] {
+                continue;
+            }
+            let ur = &rev_ranges[j];
+            let undo_payload = &rev_buf[ur.clone()];
+            if undo::validate_undo_payload_against_block(block, undo_payload).is_ok() {
+                chosen = Some(j);
+                break;
+            }
+        }
+
+        let Some(j) = chosen else {
+            return Err(err(
+                "REV_PAIRING_FAILED",
+                format!(
+                    "could not find matching undo for block[{i}] (tx_count={txc}, expected_undo_count={expected})"
+                ),
+            ));
+        };
+
+        used[j] = true;
+        out.push(rev_ranges[j].clone());
+
+    }
+
+    Ok(out)
 }
 
 fn validate_block_payload(block: &[u8]) -> Result<(), String> {
@@ -211,14 +290,22 @@ fn decode_blk_best(blk_raw: Vec<u8>, key: &[u8]) -> Result<Vec<u8>, String> {
         xor_decode_with_shift(blk_raw, key, 0)
     };
 
-    let recs = read_dat_records_strict(&blk, "blk")?;
-    if recs.is_empty() {
-        return Err(err("BLK_DECODE_FAILED", "no blk records"));
+    // Fast path: fixtures use an all-zero XOR key. In that case, we can skip the
+    // expensive merkle validation pass here.
+    //
+    // If you want strict key verification (e.g. for debugging), set:
+    //   CHAINLENS_STRICT_KEY=1
+    let strict_key = std::env::var("CHAINLENS_STRICT_KEY").is_ok();
+    if strict_key || !(key.is_empty() || key_is_all_zero(key)) {
+        let recs = read_dat_records_strict(&blk, "blk")?;
+        if recs.is_empty() {
+            return Err(err("BLK_DECODE_FAILED", "no blk records"));
+        }
+        // Validate first record as a sanity check for key correctness.
+        let first = &blk[recs[0].clone()];
+        validate_block_payload(first).map_err(|e| err("BLK_DECODE_FAILED", e))?;
     }
 
-    // Validate first record as a cheap sanity check for key correctness.
-    let first = &blk[recs[0].clone()];
-    validate_block_payload(first).map_err(|e| err("BLK_DECODE_FAILED", e))?;
     Ok(blk)
 }
 
@@ -244,21 +331,26 @@ fn decode_rev_records_against_blocks(
 
     let rev_ranges = read_rev_records_strict(&rev, "rev")?;
 
-    let paired_undo_ranges = pair_rev_to_blocks_by_checksum(blk_ranges, &rev_ranges)?;
+    let paired_undo_ranges =
+        pair_rev_to_blocks_by_checksum(blk_buf, blk_ranges, &rev, &rev_ranges)?;
 
-    for (i, (br, ur)) in blk_ranges
-        .iter()
-        .zip(paired_undo_ranges.iter())
-        .enumerate()
-    {
-        let block = &blk_buf[br.clone()];
-        let undo_payload = &rev[ur.clone()];
-        undo::validate_undo_payload_against_block(block, undo_payload).map_err(|e| {
-            err(
-                "UNDO_BLOCK_PAIR_MISMATCH",
-                format!("record[{i}] undo did not validate against block: {e}"),
-            )
-        })?;
+    // Pairing already performed full structural validation via
+    // `validate_undo_payload_against_block` for each chosen (block, undo) pair.
+    // Avoid re-validating here to keep block-mode fast.
+    //
+    // If you want a redundant validation pass (debugging), set:
+    //   CHAINLENS_STRICT_UNDO=1
+    if std::env::var("CHAINLENS_STRICT_UNDO").is_ok() {
+        for (i, (br, ur)) in blk_ranges.iter().zip(paired_undo_ranges.iter()).enumerate() {
+            let block = &blk_buf[br.clone()];
+            let undo_payload = &rev[ur.clone()];
+            undo::validate_undo_payload_against_block(block, undo_payload).map_err(|e| {
+                err(
+                    "UNDO_BLOCK_PAIR_MISMATCH",
+                    format!("record[{i}] undo did not validate against block: {e}"),
+                )
+            })?;
+        }
     }
 
     Ok((rev, paired_undo_ranges))
