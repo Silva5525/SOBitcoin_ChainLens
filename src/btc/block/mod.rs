@@ -10,6 +10,7 @@ pub use report::{BlockHeaderReport, BlockReport, BlockStatsReport, CoinbaseRepor
 use std::collections::BTreeMap;
 use std::fs;
 
+
 use crate::btc::tx::analyze_tx_from_bytes_ordered;
 
 use io::decode_blk_and_rev_best;
@@ -18,6 +19,17 @@ use undo::{extract_vin_count_from_slice, parse_undo_payload_strict};
 
 fn err(code: &str, msg: impl AsRef<str>) -> String {
     format!("{code}: {}", msg.as_ref())
+}
+
+fn txid_display_hex_to_le(s: &str) -> Result<[u8; 32], String> {
+    let mut be = [0u8; 32];
+    let raw = hex::decode(s).map_err(|_| err("INVALID_TXID", "txid is not valid hex"))?;
+    if raw.len() != 32 {
+        return Err(err("INVALID_TXID", "txid wrong length"));
+    }
+    be.copy_from_slice(&raw);
+    be.reverse(); // display hex = BE, merkle uses LE
+    Ok(be)
 }
 
 /// Analyze all txs in a block (coinbase + non-coinbase) using undo prevouts.
@@ -214,33 +226,23 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
     // --- parse txs (NO raw tx copies) ---
     let tx_count = parser::read_varint(&mut bc)?;
 
-    let mut txids_le: Vec<[u8; 32]> = Vec::with_capacity(tx_count as usize);
-    let mut tx_ranges: Vec<(usize, usize)> = Vec::with_capacity(tx_count as usize);
+	let mut tx_ranges: Vec<(usize, usize)> = Vec::with_capacity(tx_count as usize);
 
-    for _ in 0..tx_count {
-        let start = bc.pos();
-        let txid_le = parser::parse_tx_skip_and_txid_le(block, &mut bc)?;
-        let end = bc.pos();
-        txids_le.push(txid_le);
-        tx_ranges.push((start, end));
-    }
-
-    // --- verify merkle ---
-    let mr_calc = merkle_root(&txids_le);
-    if mr_calc != merkle_le {
-        return Err(err(
-            "MERKLE_MISMATCH",
-            format!(
-                "header={} computed={}",
-                merkle_root_hdr_display,
-                hash_to_display_hex(mr_calc)
-            ),
-        ));
-    }
+	for _ in 0..tx_count {
+		let start = bc.pos();
+		parser::parse_tx_skip(block, &mut bc)?;
+		let end = bc.pos();
+		tx_ranges.push((start, end));
+	}
 
     if tx_ranges.is_empty() {
         return Err(err("INVALID_BLOCK", "block has zero transactions"));
     }
+
+	let mut vin_counts_non_cb: Vec<u64> = Vec::with_capacity(tx_ranges.len().saturating_sub(1));
+	for &(s, e) in tx_ranges.iter().skip(1) {
+		vin_counts_non_cb.push(parser::extract_vin_count_from_slice(&block[s..e])?);
+	}
 
     // --- coinbase ---
     let (cb_s, cb_e) = tx_ranges[0];
@@ -249,15 +251,31 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
     let bip34_height = parser::decode_bip34_height(&coinbase_script);
     let coinbase_script_hex = bytes_to_hex(&coinbase_script);
 
-    // --- undo parse needs vin counts of non-coinbase txs ---
-    let mut vin_counts_non_cb: Vec<u64> = Vec::with_capacity(tx_ranges.len().saturating_sub(1));
-    for &(s, e) in tx_ranges.iter().skip(1) {
-        vin_counts_non_cb.push(extract_vin_count_from_slice(&block[s..e])?);
-    }
+	let mut vin_counts_non_cb: Vec<u64> = Vec::with_capacity(tx_ranges.len().saturating_sub(1));
+	for &(s, e) in tx_ranges.iter().skip(1) {
+		vin_counts_non_cb.push(extract_vin_count_from_slice(&block[s..e])?);
+	}
     let undo_prevouts = parse_undo_payload_strict(undo_payload, &vin_counts_non_cb)?;
 
     // --- analyze txs (bounded parallelism, slices) ---
     let tx_reports = analyze_txs_with_undo_slices(block, &tx_ranges, &undo_prevouts)?;
+
+	let mut txids_le: Vec<[u8; 32]> = Vec::with_capacity(tx_reports.len());
+	for tx in &tx_reports {
+		txids_le.push(txid_display_hex_to_le(&tx.txid)?);
+	}
+
+	let mr_calc = merkle_root(&txids_le);
+	if mr_calc != merkle_le {
+		return Err(err(
+			"MERKLE_MISMATCH",
+			format!(
+				"header={} computed={}",
+				merkle_root_hdr_display,
+				hash_to_display_hex(mr_calc)
+			),
+		));
+	}
 
     // --- block stats ---
     let mut total_fees: u64 = 0;
@@ -404,13 +422,26 @@ fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockR
             .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
         vec![coinbase_report]
     } else {
-        let mut vin_counts_non_cb: Vec<u64> = Vec::with_capacity(tx_ranges.len().saturating_sub(1));
-        for &(s, e) in tx_ranges.iter().skip(1) {
-            vin_counts_non_cb.push(extract_vin_count_from_slice(&block[s..e])?);
-        }
-        let undo_prevouts = parse_undo_payload_strict(undo_payload, &vin_counts_non_cb)?;
+	let undo_prevouts = parse_undo_payload_strict(undo_payload, &vin_counts_non_cb)?;
         analyze_txs_with_undo_slices(block, &tx_ranges, &undo_prevouts)?
     };
+
+	let mut txids_le: Vec<[u8; 32]> = Vec::with_capacity(tx_reports.len());
+	for tx in &tx_reports {
+		txids_le.push(txid_display_hex_to_le(&tx.txid)?);
+	}
+
+	let mr_calc = merkle_root(&txids_le);
+	if mr_calc != merkle_le {
+		return Err(err(
+			"MERKLE_MISMATCH",
+			format!(
+				"header={} computed={}",
+				merkle_root_hdr_display,
+				hash_to_display_hex(mr_calc)
+			),
+		));
+	}
 
     // --- block stats (NO JSON get()) ---
     let mut total_fees: u64 = 0;
