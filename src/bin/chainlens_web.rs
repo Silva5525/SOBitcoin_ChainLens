@@ -107,8 +107,16 @@ async fn health() -> impl IntoResponse {
     Json(json!({ "ok": true }))
 }
 
+// Serves the single-page visualizer UI.
+// File path is relative to this source file: src/bin/chainlens_web.rs
+// index.html is located at: src/btc/web/static/index.html (per your repo layout)
+// This file is in: src/bin/chainlens_web.rs
+// So we go up one level (to src/) and then into btc/web/static/
+const INDEX_HTML: &str = include_str!("../btc/web/static/index.html");
+
 async fn index() -> impl IntoResponse {
-    Html("Chain Lens Web API running. Use /api/health or POST /api/analyze.")
+    // Html sets content-type to text/html; charset=utf-8
+    Html(INDEX_HTML)
 }
 
 async fn analyze_tx_fixture(

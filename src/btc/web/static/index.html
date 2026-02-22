@@ -1,0 +1,542 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ChainLens — Bitcoin Transaction Visualizer</title>
+  <script>
+    // Minimal "utility" CSS (no external deps). Inspired by Tailwind spacing/typography.
+    const css = `
+      :root{--bg:#0b0f19;--panel:#111827;--panel2:#0f172a;--text:#e5e7eb;--muted:#9ca3af;--line:#1f2937;--ok:#34d399;--warn:#fbbf24;--bad:#fb7185;--accent:#60a5fa;}
+      *{box-sizing:border-box} html,body{height:100%}
+      body{margin:0;font:14px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; background:radial-gradient(1200px 800px at 20% 0%, #0b1227 0%, var(--bg) 55%); color:var(--text)}
+      a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+      .wrap{max-width:1180px;margin:0 auto;padding:24px}
+      .top{display:flex;gap:14px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}
+      .brand{display:flex;gap:12px;align-items:center}
+      .logo{width:40px;height:40px;border-radius:14px;background:linear-gradient(135deg,#2563eb,#22c55e);box-shadow:0 10px 24px rgba(0,0,0,.35)}
+      h1{margin:0;font-size:18px;letter-spacing:.2px}
+      .sub{margin-top:2px;color:var(--muted);font-size:12.5px}
+      .pill{display:inline-flex;gap:8px;align-items:center;border:1px solid var(--line);background:rgba(17,24,39,.65);padding:6px 10px;border-radius:999px;color:var(--muted)}
+      .pill b{color:var(--text);font-weight:600}
+      .grid{display:grid;grid-template-columns:1.1fr .9fr;gap:14px;margin-top:16px}
+      @media (max-width: 980px){.grid{grid-template-columns:1fr}}
+      .card{background:rgba(17,24,39,.75);border:1px solid var(--line);border-radius:18px;box-shadow:0 20px 45px rgba(0,0,0,.25)}
+      .card .hd{padding:14px 14px 10px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:10px}
+      .card .bd{padding:14px}
+      .title{font-size:13px;color:var(--muted)}
+      .btn{cursor:pointer;border:1px solid var(--line);background:rgba(15,23,42,.9);color:var(--text);padding:10px 12px;border-radius:14px;display:inline-flex;gap:8px;align-items:center}
+      .btn:hover{border-color:#334155}
+      .btn:disabled{opacity:.55;cursor:not-allowed}
+      .btn.primary{background:linear-gradient(135deg,#2563eb,#22c55e);border-color:transparent}
+      .btn.ghost{background:transparent}
+      .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+      textarea,input,select{width:100%;border:1px solid var(--line);background:rgba(15,23,42,.9);color:var(--text);border-radius:14px;padding:10px 12px;outline:none}
+      textarea{min-height:160px;resize:vertical}
+      label{display:block;color:var(--muted);font-size:12px;margin-bottom:6px}
+      .kpi{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+      @media (max-width: 980px){.kpi{grid-template-columns:repeat(2,1fr)}}
+      .k{padding:12px;border:1px solid var(--line);border-radius:16px;background:rgba(15,23,42,.7)}
+      .k .n{color:var(--muted);font-size:11.5px}
+      .k .v{margin-top:6px;font-size:16px;font-weight:650}
+      .k .s{margin-top:3px;color:var(--muted);font-size:12px}
+      .bad{color:var(--bad)} .ok{color:var(--ok)} .warn{color:var(--warn)}
+      .tabs{display:flex;gap:8px;flex-wrap:wrap}
+      .tab{padding:7px 10px;border-radius:999px;border:1px solid var(--line);background:rgba(15,23,42,.7);color:var(--muted);cursor:pointer}
+      .tab.active{background:rgba(96,165,250,.18);color:var(--text);border-color:rgba(96,165,250,.35)}
+      table{width:100%;border-collapse:separate;border-spacing:0 8px}
+      th{color:var(--muted);font-size:11.5px;text-align:left;font-weight:600;padding:0 8px}
+      td{padding:10px 8px;background:rgba(15,23,42,.7);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+      tr td:first-child{border-left:1px solid var(--line);border-top-left-radius:14px;border-bottom-left-radius:14px}
+      tr td:last-child{border-right:1px solid var(--line);border-top-right-radius:14px;border-bottom-right-radius:14px}
+      code, pre{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+      pre{margin:0;padding:12px;border-radius:16px;border:1px solid var(--line);background:rgba(15,23,42,.85);overflow:auto;max-height:360px}
+      .mini{font-size:12px;color:var(--muted)}
+      .bar{height:10px;border-radius:999px;background:rgba(148,163,184,.18);overflow:hidden;border:1px solid rgba(148,163,184,.15)}
+      .bar > div{height:100%;background:linear-gradient(90deg,#60a5fa,#22c55e)}
+      .svgbox{border:1px solid var(--line);background:rgba(15,23,42,.6);border-radius:18px;overflow:hidden}
+      .hint{color:var(--muted);font-size:12px}
+      .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:22px;background:rgba(17,24,39,.92);border:1px solid var(--line);padding:10px 12px;border-radius:14px;box-shadow:0 18px 40px rgba(0,0,0,.35);opacity:0;pointer-events:none;transition:opacity .18s}
+      .toast.show{opacity:1}
+    `;
+    const style = document.createElement('style'); style.textContent = css; document.head.appendChild(style);
+  </script>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div class="brand">
+        <div class="logo"></div>
+        <div>
+          <h1>ChainLens</h1>
+          <div class="sub">Bitcoin transaction & block analysis — fast, deterministic, fixture-friendly.</div>
+        </div>
+      </div>
+      <div class="row">
+        <div class="pill"><span>API</span> <b id="apiState">checking…</b></div>
+        <button class="btn" id="btnHealth">Check health</button>
+        <a class="btn ghost" href="/api/health" target="_blank" rel="noopener">/api/health</a>
+      </div>
+    </div>
+
+    <div class="grid">
+      <!-- Left: Input / Story -->
+      <div class="card">
+        <div class="hd">
+          <div>
+            <div class="title">Input</div>
+            <div style="font-weight:650;font-size:14px">Analyze a transaction fixture</div>
+          </div>
+          <div class="row">
+            <select id="network">
+              <option value="mainnet">mainnet</option>
+              <option value="testnet">testnet</option>
+              <option value="signet">signet</option>
+              <option value="regtest">regtest</option>
+            </select>
+            <button class="btn primary" id="btnAnalyze">Analyze</button>
+          </div>
+        </div>
+        <div class="bd">
+          <div class="row" style="justify-content:space-between;align-items:flex-end">
+            <div style="flex:1">
+              <label>Paste fixture JSON (recommended)</label>
+              <textarea id="fixture" spellcheck="false" placeholder='{"network":"mainnet","raw_tx":"...","prevouts":[...]}'></textarea>
+              <div class="hint" style="margin-top:8px">Tip: you can also load a file. The UI posts to <code>/api/analyze</code>.</div>
+            </div>
+          </div>
+
+          <div class="row" style="margin-top:10px">
+            <input type="file" id="file" accept="application/json" />
+            <button class="btn" id="btnLoad">Load JSON</button>
+            <button class="btn" id="btnExample">Example</button>
+            <button class="btn" id="btnClear">Clear</button>
+          </div>
+
+          <div style="margin-top:14px" class="tabs">
+            <div class="tab active" data-tab="story">Story</div>
+            <div class="tab" data-tab="graph">Flow</div>
+            <div class="tab" data-tab="raw">Raw JSON</div>
+          </div>
+
+          <div id="tab_story" style="margin-top:12px">
+            <div class="mini" id="storyText">Run an analysis to see a human-readable summary here.</div>
+          </div>
+
+          <div id="tab_graph" style="display:none;margin-top:12px">
+            <div class="svgbox">
+              <svg id="flow" width="100%" height="260" viewBox="0 0 980 260" preserveAspectRatio="none"></svg>
+            </div>
+            <div class="hint" style="margin-top:8px">Left = inputs (prevouts), Right = outputs. Fee is shown as a separate sink.</div>
+          </div>
+
+          <div id="tab_raw" style="display:none;margin-top:12px">
+            <pre id="rawOut">{}</pre>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: Results -->
+      <div class="card">
+        <div class="hd">
+          <div>
+            <div class="title">Report</div>
+            <div style="font-weight:650;font-size:14px">Transaction summary</div>
+          </div>
+          <div class="row">
+            <button class="btn" id="btnCopy">Copy JSON</button>
+            <button class="btn" id="btnToggleTech">Show technical details</button>
+          </div>
+        </div>
+        <div class="bd">
+          <div class="kpi">
+            <div class="k"><div class="n">TXID</div><div class="v" id="k_txid">—</div><div class="s" id="k_txid_s"></div></div>
+            <div class="k"><div class="n">Fee</div><div class="v" id="k_fee">—</div><div class="s" id="k_feerate">—</div></div>
+            <div class="k"><div class="n">Size</div><div class="v" id="k_vb">—</div><div class="s" id="k_wt">—</div></div>
+            <div class="k"><div class="n">SegWit</div><div class="v" id="k_sw">—</div><div class="s" id="k_sw_s">—</div></div>
+          </div>
+
+          <div style="margin-top:12px" class="row">
+            <div style="flex:1">
+              <div class="mini">Warnings</div>
+              <div id="warnings" class="mini" style="margin-top:6px">—</div>
+            </div>
+          </div>
+
+          <div style="margin-top:12px" class="tabs">
+            <div class="tab active" data-tab2="io">Inputs & Outputs</div>
+            <div class="tab" data-tab2="scripts">Scripts</div>
+            <div class="tab" data-tab2="tech">Technical</div>
+          </div>
+
+          <div id="tab2_io" style="margin-top:12px">
+            <div class="mini">Inputs</div>
+            <div style="margin-top:6px;overflow:auto">
+              <table id="tbl_in"><thead><tr><th>#</th><th>Spend type</th><th>Value (sats)</th><th>Outpoint</th></tr></thead><tbody></tbody></table>
+            </div>
+            <div class="mini" style="margin-top:12px">Outputs</div>
+            <div style="margin-top:6px;overflow:auto">
+              <table id="tbl_out"><thead><tr><th>#</th><th>Script type</th><th>Value (sats)</th><th>Address/Asm</th></tr></thead><tbody></tbody></table>
+            </div>
+          </div>
+
+          <div id="tab2_scripts" style="display:none;margin-top:12px">
+            <div class="mini">Script type distribution (by output count)</div>
+            <div style="margin-top:8px" id="scriptBars"></div>
+          </div>
+
+          <div id="tab2_tech" style="display:none;margin-top:12px">
+            <div class="mini">Locktimes</div>
+            <div style="margin-top:8px" class="row">
+              <div class="k" style="flex:1"><div class="n">Locktime</div><div class="v" id="t_lock">—</div><div class="s" id="t_lock_s">—</div></div>
+              <div class="k" style="flex:1"><div class="n">RBF</div><div class="v" id="t_rbf">—</div><div class="s" id="t_rbf_s">—</div></div>
+            </div>
+            <div style="margin-top:10px" class="mini">Full report JSON</div>
+            <div style="margin-top:8px"><pre id="jsonFull">{}</pre></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    // ---------- helpers ----------
+    const $ = (id) => document.getElementById(id);
+    const toast = (msg) => {
+      const t = $('toast');
+      t.textContent = msg;
+      t.classList.add('show');
+      setTimeout(() => t.classList.remove('show'), 1200);
+    };
+
+    function safeJsonParse(s) {
+      try { return [JSON.parse(s), null]; } catch (e) { return [null, e]; }
+    }
+
+    function sats(n){
+      if (n === null || n === undefined) return '—';
+      const x = Number(n);
+      if (!Number.isFinite(x)) return String(n);
+      return x.toLocaleString('en-US');
+    }
+
+    function shortHex(h, n=10){
+      if (!h || typeof h !== 'string') return '—';
+      if (h.length <= n*2) return h;
+      return h.slice(0,n) + '…' + h.slice(-n);
+    }
+
+    function setText(id, v){ $(id).textContent = v; }
+
+    // ---------- tabs ----------
+    document.querySelectorAll('[data-tab]').forEach(el => {
+      el.addEventListener('click', () => {
+        document.querySelectorAll('[data-tab]').forEach(x => x.classList.remove('active'));
+        el.classList.add('active');
+        ['story','graph','raw'].forEach(t => {
+          $('tab_'+t).style.display = (t === el.dataset.tab) ? '' : 'none';
+        });
+      });
+    });
+
+    document.querySelectorAll('[data-tab2]').forEach(el => {
+      el.addEventListener('click', () => {
+        document.querySelectorAll('[data-tab2]').forEach(x => x.classList.remove('active'));
+        el.classList.add('active');
+        ['io','scripts','tech'].forEach(t => {
+          $('tab2_'+t).style.display = (t === el.dataset.tab2) ? '' : 'none';
+        });
+      });
+    });
+
+    // ---------- health ----------
+    async function checkHealth(){
+      try {
+        const r = await fetch('/api/health', {cache:'no-store'});
+        const j = await r.json();
+        if (r.ok && j && j.ok === true) {
+          setText('apiState', 'ok');
+          $('apiState').className = 'ok';
+          return true;
+        }
+        setText('apiState', 'error');
+        $('apiState').className = 'bad';
+        return false;
+      } catch {
+        setText('apiState', 'offline');
+        $('apiState').className = 'bad';
+        return false;
+      }
+    }
+
+    $('btnHealth').addEventListener('click', checkHealth);
+    checkHealth();
+
+    // ---------- load file ----------
+    $('btnLoad').addEventListener('click', async () => {
+      const f = $('file').files?.[0];
+      if (!f) return toast('Pick a JSON file first');
+      const txt = await f.text();
+      $('fixture').value = txt;
+      toast('Loaded');
+    });
+
+    $('btnExample').addEventListener('click', () => {
+      $('fixture').value = JSON.stringify({
+        network: $('network').value,
+        raw_tx: "<paste-raw-tx-hex-here>",
+        prevouts: [
+          { txid: "<txid>", vout: 0, value_sats: 100000, script_pubkey_hex: "<hex>" }
+        ]
+      }, null, 2);
+      toast('Example inserted');
+    });
+
+    $('btnClear').addEventListener('click', () => {
+      $('fixture').value = '';
+      $('rawOut').textContent = '{}';
+      $('jsonFull').textContent = '{}';
+      toast('Cleared');
+    });
+
+    // ---------- copy JSON ----------
+    $('btnCopy').addEventListener('click', async () => {
+      const txt = $('jsonFull').textContent;
+      await navigator.clipboard.writeText(txt);
+      toast('Copied');
+    });
+
+    // ---------- technical toggle ----------
+    let showTech = false;
+    $('btnToggleTech').addEventListener('click', () => {
+      showTech = !showTech;
+      $('btnToggleTech').textContent = showTech ? 'Hide technical details' : 'Show technical details';
+      if (showTech){
+        document.querySelector('[data-tab2="tech"]').click();
+      } else {
+        document.querySelector('[data-tab2="io"]').click();
+      }
+    });
+
+    // ---------- render ----------
+    function render(report){
+      const txid = report?.txid || report?.txid_hex || report?.id || '—';
+      const fee = report?.fee_sats;
+      const feerate = report?.fee_rate_sat_vb;
+      const vbytes = report?.vbytes;
+      const weight = report?.weight;
+      const is_segwit = report?.is_segwit;
+      const savings = report?.segwit_savings;
+
+      setText('k_txid', shortHex(txid, 14));
+      setText('k_txid_s', txid && txid !== '—' ? txid : '');
+      setText('k_fee', fee == null ? '—' : (sats(fee) + ' sats'));
+      setText('k_feerate', feerate == null ? '—' : (Number(feerate).toFixed(1) + ' sat/vB'));
+      setText('k_vb', vbytes == null ? '—' : (sats(vbytes) + ' vB'));
+      setText('k_wt', weight == null ? '—' : (sats(weight) + ' WU'));
+      setText('k_sw', is_segwit ? 'yes' : 'no');
+      setText('k_sw_s', savings ? (sats(savings.saved_vbytes) + ' vB saved') : '');
+
+      const ws = report?.warnings || [];
+      if (!ws.length) {
+        $('warnings').innerHTML = '<span class="ok">none</span>';
+      } else {
+        $('warnings').innerHTML = ws.map(w => {
+          const code = w.code || w;
+          const msg = w.message ? ` — ${w.message}` : '';
+          return `<span class="warn"><b>${code}</b>${msg}</span>`;
+        }).join('<br/>');
+      }
+
+      const inBody = $('tbl_in').querySelector('tbody');
+      inBody.innerHTML = '';
+      const vins = report?.inputs || report?.vin || [];
+      vins.forEach((vin, idx) => {
+        const spend = vin?.spend_type || vin?.type || '—';
+        const value = vin?.prevout_value_sats ?? vin?.value_sats ?? vin?.value ?? null;
+        const op = vin?.outpoint || (vin?.prevout_txid && (vin.prevout_txid + ':' + vin.prevout_vout));
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${idx}</td>
+          <td><code>${spend}</code></td>
+          <td>${sats(value)}</td>
+          <td><code>${op ? shortHex(String(op), 16) : '—'}</code></td>
+        `;
+        inBody.appendChild(tr);
+      });
+
+      const outBody = $('tbl_out').querySelector('tbody');
+      outBody.innerHTML = '';
+      const vouts = report?.outputs || report?.vout || [];
+      vouts.forEach((vout, idx) => {
+        const st = vout?.script_type || vout?.type || '—';
+        const value = vout?.value_sats ?? vout?.value ?? null;
+        const addr = vout?.address || vout?.script_asm || vout?.script_pubkey_asm || '—';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${idx}</td>
+          <td><code>${st}</code></td>
+          <td>${sats(value)}</td>
+          <td><code>${String(addr).slice(0,64)}${String(addr).length>64?'…':''}</code></td>
+        `;
+        outBody.appendChild(tr);
+      });
+
+      const dist = report?.script_type_summary || report?.output_script_type_summary || null;
+      const sb = $('scriptBars');
+      sb.innerHTML = '';
+      if (dist && typeof dist === 'object') {
+        const entries = Object.entries(dist).sort((a,b)=>b[1]-a[1]);
+        const total = entries.reduce((s,[,v])=>s+Number(v||0),0) || 1;
+        entries.forEach(([k,v]) => {
+          const pct = (Number(v||0)/total)*100;
+          const div = document.createElement('div');
+          div.style.marginBottom = '10px';
+          div.innerHTML = `
+            <div class="row" style="justify-content:space-between">
+              <div><code>${k}</code></div>
+              <div class="mini">${v} (${pct.toFixed(1)}%)</div>
+            </div>
+            <div class="bar" style="margin-top:6px"><div style="width:${pct}%"></div></div>
+          `;
+          sb.appendChild(div);
+        });
+      } else {
+        sb.innerHTML = '<div class="mini">No script summary available in the report.</div>';
+      }
+
+      const ltType = report?.locktime_type;
+      const ltVal = report?.locktime_value;
+      setText('t_lock', ltVal == null ? '—' : String(ltVal));
+      setText('t_lock_s', ltType ? String(ltType) : '');
+      const rbf = report?.rbf_signaling;
+      setText('t_rbf', rbf === true ? 'signaling' : (rbf === false ? 'no' : '—'));
+      setText('t_rbf_s', rbf === true ? 'At least one input opts in (BIP125).' : '');
+
+      const insum = report?.inputs_sum_sats ?? report?.total_in_sats;
+      const outsum = report?.outputs_sum_sats ?? report?.total_out_sats;
+      const feeText = fee == null ? 'an unknown fee' : (sats(fee) + ' sats');
+      const rateText = feerate == null ? 'unknown fee rate' : (Number(feerate).toFixed(1) + ' sat/vB');
+      const parts = [];
+      if (txid && txid !== '—') parts.push(`<b>TXID</b> <code>${txid}</code>.`);
+      if (insum != null && outsum != null) parts.push(`Moves <b>${sats(insum)}</b> sats in and <b>${sats(outsum)}</b> sats out.`);
+      parts.push(`Pays <b>${feeText}</b> at <b>${rateText}</b>.`);
+      parts.push(`SegWit: <b>${is_segwit ? 'yes' : 'no'}</b>.`);
+      $('storyText').innerHTML = parts.join(' ');
+
+      const pretty = JSON.stringify(report, null, 2);
+      $('rawOut').textContent = pretty;
+      $('jsonFull').textContent = pretty;
+
+      drawFlow(vins, vouts, fee);
+    }
+
+    function drawFlow(vins, vouts, fee){
+      const svg = $('flow');
+      svg.innerHTML = '';
+      const inVals = vins.map(v => Number(v?.prevout_value_sats ?? v?.value_sats ?? v?.value ?? 0)).map(x=>Number.isFinite(x)?x:0);
+      const outVals = vouts.map(v => Number(v?.value_sats ?? v?.value ?? 0)).map(x=>Number.isFinite(x)?x:0);
+      const totalIn = inVals.reduce((a,b)=>a+b,0) || 1;
+      const totalOut = outVals.reduce((a,b)=>a+b,0);
+      const feeVal = Number.isFinite(Number(fee)) ? Number(fee) : Math.max(totalIn - totalOut, 0);
+
+      function node(x,y,w,h,label,sub){
+        const g = document.createElementNS('http://www.w3.org/2000/svg','g');
+        const r = document.createElementNS('http://www.w3.org/2000/svg','rect');
+        r.setAttribute('x',x); r.setAttribute('y',y);
+        r.setAttribute('width',w); r.setAttribute('height',h);
+        r.setAttribute('rx',14);
+        r.setAttribute('fill','rgba(17,24,39,0.9)');
+        r.setAttribute('stroke','rgba(31,41,55,1)');
+        g.appendChild(r);
+        const t = document.createElementNS('http://www.w3.org/2000/svg','text');
+        t.setAttribute('x',x+12); t.setAttribute('y',y+22);
+        t.setAttribute('fill','#e5e7eb'); t.setAttribute('font-size','12'); t.textContent = label;
+        g.appendChild(t);
+        const s = document.createElementNS('http://www.w3.org/2000/svg','text');
+        s.setAttribute('x',x+12); s.setAttribute('y',y+42);
+        s.setAttribute('fill','#9ca3af'); s.setAttribute('font-size','11'); s.textContent = sub || '';
+        g.appendChild(s);
+        svg.appendChild(g);
+      }
+
+      function link(x1,y1,x2,y2,thick){
+        const p = document.createElementNS('http://www.w3.org/2000/svg','path');
+        const c = (x2-x1)*0.45;
+        const d = `M ${x1} ${y1} C ${x1+c} ${y1}, ${x2-c} ${y2}, ${x2} ${y2}`;
+        p.setAttribute('d', d);
+        p.setAttribute('fill','none');
+        p.setAttribute('stroke','rgba(96,165,250,0.55)');
+        p.setAttribute('stroke-width', Math.max(1.5, thick));
+        p.setAttribute('stroke-linecap','round');
+        svg.appendChild(p);
+      }
+
+      node(60, 30, 200, 56, `Inputs (${vins.length})`, `${sats(totalIn)} sats`);
+      node(390, 30, 200, 56, 'Transaction', 'value flow');
+      node(720, 30, 200, 56, `Outputs (${vouts.length})`, `${sats(totalOut)} sats`);
+      node(720, 110, 200, 56, 'Fee', `${sats(feeVal)} sats`);
+
+      const base = 18;
+      link(260, 58, 390, 58, base);
+      link(590, 58, 720, 58, base);
+      link(590, 74, 720, 138, Math.max(6, base * (feeVal/totalIn)));
+
+      const maxItems = 8;
+      const inIdx = vins.length > maxItems ? Array.from({length:maxItems}, (_,i)=>i) : Array.from({length:vins.length}, (_,i)=>i);
+      const outIdx = vouts.length > maxItems ? Array.from({length:maxItems}, (_,i)=>i) : Array.from({length:vouts.length}, (_,i)=>i);
+      inIdx.forEach((i, k) => {
+        const y = 110 + k*16;
+        const thick = 2 + 10*(inVals[i]/totalIn);
+        link(260, 58, 390, y, thick);
+      });
+      outIdx.forEach((i, k) => {
+        const y = 110 + k*16;
+        const thick = 2 + 10*(outVals[i]/(totalOut||1));
+        link(590, 58, 720, y, thick);
+      });
+    }
+
+    $('btnAnalyze').addEventListener('click', async () => {
+      const txt = $('fixture').value.trim();
+      if (!txt) return toast('Paste fixture JSON first');
+      const [obj, err] = safeJsonParse(txt);
+      if (err) return toast('Invalid JSON');
+      if (!obj.network) obj.network = $('network').value;
+
+      $('btnAnalyze').disabled = true;
+      $('btnAnalyze').textContent = 'Analyzing…';
+      try {
+        const r = await fetch('/api/analyze', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(obj),
+        });
+        const j = await r.json();
+        if (!r.ok || !j || j.ok === false) {
+          const code = j?.error?.code || 'HTTP_'+r.status;
+          const msg = j?.error?.message || 'Request failed';
+          $('storyText').innerHTML = `<span class="bad"><b>${code}</b> — ${msg}</span>`;
+          $('rawOut').textContent = JSON.stringify(j, null, 2);
+          $('jsonFull').textContent = JSON.stringify(j, null, 2);
+          toast('Error');
+          return;
+        }
+        const report = j.report || j;
+        render(report);
+        toast('Done');
+      } catch (e) {
+        $('storyText').innerHTML = `<span class="bad"><b>NETWORK</b> — ${String(e)}</span>`;
+        toast('Network error');
+      } finally {
+        $('btnAnalyze').disabled = false;
+        $('btnAnalyze').textContent = 'Analyze';
+      }
+    });
+  </script>
+</body>
+</html>
+*/
+

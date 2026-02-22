@@ -1,27 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
+cd "$(dirname "$0")"
+
 
 ###############################################################################
-# web.sh — Bitcoin transaction web visualizer
-#
-# Starts the web visualizer server.
+# web.sh — ChainLens Web Visualizer
 #
 # Behavior:
 #   - Reads PORT env var (default: 3000)
-#   - Prints the URL (e.g., http://127.0.0.1:3000) to stdout
-#   - Keeps running until terminated (CTRL+C / SIGTERM)
+#   - Prints the URL exactly once (e.g., http://127.0.0.1:3000)
+#   - Keeps running until terminated
 #   - Must serve GET /api/health -> 200 { "ok": true }
-#
-# TODO: Replace the stub below with your web server start command.
 ###############################################################################
+
 
 PORT="${PORT:-3000}"
 
-# TODO: Start your web server here, for example:
-#   exec node server.js
-#   exec python -m http.server "$PORT"
-#   exec cargo run --release -- --port "$PORT"
+if [[ ! -x "./target/release/chainlens_web" ]]; then
+  cargo build --release >/dev/null
+fi
 
-echo "Error: Web visualizer is not yet implemented" >&2
-echo "Set up your web server to listen on port $PORT" >&2
-exit 1
+export PORT
+exec ./target/release/chainlens_web
