@@ -18,6 +18,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4"
 k256 = "0.13"
+ahash = "0.8"
 
 [features]
 framing_fuzz = []
@@ -29,6 +30,7 @@ panic = "abort"
 opt-level = 3
 strip = true
 
+
 [[bin]]
 name = "chainlens_cli"
 path = "src/bin/chainlens_cli.rs"
@@ -36,3 +38,4 @@ path = "src/bin/chainlens_cli.rs"
 [[bin]]
 name = "chainlens_web"
 path = "src/bin/chainlens_web.rs"
+

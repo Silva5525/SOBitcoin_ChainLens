@@ -1,8 +1,9 @@
 // src/btc/tx.rs
 
+
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use ahash::AHashMap;
 use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Clone)]
@@ -271,13 +272,6 @@ fn normalize_input_script_type(out_type: &str) -> String {
         "p2sh" => "unknown".to_string(),
         other => other.to_string(),
     }
-}
-
-#[derive(Clone)]
-struct PrevoutEntry {
-    value_sats: u64,
-    script_pubkey_hex: String,
-    output_script_type: String,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -615,73 +609,36 @@ pub fn analyze_tx_from_bytes_ordered(
 
 pub fn analyze_tx(network: &str, raw_tx_hex: &str, prevouts: &[Prevout]) -> Result<TxReport, String> {
     let raw = hex_to_bytes(raw_tx_hex)?;
-    let size_bytes = raw.len();
-    let wtxid_full = hash_to_display_hex(dsha256(&raw));
 
-        let mut prevmap: HashMap<PrevoutKey, PrevoutEntry> = HashMap::with_capacity(prevouts.len().saturating_mul(2));
-    for p in prevouts {
-        // Prevout.txid_hex is display big-endian; tx serialization uses little-endian.
-        let mut be = hex_to_bytes(&p.txid_hex)?;
-        if be.len() != 32 {
-            return Err("prevout txid must be 32 bytes".into());
-        }
-        be.reverse();
-        let mut txid_le = [0u8; 32];
-        txid_le.copy_from_slice(&be);
-
-        let spk_hex = p.script_pubkey_hex.to_lowercase();
-        let spk_bytes = hex_to_bytes(&spk_hex)?;
-        let out_type = script_type(&spk_bytes);
-
-        prevmap.insert(
-            PrevoutKey { txid_le, vout: p.vout },
-            PrevoutEntry {
-                value_sats: p.value_sats,
-                script_pubkey_hex: spk_hex,
-                output_script_type: out_type,
-            },
-        );
-    }
-
+    // --- 1) First pass: parse only the input outpoints (vin order) ---
     let mut c = Cursor::new(&raw);
-    let mut stripped: Vec<u8> = Vec::with_capacity(raw.len());
 
-    let version = c.take_u32_le()?;
-    stripped.extend_from_slice(&version.to_le_bytes());
+    // version
+    let _version = c.take_u32_le()?;
 
-    let mut segwit = false;
+    // segwit marker/flag (if present)
     let peek = c.take_u8()?;
     if peek == 0x00 {
         let flag = c.take_u8()?;
         if flag != 0x01 {
             return Err("invalid segwit flag".into());
         }
-        segwit = true;
     } else {
         c.backtrack_1()?;
     }
 
     let vin_count_u64 = read_varint(&mut c)?;
     let vin_count = vin_count_u64 as usize;
-    write_varint(&mut stripped, vin_count_u64);
 
-        let mut vin_outpoints: Vec<(String, u32)> = Vec::with_capacity(vin_count);
-    let mut vin_keys: Vec<PrevoutKey> = Vec::with_capacity(vin_count);
-    let mut vin_script_sigs: Vec<Vec<u8>> = Vec::with_capacity(vin_count);
-    let mut vin_sequences: Vec<u32> = Vec::with_capacity(vin_count);
-
-    let mut rbf_signaling = false;
+    // Collect outpoints as (txid_le, vout) in vin order.
     let mut coinbase = false;
+    let mut keys: Vec<PrevoutKey> = Vec::with_capacity(vin_count);
 
-    for _ in 0..vin_count {
-                let prev_txid_le_bytes = c.take(32)?;
+    for vin_idx in 0..vin_count {
+        let prev_txid_le_bytes = c.take(32)?;
         let prev_vout = c.take_u32_le()?;
 
-        let mut txid_le = [0u8; 32];
-        txid_le.copy_from_slice(prev_txid_le_bytes);
-        vin_keys.push(PrevoutKey { txid_le, vout: prev_vout });
-
-        if !coinbase
+        if vin_idx == 0
             && vin_count == 1
             && prev_vout == 0xffff_ffff
             && prev_txid_le_bytes.iter().all(|&b| b == 0)
@@ -689,257 +646,78 @@ pub fn analyze_tx(network: &str, raw_tx_hex: &str, prevouts: &[Prevout]) -> Resu
             coinbase = true;
         }
 
-                stripped.extend_from_slice(prev_txid_le_bytes);
-        stripped.extend_from_slice(&prev_vout.to_le_bytes());
+        let script_len = read_varint(&mut c)? as usize;
+        let _ = c.take(script_len)?; // scriptSig
+        let _sequence = c.take_u32_le()?; // sequence
 
-                let mut be = prev_txid_le_bytes.to_vec();
+        if !coinbase {
+            let mut txid_le = [0u8; 32];
+            txid_le.copy_from_slice(prev_txid_le_bytes);
+            keys.push(PrevoutKey { txid_le, vout: prev_vout });
+        }
+    }
+
+    // Coinbase txs don't require prevouts.
+    if coinbase {
+        return analyze_tx_from_bytes_ordered(network, &raw, &[]);
+    }
+
+    if prevouts.len() != keys.len() {
+        return Err(format!(
+            "prevouts length mismatch: got {} expected {}",
+            prevouts.len(),
+            keys.len()
+        ));
+    }
+
+    // Helper: fixture prevout uses display big-endian txid; tx serialization uses little-endian.
+    #[inline]
+    fn prevout_key_from_hex(txid_hex: &str, vout: u32) -> Result<PrevoutKey, String> {
+        let mut be = hex_to_bytes(txid_hex)?;
+        if be.len() != 32 {
+            return Err("prevout txid must be 32 bytes".into());
+        }
         be.reverse();
-        let prev_txid_hex = bytes_to_hex(&be);
-        vin_outpoints.push((prev_txid_hex, prev_vout));
+        let mut txid_le = [0u8; 32];
+        txid_le.copy_from_slice(&be);
+        Ok(PrevoutKey { txid_le, vout })
+    }
 
-        let script_len_u64 = read_varint(&mut c)?;
-        let script_len = script_len_u64 as usize;
-        write_varint(&mut stripped, script_len_u64);
-
-        let script_sig = c.take(script_len)?;
-        stripped.extend_from_slice(script_sig);
-        vin_script_sigs.push(script_sig.to_vec());
-
-        let sequence = c.take_u32_le()?;
-        stripped.extend_from_slice(&sequence.to_le_bytes());
-        vin_sequences.push(sequence);
-
-        if sequence < 0xffff_fffe {
-            rbf_signaling = true;
+    // --- 2) Fast path: if fixture prevouts are already in vin order, avoid HashMap entirely ---
+    let mut ordered_ok = true;
+    for (i, p) in prevouts.iter().enumerate() {
+        let k = prevout_key_from_hex(&p.txid_hex, p.vout)?;
+        if k != keys[i] {
+            ordered_ok = false;
+            break;
         }
     }
 
-    let vout_count_u64 = read_varint(&mut c)?;
-    let vout_count = vout_count_u64 as usize;
-    write_varint(&mut stripped, vout_count_u64);
+    let mut prevouts_ordered: Vec<(u64, Vec<u8>)> = Vec::with_capacity(keys.len());
 
-    let mut total_output_sats: u64 = 0;
-    let mut vout_reports: Vec<VoutReport> = Vec::with_capacity(vout_count);
-    let mut has_unknown_output = false;
+    if ordered_ok {
+        for p in prevouts {
+            prevouts_ordered.push((p.value_sats, hex_to_bytes(&p.script_pubkey_hex)?));
+        }
+    } else {
+        // --- 3) General path: build a fast hash map from outpoint -> (value, script_pubkey_bytes) ---
+        let mut prevmap: AHashMap<PrevoutKey, (u64, Vec<u8>)> =
+            AHashMap::with_capacity(prevouts.len().saturating_mul(2));
 
-    for _ in 0..vout_count {
-        let value = c.take_u64_le()?;
-        total_output_sats = total_output_sats.saturating_add(value);
-        stripped.extend_from_slice(&value.to_le_bytes());
-
-        let spk_len_u64 = read_varint(&mut c)?;
-        let spk_len = spk_len_u64 as usize;
-        write_varint(&mut stripped, spk_len_u64);
-
-        let spk = c.take(spk_len)?;
-        stripped.extend_from_slice(spk);
-
-        let stype = script_type(spk);
-        if stype == "unknown" {
-            has_unknown_output = true;
+        for p in prevouts {
+            let k = prevout_key_from_hex(&p.txid_hex, p.vout)?;
+            let spk_bytes = hex_to_bytes(&p.script_pubkey_hex)?;
+            prevmap.insert(k, (p.value_sats, spk_bytes));
         }
 
-        let (op_hex, op_utf8, op_proto) = if stype == "op_return" {
-            if let Some(data) = parse_op_return_data(spk) {
-                let h = bytes_to_hex(&data);
-                let u = std::str::from_utf8(&data).ok().map(|s| s.to_string());
-                (Some(h), u, Some("unknown".to_string()))
-            } else {
-                (Some(String::new()), None, Some("unknown".to_string()))
-            }
-        } else {
-            (None, None, None)
-        };
-
-        vout_reports.push(VoutReport {
-            n: vout_reports.len() as u32,
-            value_sats: value,
-            script_pubkey_hex: bytes_to_hex(spk),
-            script_asm: String::new(),
-            script_type: stype,
-            address: None,
-            op_return_data_hex: op_hex,
-            op_return_data_utf8: op_utf8,
-            op_return_protocol: op_proto,
-        });
-    }
-
-    let mut witnesses: Vec<Vec<String>> = vec![Vec::new(); vin_count];
-    if segwit {
-        for slot in witnesses.iter_mut() {
-            let n_stack = read_varint(&mut c)? as usize;
-            let mut items: Vec<String> = Vec::with_capacity(n_stack);
-            for _ in 0..n_stack {
-                let item_len = read_varint(&mut c)? as usize;
-                let item = c.take(item_len)?;
-                items.push(bytes_to_hex(item));
-            }
-            *slot = items;
+        for k in &keys {
+            let (value, spk) = prevmap
+                .get(k)
+                .ok_or_else(|| "missing prevout".to_string())?;
+            prevouts_ordered.push((*value, spk.clone()));
         }
     }
 
-    let locktime = c.take_u32_le()?;
-    stripped.extend_from_slice(&locktime.to_le_bytes());
-
-    if c.remaining() != 0 {
-        return Err("trailing bytes after parsing".into());
-    }
-
-    let txid = if segwit {
-        hash_to_display_hex(dsha256(&stripped))
-    } else {
-        hash_to_display_hex(dsha256(&raw))
-    };
-
-    let mut total_input_sats: u64 = 0;
-    let mut vin_reports: Vec<VinReport> = Vec::with_capacity(vin_count);
-
-    if coinbase {
-        rbf_signaling = false;
-    }
-
-    for i in 0..vin_count {
-        let (ref txid_in, vout_in) = vin_outpoints[i];
-
-        if coinbase {
-            vin_reports.push(VinReport {
-                txid: txid_in.clone(),
-                vout: vout_in,
-                sequence: vin_sequences[i],
-                script_sig_hex: bytes_to_hex(&vin_script_sigs[i]),
-                script_asm: String::new(),
-                witness: witnesses[i].clone(),
-                script_type: "unknown".to_string(),
-                address: None,
-                prevout: PrevoutInfo {
-                    value_sats: 0,
-                    script_pubkey_hex: String::new(),
-                },
-                relative_timelock: RelativeTimelock { enabled: false },
-            });
-            continue;
-        }
-
-                let key = vin_keys[i];
-        let entry = prevmap
-            .get(&key)
-            .ok_or_else(|| format!("missing prevout for input {txid_in}:{vout_in}"))?
-            .clone();
-
-        let val = entry.value_sats;
-                let spk_hex = entry.script_pubkey_hex;
-        let out_type = entry.output_script_type;
-        let in_type = normalize_input_script_type(&out_type);
-
-        total_input_sats = total_input_sats.saturating_add(val);
-
-        vin_reports.push(VinReport {
-            txid: txid_in.clone(),
-            vout: vout_in,
-            sequence: vin_sequences[i],
-            script_sig_hex: bytes_to_hex(&vin_script_sigs[i]),
-            script_asm: String::new(),
-            witness: witnesses[i].clone(),
-            script_type: in_type,
-            address: None,
-            prevout: PrevoutInfo {
-                value_sats: val,
-                script_pubkey_hex: spk_hex,
-            },
-            relative_timelock: RelativeTimelock { enabled: false },
-        });
-    }
-
-    if coinbase {
-        total_input_sats = total_output_sats;
-    }
-
-    let mut fee_sats_i64 = (total_input_sats as i64) - (total_output_sats as i64);
-    if coinbase {
-        fee_sats_i64 = 0;
-    }
-
-    let (weight, vbytes, wtxid_opt) = if segwit {
-        let stripped_size = stripped.len();
-        let witness_size = size_bytes.saturating_sub(stripped_size);
-        let weight = stripped_size * 4 + witness_size;
-        let vbytes = weight.div_ceil(4);
-        (weight, vbytes, Some(wtxid_full))
-    } else {
-        let weight = size_bytes * 4;
-        let vbytes = weight.div_ceil(4);
-        (weight, vbytes, None)
-    };
-
-    let segwit_savings = if segwit {
-        let stripped_size = stripped.len();
-        let witness_bytes = size_bytes.saturating_sub(stripped_size);
-        let non_witness_bytes = stripped_size;
-        let total_bytes = size_bytes;
-
-        let weight_actual = weight;
-        let weight_if_legacy = total_bytes * 4;
-
-        let savings_pct = if weight_if_legacy == 0 {
-            0.0
-        } else {
-            (1.0 - (weight_actual as f64 / weight_if_legacy as f64)) * 100.0
-        };
-
-        Some(SegwitSavings {
-            witness_bytes,
-            non_witness_bytes,
-            total_bytes,
-            weight_actual,
-            weight_if_legacy,
-            savings_pct: (savings_pct * 100.0).round() / 100.0,
-        })
-    } else {
-        None
-    };
-
-    let fee_rate = if coinbase || vbytes == 0 {
-        0.0
-    } else {
-        (fee_sats_i64 as f64) / (vbytes as f64)
-    };
-    let fee_rate_2dp = (fee_rate * 100.0).round() / 100.0;
-
-    let mut warnings: Vec<WarningItem> = Vec::new();
-
-    if rbf_signaling {
-        warnings.push(WarningItem {
-            code: "RBF_SIGNALING".into(),
-        });
-    }
-
-    if has_unknown_output {
-        warnings.push(WarningItem {
-            code: "UNKNOWN_OUTPUT_SCRIPT".into(),
-        });
-    }
-
-    Ok(TxReport {
-        ok: true,
-        network: network.into(),
-        segwit,
-        txid,
-        wtxid: wtxid_opt,
-        version,
-        locktime,
-        locktime_value: locktime,
-        size_bytes,
-        weight,
-        vbytes,
-        fee_sats: fee_sats_i64,
-        fee_rate_sat_vb: fee_rate_2dp,
-        total_input_sats,
-        total_output_sats,
-        rbf_signaling,
-        locktime_type: "none".into(),
-        vin: vin_reports,
-        vout: vout_reports,
-        warnings,
-        segwit_savings,
-    })
+    // --- 4) Run the ordered, allocation-lean analyzer ---
+    analyze_tx_from_bytes_ordered(network, &raw, &prevouts_ordered)
 }
