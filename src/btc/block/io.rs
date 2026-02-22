@@ -76,7 +76,6 @@ pub(crate) fn read_dat_records_strict(
 #[derive(Clone)]
 struct RevRecord {
     undo_range: RecordRange,
-    checksum: [u8; 32],
 }
 
 fn read_rev_records_strict(buf: &[u8], kind: &'static str) -> Result<Vec<RevRecord>, String> {
@@ -113,9 +112,17 @@ fn read_rev_records_strict(buf: &[u8], kind: &'static str) -> Result<Vec<RevReco
         let mut checksum = [0u8; 32];
         checksum.copy_from_slice(&buf[payload_end..checksum_end]);
 
+        let undo_payload = &buf[payload_start..payload_end];
+        let computed = rev_checksum(undo_payload);
+        if computed != checksum {
+            return Err(err(
+                "BAD_UNDO_CHECKSUM",
+                format!("{kind}: rev record checksum mismatch at offset {i} (size={size})"),
+            ));
+        }
+
         out.push(RevRecord {
             undo_range: payload_start..payload_end,
-            checksum,
         });
         i = checksum_end;
     }
@@ -141,65 +148,33 @@ fn rev_checksum(undo_payload: &[u8]) -> [u8; 32] {
     dsha256_bytes(undo_payload)
 }
 
-/// Pair rev-records to blk-records.
+/// Pair rev-records to blk-records by index (Core-like ordering).
 ///
-/// Correctness: ordering is not assumed (fixtures can differ).
-/// Performance: fast path is O(n) by index; only mismatches trigger a scan.
+/// We do NOT attempt to "search" a matching rev record:
+/// the rev checksum is only an integrity check, not a block identifier.
+/// Any block↔undo mismatch is caught later by `validate_undo_payload_against_block`.
 fn pair_rev_to_blocks_by_checksum(
-    blk_buf: &[u8],
+    _blk_buf: &[u8],
     blk_ranges: &[RecordRange],
-    rev_buf: &[u8],
+    _rev_buf: &[u8],
     rev_records: &[RevRecord],
 ) -> Result<Vec<RecordRange>, String> {
     if rev_records.is_empty() {
         return Err(err("REV_PAIRING_FAILED", "no rev records"));
     }
 
-    // Track which rev-records are already consumed.
-    let mut used = vec![false; rev_records.len()];
-
-    let mut out: Vec<RecordRange> = Vec::with_capacity(blk_ranges.len());
-
-    for (i, br) in blk_ranges.iter().enumerate() {
-	let _block = &blk_buf[br.clone()];
-		
-        // --- Fast path: same index (Core-like ordering) ---
-        if i < rev_records.len() && !used[i] {
-            let rr = &rev_records[i];
-            let undo_payload = &rev_buf[rr.undo_range.clone()];
-            let chk = rev_checksum(undo_payload);
-            if chk == rr.checksum {
-                used[i] = true;
-                out.push(rr.undo_range.clone());
-                continue;
-            }
-        }
-
-        // --- Cold path: scan remaining rev records until match ---
-        let mut found: Option<usize> = None;
-        for (j, rr) in rev_records.iter().enumerate() {
-            if used[j] {
-                continue;
-            }
-            let undo_payload = &rev_buf[rr.undo_range.clone()];
-            let chk = rev_checksum(undo_payload);
-            if chk == rr.checksum {
-                found = Some(j);
-                break;
-            }
-        }
-
-        let Some(j) = found else {
-            return Err(err(
-                "REV_PAIRING_FAILED",
-                format!("no matching undo payload found for blk index {i}"),
-            ));
-        };
-
-        used[j] = true;
-        out.push(rev_records[j].undo_range.clone());
+    if blk_ranges.len() != rev_records.len() {
+        return Err(err(
+            "RECORD_COUNT_MISMATCH",
+            format!("blk records={} rev records={}", blk_ranges.len(), rev_records.len()),
+        ));
     }
 
+    // Core-like: record i in blk file corresponds to record i in rev file.
+    let mut out: Vec<RecordRange> = Vec::with_capacity(blk_ranges.len());
+    for rr in rev_records.iter() {
+        out.push(rr.undo_range.clone());
+    }
     Ok(out)
 }
 
