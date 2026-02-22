@@ -144,16 +144,6 @@ pub(crate) fn merkle_root(txids_le: &[[u8; 32]]) -> [u8; 32] {
     level[0]
 }
 
-pub(crate) fn parse_tx_raw_and_txid_le(
-    block: &[u8],
-    bc: &mut Cursor,
-) -> Result<(Vec<u8>, [u8; 32]), String> {
-    let start = bc.pos();
-    let txid_le = parse_tx_skip_and_txid_le(block, bc)?;
-    let end = bc.pos();
-    Ok((block[start..end].to_vec(), txid_le))
-}
-
 pub(crate) fn parse_tx_skip_and_txid_le(
     block: &[u8],
     bc: &mut Cursor,
