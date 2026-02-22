@@ -124,18 +124,20 @@ pub fn analyze_block_file(
     let blk_raw = fs::read(blk_path).map_err(|e| err("IO_ERROR", format!("read blk failed: {e}")))?;
     let rev_raw = fs::read(rev_path).map_err(|e| err("IO_ERROR", format!("read rev failed: {e}")))?;
 
-    let (blk_records, rev_records) = decode_blk_and_rev_best(blk_raw, rev_raw, &key)?;
+    let (blk_buf, blk_ranges, rev_buf, undo_ranges) = decode_blk_and_rev_best(blk_raw, rev_raw, &key)?;
 
-    if blk_records.len() != rev_records.len() {
+    if blk_ranges.len() != undo_ranges.len() {
         return Err(err(
             "RECORD_COUNT_MISMATCH",
-            format!("blk records={} rev records={}", blk_records.len(), rev_records.len()),
+            format!("blk records={} rev records={}", blk_ranges.len(), undo_ranges.len()),
         ));
     }
 
-    let mut out = Vec::with_capacity(blk_records.len());
-    for (block_bytes, undo_bytes) in blk_records.into_iter().zip(rev_records.into_iter()) {
-        out.push(analyze_one_block_payload_record_rev(&block_bytes, &undo_bytes)?);
+    let mut out = Vec::with_capacity(blk_ranges.len());
+    for (br, ur) in blk_ranges.iter().zip(undo_ranges.iter()) {
+        let block = &blk_buf[br.clone()];
+        let undo_payload = &rev_buf[ur.clone()];
+        out.push(analyze_one_block_payload_record_rev(block, undo_payload)?);
     }
 
     Ok(out)
@@ -148,15 +150,16 @@ pub fn analyze_block_file_first_block(blk_path: &str, xor_path: &str) -> Result<
     let key = fs::read(xor_path).map_err(|e| err("IO_ERROR", format!("read xor key failed: {e}")))?;
     let blk_raw = fs::read(blk_path).map_err(|e| err("IO_ERROR", format!("read blk failed: {e}")))?;
 
-    let (blk_records, _blk) = io::decode_blk_best_to_records(blk_raw, &key)?;
+    let (blk_buf, blk_ranges) = io::decode_blk_best_to_records(blk_raw, &key)?;
 
-    let first = blk_records
+    let first = blk_ranges
         .into_iter()
         .next()
         .ok_or_else(|| err("INVALID_BLOCK", "no block records"))?;
 
-    analyze_one_block_payload(&first, &[])
+    analyze_one_block_payload(&blk_buf[first.clone()], &[])
 }
+
 
 fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Result<BlockReport, String> {
     // --- parse header ---
@@ -165,8 +168,9 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
         return Err(err("INVALID_BLOCK", "block payload too small for header"));
     }
 
-    let header = bc.take(80)?.to_vec();
-    let mut hc = Cursor::new(&header);
+    // zero-copy: header ist jetzt ein Slice
+    let header = bc.take(80)?;
+    let mut hc = Cursor::new(header);
 
     let version = hc.take_u32_le()?;
     let prev_le = {
@@ -185,7 +189,7 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
     let bits_u32 = hc.take_u32_le()?;
     let nonce = hc.take_u32_le()?;
 
-    let block_hash_le = parser::dsha256(&header);
+    let block_hash_le = parser::dsha256(header);
     let block_hash = hash_to_display_hex(block_hash_le);
 
     let prev_block_hash = {
@@ -321,8 +325,9 @@ fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockR
         return Err(err("INVALID_BLOCK", "block payload too small for header"));
     }
 
-    let header = bc.take(80)?.to_vec();
-    let mut hc = Cursor::new(&header);
+    // zero-copy: header ist jetzt ein Slice
+    let header = bc.take(80)?;
+    let mut hc = Cursor::new(header);
 
     let version = hc.take_u32_le()?;
     let prev_le = {
@@ -341,9 +346,8 @@ fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockR
     let bits_u32 = hc.take_u32_le()?;
     let nonce = hc.take_u32_le()?;
 
-    let block_hash_le = parser::dsha256(&header);
+    let block_hash_le = parser::dsha256(header);
     let block_hash = hash_to_display_hex(block_hash_le);
-
     let prev_block_hash = {
         let mut be = prev_le;
         be.reverse();

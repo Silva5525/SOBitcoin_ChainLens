@@ -8,3 +8,4 @@ target/
 sample_fixture.json
 tests/
 tests
+magic.sh

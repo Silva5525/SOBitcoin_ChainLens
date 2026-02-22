@@ -259,12 +259,17 @@ pub(crate) fn extract_vin_count_from_slice(raw_tx: &[u8]) -> Result<u64, String>
     extract_vin_count(raw_tx)
 }
 
-pub(crate) fn validate_undo_payload_against_block(block: &[u8], undo_payload: &[u8]) -> Result<(), String> {
+pub(crate) fn validate_undo_payload_against_block(
+    block: &[u8],
+    undo_payload: &[u8],
+) -> Result<(), String> {
     let mut bc = parser::Cursor::new(block);
 
     if bc.remaining() < 80 {
         return Err(err("INVALID_BLOCK", "block payload too small for header"));
     }
+
+    // Skip header (no allocation)
     let _header = bc.take(80)?;
 
     let tx_count = parser::read_varint(&mut bc)?;
@@ -272,17 +277,25 @@ pub(crate) fn validate_undo_payload_against_block(block: &[u8], undo_payload: &[
         return Err(err("INVALID_BLOCK", "block has zero transactions"));
     }
 
-    let mut raw_txs: Vec<Vec<u8>> = Vec::with_capacity(tx_count as usize);
-    for _ in 0..tx_count {
-        let (raw, _txid_le) = parser::parse_tx_raw_and_txid_le(block, &mut bc)?;
-        raw_txs.push(raw);
+    // We only need vin-counts for non-coinbase txs.
+    // Parse each tx as a slice range without copying.
+    let mut vin_counts_non_cb: Vec<u64> =
+        Vec::with_capacity((tx_count as usize).saturating_sub(1));
+
+    for tx_idx in 0..(tx_count as usize) {
+        let start = bc.pos();
+        let _txid_le = parser::parse_tx_skip_and_txid_le(block, &mut bc)?;
+        let end = bc.pos();
+
+        if tx_idx == 0 {
+            // coinbase: ignore
+            continue;
+        }
+
+        vin_counts_non_cb.push(extract_vin_count_from_slice(&block[start..end])?);
     }
 
-    let mut vin_counts_non_cb: Vec<u64> = Vec::with_capacity(raw_txs.len().saturating_sub(1));
-    for raw in raw_txs.iter().skip(1) {
-        vin_counts_non_cb.push(extract_vin_count(raw)?);
-    }
-
+    // Validate that undo payload parses cleanly against computed vin counts
     let _ = parse_undo_payload_strict(undo_payload, &vin_counts_non_cb)?;
     Ok(())
 }
