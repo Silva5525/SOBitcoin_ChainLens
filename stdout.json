@@ -1,7 +1,7 @@
 {
   "error": {
     "code": "BLOCK_PARSE_ERROR",
-    "message": "REV_PAIRING_FAILED: could not find matching undo record for block[2] tx_count=3960 (expected undo_count 3959 or 3960) near rev index 77"
+    "message": "UNDO_BLOCK_PAIR_MISMATCH: record[0] undo did not validate against block: UNDO_MISMATCH: undo txundo count mismatch: undo=3448, expected=3055 (or 3056 if coinbase included)"
   },
   "ok": false
 }
