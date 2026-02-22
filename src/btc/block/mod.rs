@@ -28,7 +28,9 @@ fn analyze_txs_with_undo_slices(
     block: &[u8],
     tx_ranges: &[(usize, usize)],
     undo_prevouts: &[Vec<(u64, Vec<u8>)>],
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<crate::btc::tx::TxReport>, String> {
+    use crate::btc::tx::TxReport;
+
     if tx_ranges.is_empty() {
         return Err(err("INVALID_BLOCK", "block has zero transactions"));
     }
@@ -44,13 +46,14 @@ fn analyze_txs_with_undo_slices(
     }
 
     // Pre-size output and fill coinbase.
-    let mut out: Vec<serde_json::Value> = vec![serde_json::Value::Null; tx_ranges.len()];
+    // Note: `vec![None; n]` requires `Option<TxReport>: Clone` which we don't want.
+    let mut out: Vec<Option<TxReport>> = Vec::with_capacity(tx_ranges.len());
+    out.resize_with(tx_ranges.len(), || None);
 
     let (cb_s, cb_e) = tx_ranges[0];
     let coinbase_report = analyze_tx_from_bytes_ordered("mainnet", &block[cb_s..cb_e], &[])
         .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
-    out[0] = serde_json::to_value(coinbase_report)
-        .map_err(|e| err("SERDE_FAILED", e.to_string()))?;
+    out[0] = Some(coinbase_report);
 
     // For small blocks, sequential is faster (thread overhead dominates).
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
@@ -60,9 +63,14 @@ fn analyze_txs_with_undo_slices(
             let per_in = &undo_prevouts[i - 1];
             let rep = analyze_tx_from_bytes_ordered("mainnet", &block[s..e], per_in)
                 .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
-            out[i] = serde_json::to_value(rep).map_err(|e| err("SERDE_FAILED", e.to_string()))?;
+            out[i] = Some(rep);
         }
-        return Ok(out);
+
+        return out
+            .into_iter()
+            .enumerate()
+            .map(|(i, x)| x.ok_or_else(|| err("INTERNAL", format!("missing tx report at index {i}"))))
+            .collect();
     }
 
     // Parallel hot path.
@@ -81,17 +89,14 @@ fn analyze_txs_with_undo_slices(
                 continue;
             }
 
-            handles.push(scope.spawn(move || -> Result<Vec<(usize, serde_json::Value)>, String> {
-                let mut local: Vec<(usize, serde_json::Value)> = Vec::with_capacity(end_i - start_i);
+            handles.push(scope.spawn(move || -> Result<Vec<(usize, TxReport)>, String> {
+                let mut local: Vec<(usize, TxReport)> = Vec::with_capacity(end_i - start_i);
                 for i in start_i..end_i {
                     let (s, e) = tx_ranges[i];
                     let per_in = &undo_prevouts[i - 1];
-
                     let rep = analyze_tx_from_bytes_ordered("mainnet", &block[s..e], per_in)
                         .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
-                    let v = serde_json::to_value(rep)
-                        .map_err(|e| err("SERDE_FAILED", e.to_string()))?;
-                    local.push((i, v));
+                    local.push((i, rep));
                 }
                 Ok(local)
             }));
@@ -101,15 +106,18 @@ fn analyze_txs_with_undo_slices(
             let local = h
                 .join()
                 .map_err(|_| err("THREAD_PANIC", "tx analysis thread panicked"))??;
-            for (i, v) in local {
-                out[i] = v;
+            for (i, rep) in local {
+                out[i] = Some(rep);
             }
         }
 
         Ok(())
     })?;
 
-    Ok(out)
+    out.into_iter()
+        .enumerate()
+        .map(|(i, x)| x.ok_or_else(|| err("INTERNAL", format!("missing tx report at index {i}"))))
+        .collect()
 }
 
 /// Block-mode entrypoint used by `cli.sh --block`.
@@ -249,7 +257,7 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
     let undo_prevouts = parse_undo_payload_strict(undo_payload, &vin_counts_non_cb)?;
 
     // --- analyze txs (bounded parallelism, slices) ---
-    let tx_reports_json = analyze_txs_with_undo_slices(block, &tx_ranges, &undo_prevouts)?;
+    let tx_reports = analyze_txs_with_undo_slices(block, &tx_ranges, &undo_prevouts)?;
 
     // --- block stats ---
     let mut total_fees: u64 = 0;
@@ -257,28 +265,19 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
     let mut total_vbytes_non_cb: u64 = 0;
     let mut script_summary: BTreeMap<String, u64> = BTreeMap::new();
 
-    for (idx, txv) in tx_reports_json.iter().enumerate() {
-        if let Some(w) = txv.get("weight").and_then(|x| x.as_u64()) {
-            total_weight = total_weight.saturating_add(w);
-        }
+    for (idx, tx) in tx_reports.iter().enumerate() {
+        total_weight = total_weight.saturating_add(tx.weight as u64);
+
         if idx != 0 {
-            if let Some(f) = txv.get("fee_sats").and_then(|x| x.as_u64()) {
-                total_fees = total_fees.saturating_add(f);
+            if tx.fee_sats > 0 {
+                total_fees = total_fees.saturating_add(tx.fee_sats as u64);
             }
-            if let Some(vb) = txv.get("vbytes").and_then(|x| x.as_u64()) {
-                total_vbytes_non_cb = total_vbytes_non_cb.saturating_add(vb);
-            }
+            total_vbytes_non_cb = total_vbytes_non_cb.saturating_add(tx.vbytes as u64);
         }
 
-        if let Some(vout) = txv.get("vout").and_then(|x| x.as_array()) {
-            for o in vout {
-                let k = o
-                    .get("script_type")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                *script_summary.entry(k).or_insert(0) += 1;
-            }
+        for o in &tx.vout {
+            let k = if o.script_type.is_empty() { "unknown" } else { &o.script_type };
+            *script_summary.entry(k.to_string()).or_insert(0) += 1;
         }
     }
 
@@ -307,7 +306,7 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
             coinbase_script_hex,
             total_output_sats: coinbase_outsum,
         },
-        transactions: tx_reports_json,
+        transactions: tx_reports,
         block_stats: BlockStatsReport {
             total_fees_sats: total_fees,
             total_weight,
@@ -325,9 +324,9 @@ fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockR
         return Err(err("INVALID_BLOCK", "block payload too small for header"));
     }
 
-    // zero-copy: header ist jetzt ein Slice
-    let header = bc.take(80)?;
-    let mut hc = Cursor::new(header);
+    // Legacy: keep the header vec to avoid changing Cursor signature expectations elsewhere.
+    let header = bc.take(80)?.to_vec();
+    let mut hc = Cursor::new(&header);
 
     let version = hc.take_u32_le()?;
     let prev_le = {
@@ -346,8 +345,9 @@ fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockR
     let bits_u32 = hc.take_u32_le()?;
     let nonce = hc.take_u32_le()?;
 
-    let block_hash_le = parser::dsha256(header);
+    let block_hash_le = parser::dsha256(&header);
     let block_hash = hash_to_display_hex(block_hash_le);
+
     let prev_block_hash = {
         let mut be = prev_le;
         be.reverse();
@@ -388,20 +388,21 @@ fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockR
         return Err(err("INVALID_BLOCK", "block has zero transactions"));
     }
 
+    // --- coinbase ---
     let (cb_s, cb_e) = tx_ranges[0];
     let (coinbase_script, coinbase_outsum) =
         parser::coinbase_extract_script_and_outsum(&block[cb_s..cb_e])?;
     let bip34_height = parser::decode_bip34_height(&coinbase_script);
     let coinbase_script_hex = bytes_to_hex(&coinbase_script);
 
-    let tx_reports_json = if undo_payload.is_empty() {
+    // --- tx analysis (NOW: Vec<TxReport>) ---
+    let tx_reports: Vec<crate::btc::tx::TxReport> = if undo_payload.is_empty() {
         if tx_ranges.len() > 1 {
             return Err(err("UNDO_MISSING", "undo payload required for non-coinbase tx analysis"));
         }
         let coinbase_report = analyze_tx_from_bytes_ordered("mainnet", &block[cb_s..cb_e], &[])
             .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
-        vec![serde_json::to_value(coinbase_report)
-            .map_err(|e| err("SERDE_FAILED", e.to_string()))?]
+        vec![coinbase_report]
     } else {
         let mut vin_counts_non_cb: Vec<u64> = Vec::with_capacity(tx_ranges.len().saturating_sub(1));
         for &(s, e) in tx_ranges.iter().skip(1) {
@@ -411,33 +412,25 @@ fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockR
         analyze_txs_with_undo_slices(block, &tx_ranges, &undo_prevouts)?
     };
 
+    // --- block stats (NO JSON get()) ---
     let mut total_fees: u64 = 0;
     let mut total_weight: u64 = 0;
     let mut total_vbytes_non_cb: u64 = 0;
     let mut script_summary: BTreeMap<String, u64> = BTreeMap::new();
 
-    for (idx, txv) in tx_reports_json.iter().enumerate() {
-        if let Some(w) = txv.get("weight").and_then(|x| x.as_u64()) {
-            total_weight = total_weight.saturating_add(w);
-        }
+    for (idx, tx) in tx_reports.iter().enumerate() {
+        total_weight = total_weight.saturating_add(tx.weight as u64);
+
         if idx != 0 {
-            if let Some(f) = txv.get("fee_sats").and_then(|x| x.as_u64()) {
-                total_fees = total_fees.saturating_add(f);
+            if tx.fee_sats > 0 {
+                total_fees = total_fees.saturating_add(tx.fee_sats as u64);
             }
-            if let Some(vb) = txv.get("vbytes").and_then(|x| x.as_u64()) {
-                total_vbytes_non_cb = total_vbytes_non_cb.saturating_add(vb);
-            }
+            total_vbytes_non_cb = total_vbytes_non_cb.saturating_add(tx.vbytes as u64);
         }
 
-        if let Some(vout) = txv.get("vout").and_then(|x| x.as_array()) {
-            for o in vout {
-                let k = o
-                    .get("script_type")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                *script_summary.entry(k).or_insert(0) += 1;
-            }
+        for o in &tx.vout {
+            let k = if o.script_type.is_empty() { "unknown" } else { &o.script_type };
+            *script_summary.entry(k.to_string()).or_insert(0) += 1;
         }
     }
 
@@ -466,7 +459,7 @@ fn analyze_one_block_payload(block: &[u8], undo_payload: &[u8]) -> Result<BlockR
             coinbase_script_hex,
             total_output_sats: coinbase_outsum,
         },
-        transactions: tx_reports_json,
+        transactions: tx_reports,
         block_stats: BlockStatsReport {
             total_fees_sats: total_fees,
             total_weight,

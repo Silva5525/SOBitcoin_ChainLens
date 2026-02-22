@@ -1,9 +1,8 @@
 // src/btc/tx.rs
 
-
+use ahash::AHashMap;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use ahash::AHashMap;
 use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Clone)]
@@ -165,20 +164,58 @@ fn hash_to_display_hex(hash_le: [u8; 32]) -> String {
     bytes_to_hex(&be)
 }
 
-fn write_varint(out: &mut Vec<u8>, n: u64) {
+/// Streaming double-SHA256 writer (lets us compute txid without allocating a "stripped" buffer).
+struct Dsha256Writer {
+    h: Sha256,
+    len: usize,
+}
+
+impl Dsha256Writer {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            h: Sha256::new(),
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        self.h.update(bytes);
+        self.len += bytes.len();
+    }
+
+    #[inline]
+    fn finish(self) -> [u8; 32] {
+        let h1 = self.h.finalize();
+        let h2 = Sha256::digest(h1);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&h2);
+        out
+    }
+}
+
+#[inline]
+fn write_varint_hasher(out: &mut Dsha256Writer, n: u64) {
     match n {
-        0x00..=0xfc => out.push(n as u8),
+        0x00..=0xfc => out.write(&[n as u8]),
         0xfd..=0xffff => {
-            out.push(0xfd);
-            out.extend_from_slice(&(n as u16).to_le_bytes());
+            let b0 = 0xfdu8;
+            let le = (n as u16).to_le_bytes();
+            out.write(&[b0]);
+            out.write(&le);
         }
         0x1_0000..=0xffff_ffff => {
-            out.push(0xfe);
-            out.extend_from_slice(&(n as u32).to_le_bytes());
+            let b0 = 0xfeu8;
+            let le = (n as u32).to_le_bytes();
+            out.write(&[b0]);
+            out.write(&le);
         }
         _ => {
-            out.push(0xff);
-            out.extend_from_slice(&n.to_le_bytes());
+            let b0 = 0xffu8;
+            let le = n.to_le_bytes();
+            out.write(&[b0]);
+            out.write(&le);
         }
     }
 }
@@ -299,6 +336,7 @@ pub fn analyze_tx_from_bytes_ordered(
     raw: &[u8],
     prevouts_ordered: &[(u64, Vec<u8>)],
 ) -> Result<TxReport, String> {
+    #[inline]
     fn txid_le_slice_to_display_hex(txid_le: &[u8]) -> String {
         let mut be = [0u8; 32];
         be.copy_from_slice(txid_le);
@@ -310,10 +348,12 @@ pub fn analyze_tx_from_bytes_ordered(
     let wtxid_full = hash_to_display_hex(dsha256(raw));
 
     let mut c = Cursor::new(raw);
-    let mut stripped: Vec<u8> = Vec::with_capacity(raw.len());
+
+    // Start streaming txid (non-witness serialization). If tx is legacy, we'll just use wtxid_full.
+    let mut txid_hasher = Dsha256Writer::new();
 
     let version = c.take_u32_le()?;
-    stripped.extend_from_slice(&version.to_le_bytes());
+    txid_hasher.write(&version.to_le_bytes());
 
     let mut segwit = false;
     let peek = c.take_u8()?;
@@ -323,13 +363,14 @@ pub fn analyze_tx_from_bytes_ordered(
             return Err("invalid segwit flag".into());
         }
         segwit = true;
+        // marker+flag are NOT included in txid serialization
     } else {
         c.backtrack_1()?;
     }
 
     let vin_count_u64 = read_varint(&mut c)?;
     let vin_count = vin_count_u64 as usize;
-    write_varint(&mut stripped, vin_count_u64);
+    write_varint_hasher(&mut txid_hasher, vin_count_u64);
 
     // Keep only what we need, and avoid per-input Vec copies where possible.
     let mut vin_outpoints: Vec<(String, u32)> = Vec::with_capacity(vin_count);
@@ -351,9 +392,9 @@ pub fn analyze_tx_from_bytes_ordered(
             coinbase = true;
         }
 
-        // Stripped serialization uses LE txid.
-        stripped.extend_from_slice(prev_txid_le_bytes);
-        stripped.extend_from_slice(&prev_vout.to_le_bytes());
+        // TxID serialization uses LE txid.
+        txid_hasher.write(prev_txid_le_bytes);
+        txid_hasher.write(&prev_vout.to_le_bytes());
 
         // Human display uses BE.
         let prev_txid_hex = txid_le_slice_to_display_hex(prev_txid_le_bytes);
@@ -361,14 +402,14 @@ pub fn analyze_tx_from_bytes_ordered(
 
         let script_len_u64 = read_varint(&mut c)?;
         let script_len = script_len_u64 as usize;
-        write_varint(&mut stripped, script_len_u64);
+        write_varint_hasher(&mut txid_hasher, script_len_u64);
 
         let script_sig = c.take(script_len)?;
-        stripped.extend_from_slice(script_sig);
+        txid_hasher.write(script_sig);
         vin_script_sig_hex.push(bytes_to_hex(script_sig));
 
         let sequence = c.take_u32_le()?;
-        stripped.extend_from_slice(&sequence.to_le_bytes());
+        txid_hasher.write(&sequence.to_le_bytes());
         vin_sequences.push(sequence);
 
         if sequence < 0xffff_fffe {
@@ -378,7 +419,7 @@ pub fn analyze_tx_from_bytes_ordered(
 
     let vout_count_u64 = read_varint(&mut c)?;
     let vout_count = vout_count_u64 as usize;
-    write_varint(&mut stripped, vout_count_u64);
+    write_varint_hasher(&mut txid_hasher, vout_count_u64);
 
     let mut total_output_sats: u64 = 0;
     let mut vout_reports: Vec<VoutReport> = Vec::with_capacity(vout_count);
@@ -387,14 +428,14 @@ pub fn analyze_tx_from_bytes_ordered(
     for _ in 0..vout_count {
         let value = c.take_u64_le()?;
         total_output_sats = total_output_sats.saturating_add(value);
-        stripped.extend_from_slice(&value.to_le_bytes());
+        txid_hasher.write(&value.to_le_bytes());
 
         let spk_len_u64 = read_varint(&mut c)?;
         let spk_len = spk_len_u64 as usize;
-        write_varint(&mut stripped, spk_len_u64);
+        write_varint_hasher(&mut txid_hasher, spk_len_u64);
 
         let spk = c.take(spk_len)?;
-        stripped.extend_from_slice(spk);
+        txid_hasher.write(spk);
 
         let stype = script_type(spk);
         if stype == "unknown" {
@@ -441,16 +482,20 @@ pub fn analyze_tx_from_bytes_ordered(
     }
 
     let locktime = c.take_u32_le()?;
-    stripped.extend_from_slice(&locktime.to_le_bytes());
+    txid_hasher.write(&locktime.to_le_bytes());
 
     if c.remaining() != 0 {
         return Err("trailing bytes after parsing".into());
     }
 
+    // Capture non-witness size BEFORE finalizing the streaming hasher (single-pass).
+    let non_witness_size = txid_hasher.len;
+
     let txid = if segwit {
-        hash_to_display_hex(dsha256(&stripped))
+        hash_to_display_hex(txid_hasher.finish())
     } else {
-        hash_to_display_hex(dsha256(raw))
+        // Legacy tx: txid == wtxid
+        wtxid_full.clone()
     };
 
     if !coinbase && prevouts_ordered.len() != vin_count {
@@ -522,43 +567,35 @@ pub fn analyze_tx_from_bytes_ordered(
         fee_sats_i64 = 0;
     }
 
-    let (weight, vbytes, wtxid_opt) = if segwit {
-        let stripped_size = stripped.len();
-        let witness_size = size_bytes.saturating_sub(stripped_size);
-        let weight = stripped_size * 4 + witness_size;
-        let vbytes = weight.div_ceil(4);
-        (weight, vbytes, Some(wtxid_full))
-    } else {
-        let weight = size_bytes * 4;
-        let vbytes = weight.div_ceil(4);
-        (weight, vbytes, None)
-    };
+    let (weight, vbytes, wtxid_opt, segwit_savings) = if segwit {
+        let witness_bytes = size_bytes.saturating_sub(non_witness_size);
+        let weight_actual = non_witness_size * 4 + witness_bytes;
+        let vbytes = weight_actual.div_ceil(4);
 
-    let segwit_savings = if segwit {
-        let stripped_size = stripped.len();
-        let witness_bytes = size_bytes.saturating_sub(stripped_size);
-        let non_witness_bytes = stripped_size;
-        let total_bytes = size_bytes;
-
-        let weight_actual = weight;
-        let weight_if_legacy = total_bytes * 4;
-
+        let weight_if_legacy = size_bytes * 4;
         let savings_pct = if weight_if_legacy == 0 {
             0.0
         } else {
             (1.0 - (weight_actual as f64 / weight_if_legacy as f64)) * 100.0
         };
 
-        Some(SegwitSavings {
-            witness_bytes,
-            non_witness_bytes,
-            total_bytes,
+        (
             weight_actual,
-            weight_if_legacy,
-            savings_pct: (savings_pct * 100.0).round() / 100.0,
-        })
+            vbytes,
+            Some(wtxid_full),
+            Some(SegwitSavings {
+                witness_bytes,
+                non_witness_bytes: non_witness_size,
+                total_bytes: size_bytes,
+                weight_actual,
+                weight_if_legacy,
+                savings_pct: (savings_pct * 100.0).round() / 100.0,
+            }),
+        )
     } else {
-        None
+        let weight = size_bytes * 4;
+        let vbytes = weight.div_ceil(4);
+        (weight, vbytes, None, None)
     };
 
     let fee_rate = if coinbase || vbytes == 0 {
@@ -653,7 +690,10 @@ pub fn analyze_tx(network: &str, raw_tx_hex: &str, prevouts: &[Prevout]) -> Resu
         if !coinbase {
             let mut txid_le = [0u8; 32];
             txid_le.copy_from_slice(prev_txid_le_bytes);
-            keys.push(PrevoutKey { txid_le, vout: prev_vout });
+            keys.push(PrevoutKey {
+                txid_le,
+                vout: prev_vout,
+            });
         }
     }
 

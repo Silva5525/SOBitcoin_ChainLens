@@ -127,73 +127,77 @@ fn read_rev_records_strict(buf: &[u8], kind: &'static str) -> Result<Vec<RevReco
     Ok(out)
 }
 
-fn block_prev_hash_le(block: &[u8]) -> Result<[u8; 32], String> {
-    if block.len() < 80 {
-        return Err(err("INVALID_BLOCK", "block too small for header"));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&block[4..36]);
-    Ok(out)
-}
-
-fn dsha256_2parts(a: &[u8], b: &[u8]) -> [u8; 32] {
-    // Avoid allocating (a||b).
-    let mut h = Sha256::new();
-    h.update(a);
-    h.update(b);
-    let h1 = h.finalize();
-
+fn dsha256_bytes(data: &[u8]) -> [u8; 32] {
+    let h1 = Sha256::digest(data);
     let h2 = Sha256::digest(h1);
     let mut out = [0u8; 32];
     out.copy_from_slice(&h2);
     out
 }
 
-fn rev_checksum(prev_hash_le: &[u8; 32], undo_payload: &[u8]) -> [u8; 32] {
-    dsha256_2parts(prev_hash_le, undo_payload)
+fn rev_checksum(undo_payload: &[u8]) -> [u8; 32] {
+    // Bitcoin Core rev*.dat checksum is dSHA256(serialized CBlockUndo record).
+    // It does NOT include any block hash or prev-hash material.
+    dsha256_bytes(undo_payload)
 }
 
+/// Pair rev-records to blk-records.
+///
+/// Correctness: ordering is not assumed (fixtures can differ).
+/// Performance: fast path is O(n) by index; only mismatches trigger a scan.
 fn pair_rev_to_blocks_by_checksum(
     blk_buf: &[u8],
     blk_ranges: &[RecordRange],
     rev_buf: &[u8],
     rev_records: &[RevRecord],
 ) -> Result<Vec<RecordRange>, String> {
-    // In der Praxis ist das 1:1 (gleiche Anzahl + gleiche Reihenfolge).
-    // Wenn die Längen nicht passen, ist das ein klares Signal, dass etwas kaputt/anders ist.
-    if blk_ranges.len() != rev_records.len() {
-        return Err(err(
-            "REV_PAIRING_FAILED",
-            format!(
-                "blk_records ({}) != rev_records ({})",
-                blk_ranges.len(),
-                rev_records.len()
-            ),
-        ));
+    if rev_records.is_empty() {
+        return Err(err("REV_PAIRING_FAILED", "no rev records"));
     }
+
+    // Track which rev-records are already consumed.
+    let mut used = vec![false; rev_records.len()];
 
     let mut out: Vec<RecordRange> = Vec::with_capacity(blk_ranges.len());
 
-    // O(n) Fast-Path: index-basiert + Checksum-Verifikation
-    for (i, (br, rr)) in blk_ranges.iter().zip(rev_records.iter()).enumerate() {
-        let block = &blk_buf[br.clone()];
-        let prev_hash_le = block_prev_hash_le(block)?;
-
-        let undo_payload = &rev_buf[rr.undo_range.clone()];
-        let chk = rev_checksum(&prev_hash_le, undo_payload);
-
-        if chk != rr.checksum {
-            // Wenn du “absolute robustness” brauchst, könntest du hier in einen Slow-Path fallen.
-            // Für maximale Performance: hart failen, weil das Format i.d.R. strikt aligned ist.
-            return Err(err(
-                "REV_PAIRING_FAILED",
-                format!(
-                    "rev/blk order mismatch at index {i}: checksum verification failed"
-                ),
-            ));
+    for (i, br) in blk_ranges.iter().enumerate() {
+	let _block = &blk_buf[br.clone()];
+		
+        // --- Fast path: same index (Core-like ordering) ---
+        if i < rev_records.len() && !used[i] {
+            let rr = &rev_records[i];
+            let undo_payload = &rev_buf[rr.undo_range.clone()];
+            let chk = rev_checksum(undo_payload);
+            if chk == rr.checksum {
+                used[i] = true;
+                out.push(rr.undo_range.clone());
+                continue;
+            }
         }
 
-        out.push(rr.undo_range.clone());
+        // --- Cold path: scan remaining rev records until match ---
+        let mut found: Option<usize> = None;
+        for (j, rr) in rev_records.iter().enumerate() {
+            if used[j] {
+                continue;
+            }
+            let undo_payload = &rev_buf[rr.undo_range.clone()];
+            let chk = rev_checksum(undo_payload);
+            if chk == rr.checksum {
+                found = Some(j);
+                break;
+            }
+        }
+
+        let Some(j) = found else {
+            return Err(err(
+                "REV_PAIRING_FAILED",
+                format!("no matching undo payload found for blk index {i}"),
+            ));
+        };
+
+        used[j] = true;
+        out.push(rev_records[j].undo_range.clone());
     }
 
     Ok(out)

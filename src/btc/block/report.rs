@@ -1,6 +1,7 @@
 // src/btc/block/report.rs
 
 use serde::Serialize;
+use crate::btc::tx::TxReport;
 
 #[derive(Debug, Serialize)]
 pub struct BlockReport {
@@ -9,7 +10,7 @@ pub struct BlockReport {
     pub block_header: BlockHeaderReport,
     pub tx_count: u64,
     pub coinbase: CoinbaseReport,
-    pub transactions: Vec<serde_json::Value>,
+	pub transactions: Vec<TxReport>,
     pub block_stats: BlockStatsReport,
 }
 
