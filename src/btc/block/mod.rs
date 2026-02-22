@@ -10,7 +10,7 @@ pub use report::{BlockHeaderReport, BlockReport, BlockStatsReport, CoinbaseRepor
 use std::collections::BTreeMap;
 use std::fs;
 
-use crate::btc::tx::analyze_tx_from_bytes_ordered;
+use crate::btc::tx::{analyze_tx_from_bytes_ordered, analyze_tx_from_bytes_ordered_lite};
 
 use io::decode_blk_and_rev_best;
 use parser::{bytes_to_hex, hash_to_display_hex, merkle_root, Cursor};
@@ -62,7 +62,7 @@ fn analyze_txs_with_undo_slices(
     out.resize_with(tx_ranges.len(), || None);
 
     let (cb_s, cb_e) = tx_ranges[0];
-    let coinbase_report = analyze_tx_from_bytes_ordered("mainnet", &block[cb_s..cb_e], &[])
+    let coinbase_report = analyze_tx_from_bytes_ordered_lite("mainnet", &block[cb_s..cb_e], &[])
         .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
     out[0] = Some(coinbase_report);
 
@@ -72,7 +72,7 @@ fn analyze_txs_with_undo_slices(
         for i in 1..tx_ranges.len() {
             let (s, e) = tx_ranges[i];
             let per_in = &undo_prevouts[i - 1];
-            let rep = analyze_tx_from_bytes_ordered("mainnet", &block[s..e], per_in)
+            let rep = analyze_tx_from_bytes_ordered_lite("mainnet", &block[s..e], per_in)
                 .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
             out[i] = Some(rep);
         }
@@ -105,7 +105,7 @@ fn analyze_txs_with_undo_slices(
                 for i in start_i..end_i {
                     let (s, e) = tx_ranges[i];
                     let per_in = &undo_prevouts[i - 1];
-                    let rep = analyze_tx_from_bytes_ordered("mainnet", &block[s..e], per_in)
+                    let rep = analyze_tx_from_bytes_ordered_lite("mainnet", &block[s..e], per_in)
                         .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
                     local.push((i, rep));
                 }

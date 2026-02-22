@@ -1,5 +1,3 @@
-// src/btc/tx.rs
-
 use ahash::AHashMap;
 use bech32::{ToBase32, Variant};
 use bs58;
@@ -706,6 +704,7 @@ fn classify_input_spend(
     prevout_spk: &[u8],
     script_sig: &[u8],
     witness_items: &[Vec<u8>],
+    include_witness_script_asm: bool,
 ) -> (String, Option<String>) {
     // Returns (script_type, witness_script_asm).
     // witness_script_asm is only set for p2wsh and p2sh-p2wsh per README.
@@ -717,7 +716,11 @@ fn classify_input_spend(
         return ("p2wpkh".to_string(), None);
     }
     if is_p2wsh_spk(prevout_spk) {
-        let ws_asm = witness_items.last().map(|b| disasm_script(b));
+        let ws_asm = if include_witness_script_asm {
+            witness_items.last().map(|b| disasm_script(b))
+        } else {
+            None
+        };
         return ("p2wsh".to_string(), ws_asm);
     }
     if is_p2tr_spk(prevout_spk) {
@@ -739,7 +742,11 @@ fn classify_input_spend(
             return ("p2sh-p2wpkh".to_string(), None);
         }
         if is_p2wsh_spk(rs) {
-            let ws_asm = witness_items.last().map(|b| disasm_script(b));
+            let ws_asm = if include_witness_script_asm {
+                witness_items.last().map(|b| disasm_script(b))
+            } else {
+                None
+            };
             return ("p2sh-p2wsh".to_string(), ws_asm);
         }
         return ("unknown".to_string(), None);
@@ -801,6 +808,37 @@ fn relative_timelock(version: u32, sequence: u32) -> RelativeTimelock {
 }
 
 
+#[derive(Clone, Copy, Debug)]
+pub struct TxComputeFlags {
+    pub include_script_hex: bool,
+    pub include_script_asm: bool,
+    pub include_addresses: bool,
+    pub include_witness_hex: bool,
+    pub include_op_return: bool,
+    pub include_warnings: bool,
+}
+
+impl TxComputeFlags {
+    pub const FULL: Self = Self {
+        include_script_hex: true,
+        include_script_asm: true,
+        include_addresses: true,
+        include_witness_hex: true,
+        include_op_return: true,
+        include_warnings: true,
+    };
+
+    // Designed for block-mode performance.
+    pub const LITE: Self = Self {
+        include_script_hex: false,
+        include_script_asm: false,
+        include_addresses: false,
+        include_witness_hex: false,
+        include_op_return: false,
+        include_warnings: false,
+    };
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct PrevoutKey {
     // txid in little-endian bytes (matches tx serialization)
@@ -821,10 +859,11 @@ impl Hash for PrevoutKey {
 /// Each entry is `(value_sats, script_pubkey_bytes)`.
 ///
 /// This avoids hex decoding/encoding and avoids building a prevout HashMap.
-pub fn analyze_tx_from_bytes_ordered(
+fn analyze_tx_from_bytes_ordered_impl(
     network: &str,
     raw: &[u8],
     prevouts_ordered: &[(u64, Vec<u8>)],
+    flags: TxComputeFlags,
 ) -> Result<TxReport, String> {
     #[inline]
     fn txid_le_slice_to_display_hex(txid_le: &[u8]) -> String {
@@ -918,8 +957,16 @@ pub fn analyze_tx_from_bytes_ordered(
         if let Some(h) = txid_hasher.as_mut() {
             h.write(script_sig);
         }
-        vin_script_sig_hex.push(bytes_to_hex(script_sig));
-        vin_script_sig_asm.push(disasm_script(script_sig));
+        vin_script_sig_hex.push(if flags.include_script_hex {
+            bytes_to_hex(script_sig)
+        } else {
+            String::new()
+        });
+        vin_script_sig_asm.push(if flags.include_script_asm {
+            disasm_script(script_sig)
+        } else {
+            String::new()
+        });
         vin_script_sig_bytes.push(script_sig.to_vec());
 
         let sequence = c.take_u32_le()?;
@@ -944,6 +991,7 @@ pub fn analyze_tx_from_bytes_ordered(
     let mut vout_reports: Vec<VoutReport> = Vec::with_capacity(vout_count);
     let mut has_unknown_output = false;
     let mut has_dust_output = false;
+    let track_warnings = flags.include_warnings;
 
     for _ in 0..vout_count {
         let value = c.take_u64_le()?;
@@ -964,15 +1012,17 @@ pub fn analyze_tx_from_bytes_ordered(
         }
 
         let stype = script_type(spk);
-        if stype == "unknown" {
-            has_unknown_output = true;
-        }
-        // README dust rule: any non-OP_RETURN output with value_sats < 546.
-        if stype != "op_return" && value < 546 {
-            has_dust_output = true;
+        if track_warnings {
+            if stype == "unknown" {
+                has_unknown_output = true;
+            }
+            // README dust rule: any non-OP_RETURN output with value_sats < 546.
+            if stype != "op_return" && value < 546 {
+                has_dust_output = true;
+            }
         }
 
-        let (op_hex, op_utf8, op_proto) = if stype == "op_return" {
+        let (op_hex, op_utf8, op_proto) = if flags.include_op_return && stype == "op_return" {
             // Concatenate all pushes after OP_RETURN per README requirements.
             if let Some(data) = parse_op_return_data(spk) {
                 let h = bytes_to_hex(&data);
@@ -998,10 +1048,22 @@ pub fn analyze_tx_from_bytes_ordered(
         vout_reports.push(VoutReport {
             n: vout_reports.len() as u32,
             value_sats: value,
-            script_pubkey_hex: bytes_to_hex(spk),
-            script_asm: disasm_script(spk),
+            script_pubkey_hex: if flags.include_script_hex {
+                bytes_to_hex(spk)
+            } else {
+                String::new()
+            },
+            script_asm: if flags.include_script_asm {
+                disasm_script(spk)
+            } else {
+                String::new()
+            },
             script_type: stype,
-            address: address_from_spk(network, spk)?,
+            address: if flags.include_addresses {
+                address_from_spk(network, spk)?
+            } else {
+                None
+            },
             op_return_data_hex: op_hex,
             op_return_data_utf8: op_utf8,
             op_return_protocol: op_proto,
@@ -1019,10 +1081,12 @@ pub fn analyze_tx_from_bytes_ordered(
             for _ in 0..n_stack {
                 let item_len = read_varint(&mut c)? as usize;
                 let item = c.take(item_len)?;
-                items_hex.push(bytes_to_hex(item));
+                if flags.include_witness_hex {
+                    items_hex.push(bytes_to_hex(item));
+                }
                 items_bytes.push(item.to_vec());
             }
-            *slot = items_hex;
+            *slot = if flags.include_witness_hex { items_hex } else { Vec::new() };
             witnesses_bytes[idx] = items_bytes;
         }
     }
@@ -1111,7 +1175,8 @@ pub fn analyze_tx_from_bytes_ordered(
         let (val, spk_bytes) = &prevouts_ordered[i];
         total_input_sats = total_input_sats.saturating_add(*val);
 
-        let (in_type, witness_script_asm) = classify_input_spend(spk_bytes, &script_sig_b, &witness_b);
+        let (in_type, witness_script_asm) =
+            classify_input_spend(spk_bytes, &script_sig_b, &witness_b, flags.include_script_asm);
 
         vin_reports.push(VinReport {
             txid: txid_in,
@@ -1122,10 +1187,18 @@ pub fn analyze_tx_from_bytes_ordered(
             witness,
             witness_script_asm,
             script_type: in_type,
-            address: address_from_spk(network, spk_bytes)?,
+            address: if flags.include_addresses {
+                address_from_spk(network, spk_bytes)?
+            } else {
+                None
+            },
             prevout: PrevoutInfo {
                 value_sats: *val,
-                script_pubkey_hex: bytes_to_hex(spk_bytes),
+                script_pubkey_hex: if flags.include_script_hex {
+                    bytes_to_hex(spk_bytes)
+                } else {
+                    String::new()
+                },
             },
             relative_timelock: relative_timelock(version, sequence),
         });
@@ -1180,28 +1253,30 @@ pub fn analyze_tx_from_bytes_ordered(
 
     let mut warnings: Vec<WarningItem> = Vec::new();
 
-    let high_fee = !coinbase && (fee_sats_i64 > 1_000_000 || fee_rate > 200.0);
+    if flags.include_warnings {
+        let high_fee = !coinbase && (fee_sats_i64 > 1_000_000 || fee_rate > 200.0);
 
-    // Emit warnings in a stable order (and avoid duplicates).
-    if rbf_signaling {
-        warnings.push(WarningItem {
-            code: "RBF_SIGNALING".into(),
-        });
-    }
-    if has_unknown_output {
-        warnings.push(WarningItem {
-            code: "UNKNOWN_OUTPUT_SCRIPT".into(),
-        });
-    }
-    if has_dust_output {
-        warnings.push(WarningItem {
-            code: "DUST_OUTPUT".into(),
-        });
-    }
-    if high_fee {
-        warnings.push(WarningItem {
-            code: "HIGH_FEE".into(),
-        });
+        // Emit warnings in a stable order (and avoid duplicates).
+        if rbf_signaling {
+            warnings.push(WarningItem {
+                code: "RBF_SIGNALING".into(),
+            });
+        }
+        if has_unknown_output {
+            warnings.push(WarningItem {
+                code: "UNKNOWN_OUTPUT_SCRIPT".into(),
+            });
+        }
+        if has_dust_output {
+            warnings.push(WarningItem {
+                code: "DUST_OUTPUT".into(),
+            });
+        }
+        if high_fee {
+            warnings.push(WarningItem {
+                code: "HIGH_FEE".into(),
+            });
+        }
     }
 
     Ok(TxReport {
@@ -1227,6 +1302,27 @@ pub fn analyze_tx_from_bytes_ordered(
         warnings,
         segwit_savings,
     })
+}
+
+/// Full (README-complete) transaction analyzer.
+pub fn analyze_tx_from_bytes_ordered(
+    network: &str,
+    raw: &[u8],
+    prevouts_ordered: &[(u64, Vec<u8>)],
+) -> Result<TxReport, String> {
+    analyze_tx_from_bytes_ordered_impl(network, raw, prevouts_ordered, TxComputeFlags::FULL)
+}
+
+/// LITE analyzer for block-mode performance.
+///
+/// This keeps only the computations needed for block-level grading (fees/weights/txids/script types)
+/// and skips expensive hex/asm/address/op_return processing.
+pub fn analyze_tx_from_bytes_ordered_lite(
+    network: &str,
+    raw: &[u8],
+    prevouts_ordered: &[(u64, Vec<u8>)],
+) -> Result<TxReport, String> {
+    analyze_tx_from_bytes_ordered_impl(network, raw, prevouts_ordered, TxComputeFlags::LITE)
 }
 
 pub fn analyze_tx(network: &str, raw_tx_hex: &str, prevouts: &[Prevout]) -> Result<TxReport, String> {
