@@ -1,6 +1,8 @@
 // src/btc/tx.rs
 
 use ahash::AHashMap;
+use bech32::{ToBase32, Variant};
+use bs58;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::hash::{Hash, Hasher};
@@ -166,10 +168,92 @@ fn dsha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-fn hash_to_display_hex(hash_le: [u8; 32]) -> String {
-    let mut be = hash_le;
+fn hash_to_display_hex(hash: [u8; 32]) -> String {
+    // Bitcoin displays hashes as big-endian hex; SHA256 output here is treated as internal byte order.
+    // We reverse for human display.
+    let mut be = hash;
     be.reverse();
     bytes_to_hex(&be)
+}
+
+#[derive(Clone, Copy)]
+struct NetParams {
+    p2pkh_prefix: u8,
+    p2sh_prefix: u8,
+    bech32_hrp: &'static str,
+}
+
+fn net_params(network: &str) -> Result<NetParams, String> {
+    match network {
+        "main" | "mainnet" | "bitcoin" => Ok(NetParams {
+            p2pkh_prefix: 0x00,
+            p2sh_prefix: 0x05,
+            bech32_hrp: "bc",
+        }),
+        "test" | "testnet" | "signet" | "regtest" => Ok(NetParams {
+            p2pkh_prefix: 0x6f,
+            p2sh_prefix: 0xc4,
+            bech32_hrp: "tb",
+        }),
+        _ => Err(format!("unsupported network: {network}")),
+    }
+}
+
+fn base58check(version: u8, payload: &[u8]) -> String {
+    let mut buf = Vec::with_capacity(1 + payload.len() + 4);
+    buf.push(version);
+    buf.extend_from_slice(payload);
+    let chk = dsha256(&buf);
+    buf.extend_from_slice(&chk[0..4]);
+    bs58::encode(buf).into_string()
+}
+
+fn bech32_witness_addr(hrp: &str, witver: u8, program: &[u8]) -> Result<String, String> {
+    if witver > 16 {
+        return Err("invalid witness version".into());
+    }
+    if program.len() < 2 || program.len() > 40 {
+        return Err("invalid witness program length".into());
+    }
+
+    let variant = if witver == 0 {
+        Variant::Bech32
+    } else {
+        Variant::Bech32m
+    };
+
+    let mut data = Vec::with_capacity(1 + (program.len() * 8 + 4) / 5);
+    data.push(bech32::u5::try_from_u8(witver).map_err(|_| "invalid witver".to_string())?);
+    data.extend_from_slice(&program.to_base32());
+
+    bech32::encode(hrp, data, variant).map_err(|e| format!("bech32 encode error: {e}"))
+}
+
+fn address_from_spk(network: &str, spk: &[u8]) -> Result<Option<String>, String> {
+    let p = net_params(network)?;
+
+    if is_p2pkh_spk(spk) {
+        let h160 = &spk[3..23];
+        return Ok(Some(base58check(p.p2pkh_prefix, h160)));
+    }
+    if is_p2sh_spk(spk) {
+        let h160 = &spk[2..22];
+        return Ok(Some(base58check(p.p2sh_prefix, h160)));
+    }
+    if is_p2wpkh_spk(spk) {
+        let prog = &spk[2..22];
+        return Ok(Some(bech32_witness_addr(p.bech32_hrp, 0, prog)?));
+    }
+    if is_p2wsh_spk(spk) {
+        let prog = &spk[2..34];
+        return Ok(Some(bech32_witness_addr(p.bech32_hrp, 0, prog)?));
+    }
+    if is_p2tr_spk(spk) {
+        let prog = &spk[2..34];
+        return Ok(Some(bech32_witness_addr(p.bech32_hrp, 1, prog)?));
+    }
+
+    Ok(None)
 }
 
 /// Streaming double-SHA256 writer (lets us compute txid without allocating a "stripped" buffer).
@@ -750,6 +834,11 @@ pub fn analyze_tx_from_bytes_ordered(
         hex::encode(be)
     }
 
+    #[inline]
+    fn round2(x: f64) -> f64 {
+        (x * 100.0).round() / 100.0
+    }
+
     let size_bytes = raw.len();
     let mut c = Cursor::new(raw);
 
@@ -854,6 +943,7 @@ pub fn analyze_tx_from_bytes_ordered(
     let mut total_output_sats: u64 = 0;
     let mut vout_reports: Vec<VoutReport> = Vec::with_capacity(vout_count);
     let mut has_unknown_output = false;
+    let mut has_dust_output = false;
 
     for _ in 0..vout_count {
         let value = c.take_u64_le()?;
@@ -876,6 +966,10 @@ pub fn analyze_tx_from_bytes_ordered(
         let stype = script_type(spk);
         if stype == "unknown" {
             has_unknown_output = true;
+        }
+        // README dust rule: any non-OP_RETURN output with value_sats < 546.
+        if stype != "op_return" && value < 546 {
+            has_dust_output = true;
         }
 
         let (op_hex, op_utf8, op_proto) = if stype == "op_return" {
@@ -907,7 +1001,7 @@ pub fn analyze_tx_from_bytes_ordered(
             script_pubkey_hex: bytes_to_hex(spk),
             script_asm: disasm_script(spk),
             script_type: stype,
-            address: None,
+            address: address_from_spk(network, spk)?,
             op_return_data_hex: op_hex,
             op_return_data_utf8: op_utf8,
             op_return_protocol: op_proto,
@@ -1028,7 +1122,7 @@ pub fn analyze_tx_from_bytes_ordered(
             witness,
             witness_script_asm,
             script_type: in_type,
-            address: None,
+            address: address_from_spk(network, spk_bytes)?,
             prevout: PrevoutInfo {
                 value_sats: *val,
                 script_pubkey_hex: bytes_to_hex(spk_bytes),
@@ -1068,7 +1162,7 @@ pub fn analyze_tx_from_bytes_ordered(
                 total_bytes: size_bytes,
                 weight_actual,
                 weight_if_legacy,
-                savings_pct: (savings_pct * 100.0).round() / 100.0,
+                savings_pct: round2(savings_pct),
             }),
         )
     } else {
@@ -1082,19 +1176,31 @@ pub fn analyze_tx_from_bytes_ordered(
     } else {
         (fee_sats_i64 as f64) / (vbytes as f64)
     };
-    let fee_rate_2dp = (fee_rate * 100.0).round() / 100.0;
+    let fee_rate_2dp = round2(fee_rate);
 
     let mut warnings: Vec<WarningItem> = Vec::new();
 
+    let high_fee = !coinbase && (fee_sats_i64 > 1_000_000 || fee_rate > 200.0);
+
+    // Emit warnings in a stable order (and avoid duplicates).
     if rbf_signaling {
         warnings.push(WarningItem {
             code: "RBF_SIGNALING".into(),
         });
     }
-
     if has_unknown_output {
         warnings.push(WarningItem {
             code: "UNKNOWN_OUTPUT_SCRIPT".into(),
+        });
+    }
+    if has_dust_output {
+        warnings.push(WarningItem {
+            code: "DUST_OUTPUT".into(),
+        });
+    }
+    if high_fee {
+        warnings.push(WarningItem {
+            code: "HIGH_FEE".into(),
         });
     }
 
