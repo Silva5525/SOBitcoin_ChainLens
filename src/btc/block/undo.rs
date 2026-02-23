@@ -71,6 +71,71 @@ fn read_compactsize(c: &mut parser::Cursor) -> Result<u64, String> {
     }
 }
 
+// ------------------------------------------------------------
+// Hot-path helpers
+// ------------------------------------------------------------
+/// Ultra-cheap read of the number of `CTxUndo` entries in a `CBlockUndo` payload.
+///
+/// This reads only the leading CompactSize (`nTxUndo`) and performs the same sanity bound
+/// used by the strict parser.
+///
+/// Intended for fast blk↔rev pairing in `block/io.rs`.
+#[inline]
+pub(crate) fn undo_txundo_count_fast(undo_payload: &[u8]) -> Result<u64, String> {
+    let mut c = parser::Cursor::new(undo_payload);
+    let n = read_compactsize(&mut c)?;
+    ensure_len("undo", "n_txundo", n, 200_000)?;
+    Ok(n)
+}
+
+/// Even cheaper variant that operates on a byte slice cursor and also returns bytes consumed.
+///
+/// This avoids constructing `parser::Cursor` and is useful if you already have a `&[u8]` cursor.
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn undo_txundo_count_fast_bytes(input: &mut &[u8]) -> Result<u64, String> {
+    if input.is_empty() {
+        return Err(err("COMPACTSIZE_EOF", "empty input"));
+    }
+    let first = input[0];
+    *input = &input[1..];
+
+    let n = match first {
+        0x00..=0xfc => first as u64,
+        0xfd => {
+            if input.len() < 2 {
+                return Err(err("COMPACTSIZE_EOF", "0xfd but missing 2 bytes"));
+            }
+            let v = u16::from_le_bytes([input[0], input[1]]) as u64;
+            *input = &input[2..];
+            v
+        }
+        0xfe => {
+            if input.len() < 4 {
+                return Err(err("COMPACTSIZE_EOF", "0xfe but missing 4 bytes"));
+            }
+            let v = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as u64;
+            *input = &input[4..];
+            v
+        }
+        0xff => {
+            if input.len() < 8 {
+                return Err(err("COMPACTSIZE_EOF", "0xff but missing 8 bytes"));
+            }
+            let v = u64::from_le_bytes([
+                input[0], input[1], input[2], input[3],
+                input[4], input[5], input[6], input[7],
+            ]);
+            *input = &input[8..];
+            v
+        }
+    };
+
+    ensure_len("undo", "n_txundo", n, 200_000)?;
+    Ok(n)
+}
+
+
 fn decompress_amount(x: u64) -> u64 {
     if x == 0 {
         return 0;

@@ -169,17 +169,17 @@ fn block_tx_count(block: &[u8]) -> Result<u64, String> {
     parser::read_varint(&mut bc).map_err(|e| err("INVALID_BLOCK", e))
 }
 
-fn undo_txundo_count(undo_payload: &[u8]) -> Result<u64, String> {
-    let mut uc = parser::Cursor::new(undo_payload);
-    parser::read_varint(&mut uc).map_err(|e| err("INVALID_UNDO", e))
-}
 
-/// Attempt fast-path pairing using the 32-byte rev trailer.
+/// Attempt fast-path pairing.
 ///
-/// This is only safe if the trailer is some block identifier we can compute per block
-/// (most likely block_hash). We therefore:
-/// - only take the fast-path when the match is **unique** and **unused**
-/// - fill remaining blocks via the existing invariant+validate fallback.
+/// Order between blk*.dat and rev*.dat is *often* aligned in practice (height order),
+/// but is not guaranteed (reorgs, pruned/partial datasets, etc.).
+///
+/// We therefore implement a **safe** two-stage strategy:
+/// 1) **Default hot path**: index-based pairing (block[i] ↔ rev[i]) *only if* cheap
+///    structural invariants hold for **every** record.
+/// 2) Optional trailer-based pairing (opt-in) for additional speed when trailer meaning is known.
+/// 3) Correctness fallback: invariant bucketing + full `validate_undo_payload_against_block`.
 fn pair_rev_to_blocks_fast_then_fallback(
     blk_buf: &[u8],
     blk_ranges: &[RecordRange],
@@ -193,9 +193,17 @@ fn pair_rev_to_blocks_fast_then_fallback(
         return Err(err("NO_RECORDS_FOUND", "rev: no records found"));
     }
 
+    // --- NEW DEFAULT HOT PATH -------------------------------------------------
+    // Try the cheap, Core-like sequential pairing first.
+    // This is only accepted when *all* records satisfy the structural invariant:
+    //   undo_txundo_count == block_tx_count - 1  (or == block_tx_count in rare cases).
+    if let Some(paired) = pair_rev_to_blocks_index_if_plausible(blk_buf, blk_ranges, rev_buf, rev_recs)? {
+        return Ok(paired);
+    }
+
     // Optional diagnostics to understand what trailer likely represents.
-    // This is intentionally cheap and off by default.
-    let diag = std::env::var("CHAINLENS_REV_TRAILER_DIAG").is_ok();
+// This is intentionally cheap and off by default.
+let diag = std::env::var("CHAINLENS_REV_TRAILER_DIAG").is_ok();
 
     // Build trailer index: trailer_bytes -> rev indices (Vec for collision safety).
     let mut by_trailer: std::collections::HashMap<[u8; 32], Vec<usize>> =
@@ -208,10 +216,10 @@ fn pair_rev_to_blocks_fast_then_fallback(
     let mut used = vec![false; rev_recs.len()];
     let mut out: Vec<Option<RecordRange>> = vec![None; blk_ranges.len()];
 
-    // Fast-path toggle. We keep it opt-in until trailer meaning is confirmed.
-    let fast_enabled = std::env::var("CHAINLENS_PAIRING_FAST").is_ok();
+    // Trailer fast-path toggle. We keep it opt-in until trailer meaning is confirmed.
+let fast_enabled = std::env::var("CHAINLENS_PAIRING_FAST").is_ok();
 
-    let mut matched_fast = 0usize;
+let mut matched_fast = 0usize;
 
     if fast_enabled {
         for (i, br) in blk_ranges.iter().enumerate() {
@@ -312,6 +320,62 @@ fn pair_rev_to_blocks_fast_then_fallback(
 /// Existing (correctness) pairing algorithm: bucket by undo_count invariant and validate.
 ///
 /// This is now used as a fallback and can skip already-used rev records.
+// ------------------------------------------------------------
+// NEW: Index-based pairing with ultra-cheap plausibility checks
+// ------------------------------------------------------------
+fn pair_rev_to_blocks_index_if_plausible(
+    blk_buf: &[u8],
+    blk_ranges: &[RecordRange],
+    rev_buf: &[u8],
+    rev_recs: &[RevRecord],
+) -> Result<Option<Vec<RecordRange>>, String> {
+    if blk_ranges.len() != rev_recs.len() {
+        return Ok(None);
+    }
+
+    // Require full plausibility for every record to avoid silent mispairing.
+    let mut out: Vec<RecordRange> = Vec::with_capacity(blk_ranges.len());
+
+    for (i, (br, rr)) in blk_ranges.iter().zip(rev_recs.iter()).enumerate() {
+        let block = &blk_buf[br.clone()];
+        let undo_payload = &rev_buf[rr.payload.clone()];
+
+        let txc = block_tx_count(block)?;
+        if txc == 0 {
+            return Ok(None);
+        }
+        let expected = txc.saturating_sub(1);
+
+        let undo_cnt = undo::undo_txundo_count_fast(undo_payload)?;
+
+        // Accept only if the invariant holds.
+        if !(undo_cnt == expected || undo_cnt == txc) {
+            // Not plausibly aligned → fall back to validate-based matching.
+            if std::env::var("CHAINLENS_PAIRING_STATS").is_ok() {
+                eprintln!(
+                    "[chainlens] pairing: index hotpath rejected at i={} (txc={}, undo_cnt={}, expected={})",
+                    i, txc, undo_cnt, expected
+                );
+            }
+            return Ok(None);
+        }
+
+        out.push(rr.payload.clone());
+    }
+
+    if std::env::var("CHAINLENS_PAIRING_STATS").is_ok() {
+        eprintln!(
+            "[chainlens] pairing: index hotpath accepted for {} blocks",
+            blk_ranges.len()
+        );
+    }
+
+    Ok(Some(out))
+}
+
+/// Existing (correctness) pairing algorithm: bucket by undo_count invariant and validate.
+///
+/// This is now used as a fallback and can skip already-used rev records.
 fn pair_rev_to_blocks_fallback_validate_fill(
     blk_buf: &[u8],
     blk_ranges: &[RecordRange],
@@ -328,7 +392,7 @@ fn pair_rev_to_blocks_fallback_validate_fill(
             continue;
         }
         let undo_payload = &rev_buf[rr.payload.clone()];
-        let undo_cnt = undo_txundo_count(undo_payload)?;
+        let undo_cnt = undo::undo_txundo_count_fast(undo_payload)?;
         by_undo_cnt.entry(undo_cnt).or_default().push(j);
     }
 

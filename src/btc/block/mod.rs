@@ -12,7 +12,6 @@ use std::fs;
 
 use crate::btc::tx::analyze_tx_from_bytes_ordered_lite;
 
-use io::decode_blk_and_rev_best;
 use parser::{bytes_to_hex, hash_to_display_hex, merkle_root, Cursor};
 use undo::parse_undo_payload_strict_slices;
 
@@ -150,7 +149,7 @@ pub fn analyze_block_file(
     let blk_raw = fs::read(blk_path).map_err(|e| err("IO_ERROR", format!("read blk failed: {e}")))?;
     let rev_raw = fs::read(rev_path).map_err(|e| err("IO_ERROR", format!("read rev failed: {e}")))?;
 
-    let (blk_buf, blk_ranges, rev_buf, undo_ranges) = decode_blk_and_rev_best(blk_raw, rev_raw, &key)?;
+    let (blk_buf, blk_ranges, rev_buf, undo_ranges) = io::decode_blk_and_rev_best(blk_raw, rev_raw, &key)?;
 
     if blk_ranges.len() != undo_ranges.len() {
         return Err(err(

@@ -105,12 +105,8 @@ fn main() {
     let s = fs::read_to_string(path)
         .unwrap_or_else(|e| print_err_and_exit("IO_ERROR", format!("failed to read fixture {path}: {e}"), 1));
 
-    // Determine whether to print stdout (only when there is no "mode" field).
-    let v: serde_json::Value = serde_json::from_str(&s)
-        .unwrap_or_else(|e| print_err_and_exit("INVALID_FIXTURE", format!("invalid fixture json: {e}"), 1));
-    let print_stdout = v.get("mode").is_none();
-
-    let fx: FixtureTx = serde_json::from_value(v)
+        // Parse fixture JSON. Unknown fields (like "mode") are ignored by serde by default.
+    let fx: FixtureTx = serde_json::from_str(&s)
         .unwrap_or_else(|e| print_err_and_exit("INVALID_FIXTURE", format!("invalid tx fixture: {e}"), 1));
 
     let prevouts: Vec<Prevout> = fx
@@ -133,11 +129,8 @@ fn main() {
     if let Err(e) = write_json_file(&out_path, &report) {
         print_err_and_exit("IO_ERROR", format!("write {:?} failed: {e}", out_path), 1);
     }
-
-    if print_stdout {
-        // Printing to stdout can be compact; graders parse JSON regardless.
-        println!("{}", serde_json::to_string(&report).unwrap());
-    }
+    // Always print JSON report to stdout for graders.
+    println!("{}", serde_json::to_string(&report).unwrap());
 
     std::process::exit(0);
 }
@@ -399,6 +392,13 @@ fn key_is_all_zero(key: &[u8]) -> bool {
 /// A zero-copy record reference into a decoded dat buffer.
 pub(crate) type RecordRange = std::ops::Range<usize>;
 
+/// rev*.dat record with the 32-byte trailer preserved.
+#[derive(Clone, Debug)]
+struct RevRecord {
+    payload: RecordRange,
+    trailer: RecordRange, // 32 bytes
+}
+
 pub(crate) fn xor_decode_with_shift(mut data: Vec<u8>, key: &[u8], shift: usize) -> Vec<u8> {
     if key.is_empty() {
         return data;
@@ -454,13 +454,12 @@ pub(crate) fn read_dat_records_strict(
     Ok(out)
 }
 
-fn read_rev_records_strict(buf: &[u8], kind: &'static str) -> Result<Vec<RecordRange>, String> {
+fn read_rev_records_strict(buf: &[u8], kind: &'static str) -> Result<Vec<RevRecord>, String> {
     // Bitcoin Core-like rev*.dat framing:
-    //   MAGIC(4) | size(u32 LE) | undo_payload(size) | checksum(32)
-    // The fixtures include the 32-byte checksum trailer per record.
-    // We do *not* validate the checksum here; correctness is enforced later by
-    // `validate_undo_payload_against_block`.
-    let mut out: Vec<RecordRange> = Vec::new();
+    //   MAGIC(4) | size(u32 LE) | undo_payload(size) | trailer(32)
+    // The fixtures include the 32-byte trailer per record.
+    // We keep it so we can (optionally) use it for O(1) pairing.
+    let mut out: Vec<RevRecord> = Vec::new();
     let mut i: usize = 0;
 
     while i + 8 <= buf.len() {
@@ -483,13 +482,16 @@ fn read_rev_records_strict(buf: &[u8], kind: &'static str) -> Result<Vec<RecordR
             return Err(err(
                 "TRUNCATED_RECORD",
                 format!(
-                    "{kind}: record truncated: need payload={size} + 32-byte checksum, have {}",
+                    "{kind}: record truncated: need payload={size} + 32-byte trailer, have {}",
                     buf.len().saturating_sub(payload_start)
                 ),
             ));
         }
 
-        out.push(payload_start..payload_end);
+        out.push(RevRecord {
+            payload: payload_start..payload_end,
+            trailer: payload_end..trailer_end,
+        });
         i = trailer_end;
     }
 
@@ -500,6 +502,11 @@ fn read_rev_records_strict(buf: &[u8], kind: &'static str) -> Result<Vec<RecordR
     Ok(out)
 }
 
+fn read32(buf: &[u8], r: &std::ops::Range<usize>) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&buf[r.clone()]);
+    out
+}
 
 fn dsha256_bytes(data: &[u8]) -> [u8; 32] {
     let h1 = Sha256::digest(data);
@@ -513,6 +520,13 @@ fn dsha256_bytes(data: &[u8]) -> [u8; 32] {
 #[allow(dead_code)]
 fn rev_checksum(undo_payload: &[u8]) -> [u8; 32] {
     dsha256_bytes(undo_payload)
+}
+
+fn block_hash_le(block_payload: &[u8]) -> Result<[u8; 32], String> {
+    if block_payload.len() < 80 {
+        return Err(err("INVALID_BLOCK", "block payload too small for header"));
+    }
+    Ok(dsha256_bytes(&block_payload[..80]))
 }
 
 /// Helpers to extract structural counts from block and undo payloads.
@@ -534,41 +548,171 @@ fn undo_txundo_count(undo_payload: &[u8]) -> Result<u64, String> {
     parser::read_varint(&mut uc).map_err(|e| err("INVALID_UNDO", e))
 }
 
-/// Pair rev-records to blk-records without assuming identical on-disk ordering.
+/// Attempt fast-path pairing using the 32-byte rev trailer.
 ///
-/// In Bitcoin Core, blk and rev offsets are resolved via the block index DB.
-/// In this challenge (no block index available), we pair using a strong invariant:
-///   undo_txundo_count == tx_count - 1 (coinbase has no undo entry)
-/// plus a full structural validation:
-///   validate_undo_payload_against_block(block, undo_payload)
-///
-/// A strict 1:1 mapping is enforced (each rev record used at most once).
-fn pair_rev_to_blocks_by_checksum(
+/// This is only safe if the trailer is some block identifier we can compute per block
+/// (most likely block_hash). We therefore:
+/// - only take the fast-path when the match is **unique** and **unused**
+/// - fill remaining blocks via the existing invariant+validate fallback.
+fn pair_rev_to_blocks_fast_then_fallback(
     blk_buf: &[u8],
     blk_ranges: &[RecordRange],
     rev_buf: &[u8],
-    rev_ranges: &[RecordRange],
+    rev_recs: &[RevRecord],
 ) -> Result<Vec<RecordRange>, String> {
     if blk_ranges.is_empty() {
         return Err(err("NO_RECORDS_FOUND", "blk: no records found"));
     }
-    if rev_ranges.is_empty() {
+    if rev_recs.is_empty() {
         return Err(err("NO_RECORDS_FOUND", "rev: no records found"));
     }
 
+    // Optional diagnostics to understand what trailer likely represents.
+    // This is intentionally cheap and off by default.
+    let diag = std::env::var("CHAINLENS_REV_TRAILER_DIAG").is_ok();
 
+    // Build trailer index: trailer_bytes -> rev indices (Vec for collision safety).
+    let mut by_trailer: std::collections::HashMap<[u8; 32], Vec<usize>> =
+        std::collections::HashMap::new();
+    for (j, rr) in rev_recs.iter().enumerate() {
+        let t = read32(rev_buf, &rr.trailer);
+        by_trailer.entry(t).or_default().push(j);
+    }
+
+    let mut used = vec![false; rev_recs.len()];
+    let mut out: Vec<Option<RecordRange>> = vec![None; blk_ranges.len()];
+
+    // Fast-path toggle. We keep it opt-in until trailer meaning is confirmed.
+    let fast_enabled = std::env::var("CHAINLENS_PAIRING_FAST").is_ok();
+
+    let mut matched_fast = 0usize;
+
+    if fast_enabled {
+        for (i, br) in blk_ranges.iter().enumerate() {
+            let block = &blk_buf[br.clone()];
+            let bh = block_hash_le(block)?;
+
+            if let Some(cands) = by_trailer.get(&bh) {
+                // Only accept when exactly one unused candidate exists.
+                let mut chosen: Option<usize> = None;
+                for &j in cands {
+                    if !used[j] {
+                        if chosen.is_some() {
+                            // Ambiguous.
+                            chosen = None;
+                            break;
+                        }
+                        chosen = Some(j);
+                    }
+                }
+
+                if let Some(j) = chosen {
+                    used[j] = true;
+                    out[i] = Some(rev_recs[j].payload.clone());
+                    matched_fast += 1;
+                }
+            }
+        }
+    }
+
+    if diag {
+        // Quick signal: how many rev trailers equal dSHA256(undo_payload)?
+        // and how many trailers match some block_hash (whether used or not).
+        let mut trailer_eq_undo_checksum = 0usize;
+        let mut trailer_matches_any_blockhash = 0usize;
+
+        // Build a set of block hashes for membership test.
+        let mut blockhash_set: std::collections::HashSet<[u8; 32]> =
+            std::collections::HashSet::with_capacity(blk_ranges.len());
+        for br in blk_ranges {
+            let block = &blk_buf[br.clone()];
+            if let Ok(bh) = block_hash_le(block) {
+                blockhash_set.insert(bh);
+            }
+        }
+
+        // Sample up to 64 rev records.
+        let sample_n = rev_recs.len().min(64);
+        for rr in rev_recs.iter().take(sample_n) {
+            let undo_payload = &rev_buf[rr.payload.clone()];
+            let t = read32(rev_buf, &rr.trailer);
+            if rev_checksum(undo_payload) == t {
+                trailer_eq_undo_checksum += 1;
+            }
+            if blockhash_set.contains(&t) {
+                trailer_matches_any_blockhash += 1;
+            }
+        }
+
+        eprintln!(
+            "[chainlens] rev trailer diag: sample_n={sample_n} eq(dsha256(undo))={trailer_eq_undo_checksum} matches_any_blockhash={trailer_matches_any_blockhash} fast_matched={matched_fast}/{}",
+            blk_ranges.len()
+        );
+    }
+
+    // Fallback fill for any blocks we did not match via fast-path.
+    let filled = pair_rev_to_blocks_fallback_validate_fill(
+        blk_buf,
+        blk_ranges,
+        rev_buf,
+        rev_recs,
+        &mut used,
+        &mut out,
+    )?;
+
+    // Convert out -> Vec<RecordRange> in block order.
+    let mut final_out: Vec<RecordRange> = Vec::with_capacity(blk_ranges.len());
+    for (i, opt) in out.into_iter().enumerate() {
+        let Some(r) = opt else {
+            return Err(err("REV_PAIRING_FAILED", format!("block[{i}] left unpaired")));
+        };
+        final_out.push(r);
+    }
+
+    // Optional stats
+    if std::env::var("CHAINLENS_PAIRING_STATS").is_ok() {
+        let matched_fallback = filled;
+        eprintln!(
+            "[chainlens] pairing: fast={} fallback={} total_blocks={}",
+            matched_fast,
+            matched_fallback,
+            blk_ranges.len()
+        );
+    }
+
+    Ok(final_out)
+}
+
+/// Existing (correctness) pairing algorithm: bucket by undo_count invariant and validate.
+///
+/// This is now used as a fallback and can skip already-used rev records.
+fn pair_rev_to_blocks_fallback_validate_fill(
+    blk_buf: &[u8],
+    blk_ranges: &[RecordRange],
+    rev_buf: &[u8],
+    rev_recs: &[RevRecord],
+    used: &mut [bool],
+    out: &mut [Option<RecordRange>],
+) -> Result<usize, String> {
     // Index rev records by their leading txundo-count varint.
-    let mut by_undo_cnt: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
-    for (j, ur) in rev_ranges.iter().enumerate() {
-        let undo_payload = &rev_buf[ur.clone()];
+    let mut by_undo_cnt: std::collections::HashMap<u64, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (j, rr) in rev_recs.iter().enumerate() {
+        if used[j] {
+            continue;
+        }
+        let undo_payload = &rev_buf[rr.payload.clone()];
         let undo_cnt = undo_txundo_count(undo_payload)?;
         by_undo_cnt.entry(undo_cnt).or_default().push(j);
     }
 
-    let mut used = vec![false; rev_ranges.len()];
-    let mut out: Vec<RecordRange> = Vec::with_capacity(blk_ranges.len());
+    let mut matched = 0usize;
 
     for (i, br) in blk_ranges.iter().enumerate() {
+        if out[i].is_some() {
+            continue; // already paired by fast-path
+        }
+
         let block = &blk_buf[br.clone()];
         let txc = block_tx_count(block)?;
         if txc == 0 {
@@ -588,14 +732,12 @@ fn pair_rev_to_blocks_by_checksum(
             }
         }
 
-
         let mut chosen: Option<usize> = None;
         for &j in &cand {
             if used[j] {
                 continue;
             }
-            let ur = &rev_ranges[j];
-            let undo_payload = &rev_buf[ur.clone()];
+            let undo_payload = &rev_buf[rev_recs[j].payload.clone()];
             if undo::validate_undo_payload_against_block(block, undo_payload).is_ok() {
                 chosen = Some(j);
                 break;
@@ -612,11 +754,11 @@ fn pair_rev_to_blocks_by_checksum(
         };
 
         used[j] = true;
-        out.push(rev_ranges[j].clone());
-
+        out[i] = Some(rev_recs[j].payload.clone());
+        matched += 1;
     }
 
-    Ok(out)
+    Ok(matched)
 }
 
 fn validate_block_payload(block: &[u8]) -> Result<(), String> {
@@ -710,13 +852,14 @@ fn decode_rev_records_against_blocks(
         rev = xor_decode_with_shift(rev, key, 0);
     }
 
-    let rev_ranges = read_rev_records_strict(&rev, "rev")?;
+    let rev_recs = read_rev_records_strict(&rev, "rev")?;
 
+    // Fast-path (optional) using the 32-byte trailer, then fallback to current validate-based pairing.
     let paired_undo_ranges =
-        pair_rev_to_blocks_by_checksum(blk_buf, blk_ranges, &rev, &rev_ranges)?;
+        pair_rev_to_blocks_fast_then_fallback(blk_buf, blk_ranges, &rev, &rev_recs)?;
 
     // Pairing already performed full structural validation via
-    // `validate_undo_payload_against_block` for each chosen (block, undo) pair.
+    // `validate_undo_payload_against_block` for each chosen (block, undo) pair (fallback path).
     // Avoid re-validating here to keep block-mode fast.
     //
     // If you want a redundant validation pass (debugging), set:
@@ -763,14 +906,20 @@ pub use report::{BlockHeaderReport, BlockReport, BlockStatsReport, CoinbaseRepor
 use std::collections::BTreeMap;
 use std::fs;
 
-use crate::btc::tx::{analyze_tx_from_bytes_ordered, analyze_tx_from_bytes_ordered_lite};
+use crate::btc::tx::analyze_tx_from_bytes_ordered_lite;
 
 use io::decode_blk_and_rev_best;
 use parser::{bytes_to_hex, hash_to_display_hex, merkle_root, Cursor};
-use undo::{extract_vin_count_from_slice, parse_undo_payload_strict_slices};
+use undo::parse_undo_payload_strict_slices;
 
 fn err(code: &str, msg: impl AsRef<str>) -> String {
     format!("{code}: {}", msg.as_ref())
+}
+
+#[inline]
+fn bump_script_summary<'a>(m: &mut BTreeMap<&'a str, u64>, script_type: &'a str) {
+    let key = if script_type.is_empty() { "unknown" } else { script_type };
+    *m.entry(key).or_insert(0) += 1;
 }
 
 fn txid_display_hex_to_le(s: &str) -> Result<[u8; 32], String> {
@@ -930,8 +1079,159 @@ pub fn analyze_block_file_first_block(blk_path: &str, xor_path: &str) -> Result<
         .next()
         .ok_or_else(|| err("INVALID_BLOCK", "no block records"))?;
 
-    let empty: &[(u64, &[u8])] = &[];
-    analyze_one_block_payload(&blk_buf[first.clone()], empty)
+    analyze_one_block_payload(&blk_buf[first.clone()])
+}
+
+/// Analyze a single block payload WITHOUT an undo payload.
+///
+/// This exists for the web helper that only uploads blk+xor.
+/// Non-coinbase txs are analyzed with empty prevouts, so fees/feerates will be 0.
+fn analyze_one_block_payload(block: &[u8]) -> Result<BlockReport, String> {
+    // --- parse header ---
+    let mut bc = Cursor::new(block);
+    if bc.remaining() < 80 {
+        return Err(err("INVALID_BLOCK", "block payload too small for header"));
+    }
+
+    let header = bc.take(80)?;
+    let mut hc = Cursor::new(header);
+
+    let version = hc.take_u32_le()?;
+    let prev_le = {
+        let s = hc.take(32)?;
+        let mut a = [0u8; 32];
+        a.copy_from_slice(s);
+        a
+    };
+    let merkle_le = {
+        let s = hc.take(32)?;
+        let mut a = [0u8; 32];
+        a.copy_from_slice(s);
+        a
+    };
+    let timestamp = hc.take_u32_le()?;
+    let bits_u32 = hc.take_u32_le()?;
+    let nonce = hc.take_u32_le()?;
+
+    let block_hash_le = parser::dsha256(header);
+    let block_hash = hash_to_display_hex(block_hash_le);
+
+    let prev_block_hash = {
+        let mut be = prev_le;
+        be.reverse();
+        bytes_to_hex(&be)
+    };
+    let merkle_root_hdr_display = {
+        let mut be = merkle_le;
+        be.reverse();
+        bytes_to_hex(&be)
+    };
+
+    // --- parse txs (NO raw tx copies) ---
+    let tx_count = parser::read_varint(&mut bc)?;
+    if tx_count == 0 {
+        return Err(err("INVALID_BLOCK", "tx_count=0"));
+    }
+
+    let mut tx_ranges: Vec<(usize, usize)> = Vec::with_capacity(tx_count as usize);
+
+    for _tx_idx in 0..(tx_count as usize) {
+        let start = bc.pos();
+        let _vin_count = parser::parse_tx_skip_and_vin_count(&mut bc)?;
+        let end = bc.pos();
+        tx_ranges.push((start, end));
+    }
+
+    // --- coinbase ---
+    let (cb_s, cb_e) = tx_ranges[0];
+    let (coinbase_script, coinbase_outsum) =
+        parser::coinbase_extract_script_and_outsum(&block[cb_s..cb_e])?;
+    let bip34_height = parser::decode_bip34_height(&coinbase_script);
+    let coinbase_script_hex = bytes_to_hex(&coinbase_script);
+
+    // Build empty undo prevouts for non-coinbase txs.
+    let undo_prevouts: Vec<Vec<(u64, &[u8])>> = vec![Vec::new(); tx_ranges.len().saturating_sub(1)];
+
+    // --- analyze txs (bounded parallelism, slices) ---
+    let tx_reports = analyze_txs_with_undo_slices(block, &tx_ranges, &undo_prevouts)?;
+
+    // Merkle check *after* tx analysis (txids come from TxReport)
+    let mut txids_le: Vec<[u8; 32]> = Vec::with_capacity(tx_reports.len());
+    for tx in &tx_reports {
+        txids_le.push(txid_display_hex_to_le(&tx.txid)?);
+    }
+
+    let mr_calc = merkle_root(&txids_le);
+    if mr_calc != merkle_le {
+        return Err(err(
+            "MERKLE_MISMATCH",
+            format!(
+                "header={} computed={}",
+                merkle_root_hdr_display,
+                hash_to_display_hex(mr_calc)
+            ),
+        ));
+    }
+
+    // --- block stats ---
+    let mut total_fees: u64 = 0;
+    let mut total_weight: u64 = 0;
+    let mut total_vbytes_non_cb: u64 = 0;
+    let mut script_summary_ref: BTreeMap<&str, u64> = BTreeMap::new();
+
+    for (idx, tx) in tx_reports.iter().enumerate() {
+        total_weight = total_weight.saturating_add(tx.weight as u64);
+
+        if idx != 0 {
+            if tx.fee_sats > 0 {
+                total_fees = total_fees.saturating_add(tx.fee_sats as u64);
+            }
+            total_vbytes_non_cb = total_vbytes_non_cb.saturating_add(tx.vbytes as u64);
+        }
+
+        for o in &tx.vout {
+            bump_script_summary(&mut script_summary_ref, &o.script_type);
+        }
+    }
+
+    let mut script_summary: BTreeMap<String, u64> = BTreeMap::new();
+    for (k, v) in script_summary_ref {
+        script_summary.insert(k.to_string(), v);
+    }
+
+    let avg_fee_rate_sat_vb = if total_vbytes_non_cb == 0 {
+        0.0
+    } else {
+        (total_fees as f64) / (total_vbytes_non_cb as f64)
+    };
+
+    Ok(BlockReport {
+        ok: true,
+        mode: "block",
+        block_header: BlockHeaderReport {
+            version,
+            prev_block_hash,
+            merkle_root: merkle_root_hdr_display,
+            merkle_root_valid: true,
+            timestamp,
+            bits: format!("{bits_u32:08x}"),
+            nonce,
+            block_hash,
+        },
+        tx_count,
+        coinbase: CoinbaseReport {
+            bip34_height,
+            coinbase_script_hex,
+            total_output_sats: coinbase_outsum,
+        },
+        transactions: tx_reports,
+        block_stats: BlockStatsReport {
+            total_fees_sats: total_fees,
+            total_weight,
+            avg_fee_rate_sat_vb,
+            script_type_summary: script_summary,
+        },
+    })
 }
 
 fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Result<BlockReport, String> {
@@ -980,21 +1280,17 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
     let tx_count = parser::read_varint(&mut bc)?;
 
     let mut tx_ranges: Vec<(usize, usize)> = Vec::with_capacity(tx_count as usize);
-    for _ in 0..tx_count {
+    // Build vin counts for non-coinbase txs in the SAME pass (no second parse).
+    let mut vin_counts_non_cb: Vec<u64> = Vec::with_capacity((tx_count as usize).saturating_sub(1));
+
+    for tx_idx in 0..(tx_count as usize) {
         let start = bc.pos();
-        parser::parse_tx_skip(block, &mut bc)?;
+        let vin_count = parser::parse_tx_skip_and_vin_count(&mut bc)?;
         let end = bc.pos();
         tx_ranges.push((start, end));
-    }
-
-    if tx_ranges.is_empty() {
-        return Err(err("INVALID_BLOCK", "block has zero transactions"));
-    }
-
-    // Build vin counts for non-coinbase txs (needed for undo parsing)
-    let mut vin_counts_non_cb: Vec<u64> = Vec::with_capacity(tx_ranges.len().saturating_sub(1));
-    for &(s, e) in tx_ranges.iter().skip(1) {
-        vin_counts_non_cb.push(extract_vin_count_from_slice(&block[s..e])?);
+        if tx_idx != 0 {
+            vin_counts_non_cb.push(vin_count);
+        }
     }
 
     // --- coinbase ---
@@ -1043,7 +1339,7 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
     let mut total_fees: u64 = 0;
     let mut total_weight: u64 = 0;
     let mut total_vbytes_non_cb: u64 = 0;
-    let mut script_summary: BTreeMap<String, u64> = BTreeMap::new();
+    let mut script_summary_ref: BTreeMap<&str, u64> = BTreeMap::new();
 
     for (idx, tx) in tx_reports.iter().enumerate() {
         total_weight = total_weight.saturating_add(tx.weight as u64);
@@ -1056,157 +1352,15 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
         }
 
         for o in &tx.vout {
-            let k = if o.script_type.is_empty() { "unknown" } else { &o.script_type };
-            *script_summary.entry(k.to_string()).or_insert(0) += 1;
+            bump_script_summary(&mut script_summary_ref, &o.script_type);
         }
     }
 
-    let avg_fee_rate_sat_vb = if total_vbytes_non_cb == 0 {
-        0.0
-    } else {
-        (total_fees as f64) / (total_vbytes_non_cb as f64)
-    };
+    // Materialize once into the report-required type.
 
-    Ok(BlockReport {
-        ok: true,
-        mode: "block",
-        block_header: BlockHeaderReport {
-            version,
-            prev_block_hash,
-            merkle_root: merkle_root_hdr_display,
-            merkle_root_valid: true,
-            timestamp,
-            bits: format!("{bits_u32:08x}"),
-            nonce,
-            block_hash,
-        },
-        tx_count,
-        coinbase: CoinbaseReport {
-            bip34_height,
-            coinbase_script_hex,
-            total_output_sats: coinbase_outsum,
-        },
-        transactions: tx_reports,
-        block_stats: BlockStatsReport {
-            total_fees_sats: total_fees,
-            total_weight,
-            avg_fee_rate_sat_vb,
-            script_type_summary: script_summary,
-        },
-    })
-}
-
-/// Legacy entrypoint kept for the web's "first block" demo mode.
-fn analyze_one_block_payload(block: &[u8], undo_payload: &[(u64, &[u8])]) -> Result<BlockReport, String> {
-    // NOTE: left as legacy for now; consider mirroring the record_rev path for speed.
-    // (This function currently uses parse_tx_skip_and_txid_le + early merkle check.)
-
-    let mut bc = Cursor::new(block);
-    if bc.remaining() < 80 {
-        return Err(err("INVALID_BLOCK", "block payload too small for header"));
-    }
-
-    let header = bc.take(80)?.to_vec();
-    let mut hc = Cursor::new(&header);
-
-    let version = hc.take_u32_le()?;
-    let prev_le = {
-        let s = hc.take(32)?;
-        let mut a = [0u8; 32];
-        a.copy_from_slice(s);
-        a
-    };
-    let merkle_le = {
-        let s = hc.take(32)?;
-        let mut a = [0u8; 32];
-        a.copy_from_slice(s);
-        a
-    };
-    let timestamp = hc.take_u32_le()?;
-    let bits_u32 = hc.take_u32_le()?;
-    let nonce = hc.take_u32_le()?;
-
-    let block_hash_le = parser::dsha256(&header);
-    let block_hash = hash_to_display_hex(block_hash_le);
-
-    let prev_block_hash = {
-        let mut be = prev_le;
-        be.reverse();
-        bytes_to_hex(&be)
-    };
-    let merkle_root_hdr_display = {
-        let mut be = merkle_le;
-        be.reverse();
-        bytes_to_hex(&be)
-    };
-
-    let tx_count = parser::read_varint(&mut bc)?;
-
-    let mut txids_le: Vec<[u8; 32]> = Vec::with_capacity(tx_count as usize);
-    let mut tx_ranges: Vec<(usize, usize)> = Vec::with_capacity(tx_count as usize);
-
-    for _ in 0..tx_count {
-        let start = bc.pos();
-        let txid_le = parser::parse_tx_skip_and_txid_le(block, &mut bc)?;
-        let end = bc.pos();
-        txids_le.push(txid_le);
-        tx_ranges.push((start, end));
-    }
-
-    let mr_calc = merkle_root(&txids_le);
-    if mr_calc != merkle_le {
-        return Err(err(
-            "MERKLE_MISMATCH",
-            format!(
-                "header={} computed={}",
-                merkle_root_hdr_display,
-                hash_to_display_hex(mr_calc)
-            ),
-        ));
-    }
-
-    if tx_ranges.is_empty() {
-        return Err(err("INVALID_BLOCK", "block has zero transactions"));
-    }
-
-    let (cb_s, cb_e) = tx_ranges[0];
-    let (coinbase_script, coinbase_outsum) =
-        parser::coinbase_extract_script_and_outsum(&block[cb_s..cb_e])?;
-    let bip34_height = parser::decode_bip34_height(&coinbase_script);
-    let coinbase_script_hex = bytes_to_hex(&coinbase_script);
-
-    let tx_reports: Vec<crate::btc::tx::TxReport> = if undo_payload.is_empty() {
-        if tx_ranges.len() > 1 {
-            return Err(err("UNDO_MISSING", "undo payload required for non-coinbase tx analysis"));
-        }
-        let empty: &[(u64, &[u8])] = &[];
-        let coinbase_report = analyze_tx_from_bytes_ordered("mainnet", &block[cb_s..cb_e], empty)
-            .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
-        vec![coinbase_report]
-    } else {
-        // Legacy path lacks vin_counts; keep old behavior or refactor later.
-        return Err(err("UNDO_UNSUPPORTED", "legacy block demo does not support undo payload"));
-    };
-
-    let mut total_fees: u64 = 0;
-    let mut total_weight: u64 = 0;
-    let mut total_vbytes_non_cb: u64 = 0;
     let mut script_summary: BTreeMap<String, u64> = BTreeMap::new();
-
-    for (idx, tx) in tx_reports.iter().enumerate() {
-        total_weight = total_weight.saturating_add(tx.weight as u64);
-
-        if idx != 0 {
-            if tx.fee_sats > 0 {
-                total_fees = total_fees.saturating_add(tx.fee_sats as u64);
-            }
-            total_vbytes_non_cb = total_vbytes_non_cb.saturating_add(tx.vbytes as u64);
-        }
-
-        for o in &tx.vout {
-            let k = if o.script_type.is_empty() { "unknown" } else { &o.script_type };
-            *script_summary.entry(k.to_string()).or_insert(0) += 1;
-        }
+    for (k, v) in script_summary_ref {
+        script_summary.insert(k.to_string(), v);
     }
 
     let avg_fee_rate_sat_vb = if total_vbytes_non_cb == 0 {
@@ -1246,6 +1400,7 @@ fn analyze_one_block_payload(block: &[u8], undo_payload: &[(u64, &[u8])]) -> Res
 
 
 # =================== btc/block/parser.rs
+
 
 // src/btc/block/parser.rs
 
@@ -1397,6 +1552,19 @@ pub(crate) fn parse_tx_skip_and_txid_le(
     block: &[u8],
     bc: &mut Cursor,
 ) -> Result<[u8; 32], String> {
+    // Backwards-compatible wrapper.
+    let (txid, _vin_count) = parse_tx_skip_and_txid_le_and_vin_count(block, bc)?;
+    Ok(txid)
+}
+
+/// Skip a transaction in `block` at the current cursor position, returning both the txid (LE)
+/// and the vin_count.
+///
+/// This avoids a second parse when callers need vin_count (e.g. undo pairing/validation).
+pub(crate) fn parse_tx_skip_and_txid_le_and_vin_count(
+    block: &[u8],
+    bc: &mut Cursor,
+) -> Result<([u8; 32], u64), String> {
     let start = bc.pos();
 
     let version = bc.take_u32_le()?;
@@ -1436,7 +1604,7 @@ pub(crate) fn parse_tx_skip_and_txid_le(
 
         let _ = bc.take(4)?; // locktime
         let end = bc.pos();
-        return Ok(dsha256(&block[start..end]));
+        return Ok((dsha256(&block[start..end]), vin_count));
     }
 
     // Segwit: stream stripped serialization directly into hasher.
@@ -1492,10 +1660,14 @@ pub(crate) fn parse_tx_skip_and_txid_le(
     let lock = bc.take(4)?;
     h.update(lock);
 
-    Ok(sha256d_finish(h))
+    Ok((sha256d_finish(h), vin_count))
 }
 
-pub(crate) fn parse_tx_skip(_block: &[u8], bc: &mut Cursor) -> Result<(), String> {
+/// Skip a transaction and return only the vin_count.
+///
+/// This is cheaper than computing txid and is useful when callers only need
+/// input counts (e.g. undo parsing/validation).
+pub(crate) fn parse_tx_skip_and_vin_count(bc: &mut Cursor) -> Result<u64, String> {
     let _version = bc.take_u32_le()?;
 
     // Detect segwit marker/flag.
@@ -1512,48 +1684,42 @@ pub(crate) fn parse_tx_skip(_block: &[u8], bc: &mut Cursor) -> Result<(), String
     };
 
     // vin
-    let vin_count_u64 = read_varint(bc)?;
-    ensure_len("tx", "vin_count", vin_count_u64, 50_000)?;
-    let vin_count = vin_count_u64 as usize;
-
+    let vin_count = read_varint(bc)?;
+    ensure_len("tx", "vin_count", vin_count, 50_000)?;
     for _ in 0..vin_count {
-        let _ = bc.take(32)?; // prev txid
-        let _ = bc.take(4)?;  // vout
-        let script_len_u64 = read_varint(bc)?;
-        ensure_len("tx", "script_sig_len", script_len_u64, 1_000_000)?;
-        let _ = bc.take(script_len_u64 as usize)?; // scriptSig
-        let _ = bc.take(4)?; // sequence
+        let _ = bc.take(32)?;
+        let _ = bc.take(4)?;
+        let script_len = read_varint(bc)?;
+        ensure_len("tx", "script_sig_len", script_len, 1_000_000)?;
+        let _ = bc.take(script_len as usize)?;
+        let _ = bc.take(4)?;
     }
 
     // vout
-    let vout_count_u64 = read_varint(bc)?;
-    ensure_len("tx", "vout_count", vout_count_u64, 50_000)?;
-    let vout_count = vout_count_u64 as usize;
-
+    let vout_count = read_varint(bc)?;
+    ensure_len("tx", "vout_count", vout_count, 50_000)?;
     for _ in 0..vout_count {
-        let _ = bc.take(8)?; // value
-        let spk_len_u64 = read_varint(bc)?;
-        ensure_len("tx", "script_pubkey_len", spk_len_u64, 10_000)?;
-        let _ = bc.take(spk_len_u64 as usize)?; // scriptPubKey
+        let _ = bc.take(8)?;
+        let spk_len = read_varint(bc)?;
+        ensure_len("tx", "script_pubkey_len", spk_len, 10_000)?;
+        let _ = bc.take(spk_len as usize)?;
     }
 
     // witness (only present in segwit txs)
     if segwit {
         for _ in 0..vin_count {
-            let n_items_u64 = read_varint(bc)?;
-            ensure_len("tx", "witness_item_count", n_items_u64, 10_000)?;
-            let n_items = n_items_u64 as usize;
-
+            let n_items = read_varint(bc)?;
+            ensure_len("tx", "witness_item_count", n_items, 10_000)?;
             for _ in 0..n_items {
-                let item_len_u64 = read_varint(bc)?;
-                ensure_len("tx", "witness_item_len", item_len_u64, 4_000_000)?;
-                let _ = bc.take(item_len_u64 as usize)?;
+                let item_len = read_varint(bc)?;
+                ensure_len("tx", "witness_item_len", item_len, 4_000_000)?;
+                let _ = bc.take(item_len as usize)?;
             }
         }
     }
 
-    let _locktime = bc.take(4)?;
-    Ok(())
+    let _ = bc.take(4)?; // locktime
+    Ok(vin_count)
 }
 
 pub(crate) fn decode_bip34_height(coinbase_script: &[u8]) -> u64 {
@@ -1624,8 +1790,6 @@ use super::parser;
 
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::PublicKey;
-
-type UndoPrevouts = Vec<Vec<(u64, Vec<u8>)>>;
 
 // Zero-copy representation for scriptPubKey bytes in undo payload.
 // Some scripts are stored raw inside the undo payload; others are stored in a compressed form and
@@ -1737,66 +1901,6 @@ fn decompress_uncompressed_pubkey_from_x(x32: &[u8], y_is_odd: bool) -> Result<V
     Ok(bytes.to_vec())
 }
 
-fn read_compressed_script(c: &mut parser::Cursor) -> Result<Vec<u8>, String> {
-    // ScriptCompressor uses Bitcoin Core base-128 VarInt (not CompactSize).
-    let nsize = read_varint_core(c)?;
-
-    match nsize {
-        0 => {
-            let h160 = c.take(20)?;
-            let mut spk = Vec::with_capacity(25);
-            spk.extend_from_slice(&[0x76, 0xa9, 0x14]);
-            spk.extend_from_slice(h160);
-            spk.extend_from_slice(&[0x88, 0xac]);
-            Ok(spk)
-        }
-        1 => {
-            let h160 = c.take(20)?;
-            let mut spk = Vec::with_capacity(23);
-            spk.extend_from_slice(&[0xa9, 0x14]);
-            spk.extend_from_slice(h160);
-            spk.push(0x87);
-            Ok(spk)
-        }
-        2 | 3 => {
-            let x = c.take(32)?;
-            let prefix = if nsize == 2 { 0x02 } else { 0x03 };
-            let mut pubkey = Vec::with_capacity(33);
-            pubkey.push(prefix);
-            pubkey.extend_from_slice(x);
-
-            let mut spk = Vec::with_capacity(35);
-            spk.push(0x21);
-            spk.extend_from_slice(&pubkey);
-            spk.push(0xac);
-            Ok(spk)
-        }
-        4 | 5 => {
-            let x = c.take(32)?;
-            let y_is_odd = nsize == 5;
-            let pubkey65 = decompress_uncompressed_pubkey_from_x(x, y_is_odd)?;
-
-            let mut spk = Vec::with_capacity(67);
-            spk.push(0x41);
-            spk.extend_from_slice(&pubkey65);
-            spk.push(0xac);
-            Ok(spk)
-        }
-        _ => {
-            if nsize < 6 {
-                return Err(err("INVALID_SCRIPT_COMPRESSION", "nsize < 6 unexpected"));
-            }
-
-            let raw_len_u64 = nsize - 6;
-            ensure_len("undo", "compressed_script_raw_len", raw_len_u64, 100_000)?;
-
-            let raw_len: usize = usize::try_from(raw_len_u64)
-                .map_err(|_| err("LEN_OVERFLOW", format!("raw_len too large for usize: {raw_len_u64}")))?;
-
-            Ok(c.take(raw_len)?.to_vec())
-        }
-    }
-}
 
 // Zero-copy variant: returns a ScriptSlice into either undo_payload (raw scripts) or the arena
 // (expanded standard scripts). No per-script Vec allocations.
@@ -1869,24 +1973,6 @@ fn read_compressed_script_slice(c: &mut parser::Cursor, arena: &mut Vec<u8>) -> 
     }
 }
 
-fn read_one_inundo(rc: &mut parser::Cursor) -> Result<(u64, Vec<u8>), String> {
-    let ncode = read_varint_core(rc)?;
-    let height = ncode >> 1;
-
-    if height > 0 {
-        let _tx_version = read_varint_core(rc)?;
-    }
-
-    let comp_amt = read_varint_core(rc)?;
-    let spk = read_compressed_script(rc)?;
-    let value_sats = decompress_amount(comp_amt);
-
-    if spk.len() > 100_000 {
-        return Err(err("INSANE_LEN", format!("spk too large: {}", spk.len())));
-    }
-
-    Ok((value_sats, spk))
-}
 
 #[allow(dead_code)]
 fn read_one_inundo_slice(rc: &mut parser::Cursor, arena: &mut Vec<u8>) -> Result<(u64, ScriptSlice), String> {
@@ -1906,70 +1992,6 @@ fn read_one_inundo_slice(rc: &mut parser::Cursor, arena: &mut Vec<u8>) -> Result
     }
 
     Ok((value_sats, spk))
-}
-
-fn read_undo_for_block_from_cursor(
-    rc: &mut parser::Cursor,
-    vin_counts_non_cb: &[u64],
-) -> Result<UndoPrevouts, String> {
-    // CBlockUndo: CompactSize(nTxUndo)
-    // Usually tx_count - 1, but some fixtures include an extra empty CTxUndo for coinbase.
-    let n_txundo = read_compactsize(rc)?;
-    ensure_len("undo", "n_txundo", n_txundo, 200_000)?;
-
-    let expected = vin_counts_non_cb.len() as u64;
-
-    let mut has_cb_undo = false;
-    if n_txundo == expected {
-        // ok
-    } else if n_txundo == expected.saturating_add(1) {
-        has_cb_undo = true;
-    } else {
-        return Err(err(
-            "UNDO_MISMATCH",
-            format!(
-                "undo txundo count mismatch: undo={}, expected={} (or {} if coinbase included)",
-                n_txundo,
-                expected,
-                expected.saturating_add(1)
-            ),
-        ));
-    }
-
-    if has_cb_undo {
-        let cb_vin_n = read_compactsize(rc)?;
-        if cb_vin_n != 0 {
-            return Err(err(
-                "UNDO_MISMATCH",
-                format!("coinbase undo present but vin_n != 0: got={cb_vin_n}"),
-            ));
-        }
-    }
-
-    let mut all: UndoPrevouts = Vec::with_capacity(vin_counts_non_cb.len());
-
-    for (txundo_idx, &vin_expected) in vin_counts_non_cb.iter().enumerate() {
-        let vin_n = read_compactsize(rc)?;
-        ensure_len("undo", "vin_count", vin_n, 100_000)?;
-
-        if vin_n != vin_expected {
-            return Err(err(
-                "UNDO_MISMATCH",
-                format!(
-                    "undo vin count mismatch: txundo_idx={} undo={} expected={}",
-                    txundo_idx, vin_n, vin_expected
-                ),
-            ));
-        }
-
-        let mut ins = Vec::with_capacity(vin_n as usize);
-        for _ in 0..(vin_n as usize) {
-            ins.push(read_one_inundo(rc)?);
-        }
-        all.push(ins);
-    }
-
-    Ok(all)
 }
 
 #[allow(dead_code)]
@@ -2036,21 +2058,6 @@ fn read_undo_for_block_from_cursor_slices(
     Ok(all)
 }
 
-pub(crate) fn parse_undo_payload_strict(
-    undo_payload: &[u8],
-    vin_counts_non_cb: &[u64],
-) -> Result<UndoPrevouts, String> {
-    let mut uc = parser::Cursor::new(undo_payload);
-    let v = read_undo_for_block_from_cursor(&mut uc, vin_counts_non_cb)?;
-    if uc.remaining() != 0 {
-        return Err(err(
-            "UNDO_TRAILING_BYTES",
-            format!("undo payload has {} trailing bytes", uc.remaining()),
-        ));
-    }
-    Ok(v)
-}
-
 // Zero-copy strict parser: returns ScriptSlice references that can be materialized as &[u8]
 // using ScriptSlice::as_slice(undo_payload, arena).
 #[allow(dead_code)]
@@ -2088,6 +2095,128 @@ pub(crate) fn extract_vin_count_from_slice(raw_tx: &[u8]) -> Result<u64, String>
     extract_vin_count(raw_tx)
 }
 
+#[inline]
+fn skip_compressed_script(rc: &mut parser::Cursor) -> Result<(), String> {
+    // ScriptCompressor uses Bitcoin Core base-128 VarInt (not CompactSize).
+    let nsize = read_varint_core(rc)?;
+
+    match nsize {
+        0 | 1 => {
+            // P2PKH or P2SH: 20-byte hash160
+            let _ = rc.take(20)?;
+            Ok(())
+        }
+        2 | 3 | 4 | 5 => {
+            // P2PK: 32-byte X coordinate (compressed or uncompressed key)
+            let _ = rc.take(32)?;
+            Ok(())
+        }
+        _ => {
+            if nsize < 6 {
+                return Err(err("INVALID_SCRIPT_COMPRESSION", "nsize < 6 unexpected"));
+            }
+            let raw_len_u64 = nsize - 6;
+            ensure_len("undo", "compressed_script_raw_len", raw_len_u64, 100_000)?;
+            let raw_len: usize = usize::try_from(raw_len_u64)
+                .map_err(|_| err("LEN_OVERFLOW", format!("raw_len too large for usize: {raw_len_u64}")))?;
+            let _ = rc.take(raw_len)?;
+            Ok(())
+        }
+    }
+}
+
+#[inline]
+fn skip_one_inundo(rc: &mut parser::Cursor) -> Result<(), String> {
+    // Matches read_one_inundo/read_one_inundo_slice structure:
+    //   ncode (varint_core)
+    //   optional tx_version (varint_core) if height>0
+    //   comp_amt (varint_core)
+    //   compressed_script (varint_core + payload)
+    let ncode = read_varint_core(rc)?;
+    let height = ncode >> 1;
+    if height > 0 {
+        let _tx_version = read_varint_core(rc)?;
+    }
+    let _comp_amt = read_varint_core(rc)?;
+    skip_compressed_script(rc)?;
+    Ok(())
+}
+
+fn validate_undo_payload_strict_structure(
+    undo_payload: &[u8],
+    vin_counts_non_cb: &[u64],
+) -> Result<(), String> {
+    let mut uc = parser::Cursor::new(undo_payload);
+
+    // CBlockUndo: CompactSize(nTxUndo)
+    // Usually tx_count - 1, but some fixtures include an extra empty CTxUndo for coinbase.
+    let n_txundo = read_compactsize(&mut uc)?;
+    ensure_len("undo", "n_txundo", n_txundo, 200_000)?;
+
+    let expected = vin_counts_non_cb.len() as u64;
+
+    let mut has_cb_undo = false;
+    if n_txundo == expected {
+        // ok
+    } else if n_txundo == expected.saturating_add(1) {
+        has_cb_undo = true;
+    } else {
+        return Err(err(
+            "UNDO_MISMATCH",
+            format!(
+                "undo txundo count mismatch: undo={}, expected={} (or {} if coinbase included)",
+                n_txundo,
+                expected,
+                expected.saturating_add(1)
+            ),
+        ));
+    }
+
+    if has_cb_undo {
+        let cb_vin_n = read_compactsize(&mut uc)?;
+        if cb_vin_n != 0 {
+            return Err(err(
+                "UNDO_MISMATCH",
+                format!("coinbase undo present but vin_n != 0: got={cb_vin_n}"),
+            ));
+        }
+    }
+
+    for (txundo_idx, &vin_expected) in vin_counts_non_cb.iter().enumerate() {
+        let vin_n = read_compactsize(&mut uc)?;
+        ensure_len("undo", "vin_count", vin_n, 100_000)?;
+
+        if vin_n != vin_expected {
+            return Err(err(
+                "UNDO_MISMATCH",
+                format!(
+                    "undo vin count mismatch: txundo_idx={} undo={} expected={}",
+                    txundo_idx, vin_n, vin_expected
+                ),
+            ));
+        }
+
+        // Skip vin_n inputs.
+        for _ in 0..(vin_n as usize) {
+            skip_one_inundo(&mut uc)?;
+        }
+    }
+
+    if uc.remaining() != 0 {
+        return Err(err(
+            "UNDO_TRAILING_BYTES",
+            format!("undo payload has {} trailing bytes", uc.remaining()),
+        ));
+    }
+
+    Ok(())
+}
+
+// --- Drop-in replacement for your existing function ---
+// This preserves the external signature but makes it much faster.
+// It still computes vin_counts_non_cb the same way as before; a further speedup
+// is possible by adding a parser helper that returns vin_count during skip.
+
 pub(crate) fn validate_undo_payload_against_block(
     block: &[u8],
     undo_payload: &[u8],
@@ -2124,9 +2253,8 @@ pub(crate) fn validate_undo_payload_against_block(
         vin_counts_non_cb.push(extract_vin_count_from_slice(&block[start..end])?);
     }
 
-    // Validate that undo payload parses cleanly against computed vin counts
-    let _ = parse_undo_payload_strict(undo_payload, &vin_counts_non_cb)?;
-    Ok(())
+    // FAST structural validation (no script allocations, no pubkey decompression)
+    validate_undo_payload_strict_structure(undo_payload, &vin_counts_non_cb)
 }
 
 
@@ -4290,3 +4418,120 @@ while IFS= read -r -d '' f; do
   printf "\n\n# =================== %s\n\n" "${rel:-$f}" >> "$OUT"
   cat -- "$f" >> "$OUT"
 done < <("${find_cmd[@]}" -print0)
+
+....... web.sh........
+
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+
+
+###############################################################################
+# web.sh — ChainLens Web Visualizer
+#
+# Behavior:
+#   - Reads PORT env var (default: 3000)
+#   - Prints the URL exactly once (e.g., http://127.0.0.1:3000)
+#   - Keeps running until terminated
+#   - Must serve GET /api/health -> 200 { "ok": true }
+###############################################################################
+
+
+PORT="${PORT:-3000}"
+
+if [[ ! -x "./target/release/chainlens_web" ]]; then
+  # Build ONLY the web binary.
+  cargo build --release --bin chainlens_web --quiet
+fi
+
+export PORT
+exec ./target/release/chainlens_web
+
+
+
+....... cli.sh ......
+
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+
+error_json() {
+  local code="$1"
+  local message="$2"
+  printf '{"ok":false,"error":{"code":"%s","message":"%s"}}\n' "$code" "$message"
+}
+
+hex16() {
+  # prints first 16 bytes as hex (no spaces)
+  head -c 16 "$1" | xxd -p -c 16
+}
+
+fsize() {
+  # portable-ish size
+  if command -v stat >/dev/null 2>&1; then
+    stat -c '%s' "$1" 2>/dev/null || stat -f '%z' "$1"
+  else
+    wc -c <"$1"
+  fi
+}
+
+# --- Block mode ---
+if [[ "${1:-}" == "--block" ]]; then
+  shift
+  if [[ $# -lt 3 ]]; then
+    error_json "INVALID_ARGS" "Block mode requires: --block <blk.dat> <rev.dat> <xor.dat>"
+    exit 1
+  fi
+
+  BLK_FILE="$1"
+  REV_FILE="$2"
+  XOR_FILE="$3"
+
+  for f in "$BLK_FILE" "$REV_FILE" "$XOR_FILE"; do
+    if [[ ! -f "$f" ]]; then
+      error_json "FILE_NOT_FOUND" "File not found: $f"
+      exit 1
+    fi
+  done
+
+  mkdir -p out
+
+  echo "[dbg] blk: $BLK_FILE  size=$(fsize "$BLK_FILE")  head16=$(hex16 "$BLK_FILE")" >&2
+  echo "[dbg] rev: $REV_FILE  size=$(fsize "$REV_FILE")  head16=$(hex16 "$REV_FILE")" >&2
+  echo "[dbg] xor: $XOR_FILE  size=$(fsize "$XOR_FILE")  head16=$(hex16 "$XOR_FILE")" >&2
+
+  # quick gzip hint
+  if [[ "$(hex16 "$BLK_FILE" | cut -c1-8)" == "1f8b0800" ]]; then
+    echo "[dbg] blk looks gzip-compressed (1f8b0800)" >&2
+  fi
+  if [[ "$(hex16 "$REV_FILE" | cut -c1-8)" == "1f8b0800" ]]; then
+    echo "[dbg] rev looks gzip-compressed (1f8b0800)" >&2
+  fi
+
+  if [[ ! -x "./target/release/chainlens_cli" ]]; then
+    cargo build --release --bin chainlens_cli --quiet
+  fi
+
+  exec ./target/release/chainlens_cli --block "$BLK_FILE" "$REV_FILE" "$XOR_FILE"
+fi
+
+# --- Single-transaction mode ---
+if [[ $# -lt 1 ]]; then
+  error_json "INVALID_ARGS" "Usage: cli.sh <fixture.json> or cli.sh --block <blk> <rev> <xor>"
+  exit 1
+fi
+
+FIXTURE="$1"
+
+if [[ ! -f "$FIXTURE" ]]; then
+  error_json "FILE_NOT_FOUND" "Fixture file not found: $FIXTURE"
+  exit 1
+fi
+
+mkdir -p out
+
+if [[ ! -x "./target/release/chainlens_cli" ]]; then
+  cargo build --release --bin chainlens_cli --quiet
+fi
+
+exec ./target/release/chainlens_cli "$FIXTURE"

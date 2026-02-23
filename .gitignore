@@ -8,4 +8,6 @@ target/
 sample_fixture.json
 tests/
 tests
-magic.sh
+magic.sh]
+flamegraph.svg
+perf.data
