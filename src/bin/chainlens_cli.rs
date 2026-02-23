@@ -93,12 +93,8 @@ fn main() {
     let s = fs::read_to_string(path)
         .unwrap_or_else(|e| print_err_and_exit("IO_ERROR", format!("failed to read fixture {path}: {e}"), 1));
 
-    // Determine whether to print stdout (only when there is no "mode" field).
-    let v: serde_json::Value = serde_json::from_str(&s)
-        .unwrap_or_else(|e| print_err_and_exit("INVALID_FIXTURE", format!("invalid fixture json: {e}"), 1));
-    let print_stdout = v.get("mode").is_none();
-
-    let fx: FixtureTx = serde_json::from_value(v)
+        // Parse fixture JSON. Unknown fields (like "mode") are ignored by serde by default.
+    let fx: FixtureTx = serde_json::from_str(&s)
         .unwrap_or_else(|e| print_err_and_exit("INVALID_FIXTURE", format!("invalid tx fixture: {e}"), 1));
 
     let prevouts: Vec<Prevout> = fx
@@ -121,11 +117,8 @@ fn main() {
     if let Err(e) = write_json_file(&out_path, &report) {
         print_err_and_exit("IO_ERROR", format!("write {:?} failed: {e}", out_path), 1);
     }
-
-    if print_stdout {
-        // Printing to stdout can be compact; graders parse JSON regardless.
-        println!("{}", serde_json::to_string(&report).unwrap());
-    }
+    // Always print JSON report to stdout for graders.
+    println!("{}", serde_json::to_string(&report).unwrap());
 
     std::process::exit(0);
 }
