@@ -17,7 +17,8 @@ cd "$(dirname "$0")"
 PORT="${PORT:-3000}"
 
 if [[ ! -x "./target/release/chainlens_web" ]]; then
-  cargo build --release >/dev/null
+  # Build ONLY the web binary.
+  cargo build --release --bin chainlens_web --quiet
 fi
 
 export PORT

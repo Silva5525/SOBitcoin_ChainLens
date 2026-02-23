@@ -78,8 +78,7 @@ fi
 mkdir -p out
 
 if [[ ! -x "./target/release/chainlens_cli" ]]; then
-  cargo build --release >/dev/null
+  cargo build --release --bin chainlens_cli --quiet
 fi
 
 exec ./target/release/chainlens_cli "$FIXTURE"
-
