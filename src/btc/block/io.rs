@@ -1,16 +1,34 @@
 // src/btc/block/io.rs
+//
+// Block / undo file decoding and pairing logic.
+//
+// Responsibilities:
+//   - XOR-decode blk*.dat / rev*.dat using xor.dat key.
+//   - Parse strict Bitcoin Core-style record framing.
+//   - Pair block records with corresponding undo records.
+//   - Provide fast-path pairing with safe fallback validation.
+//
+// Design goals:
+//   - Zero-copy record ranges (no unnecessary Vec allocations).
+//   - Fast hot-path for common aligned datasets.
+//   - Always preserve correctness via structural + semantic validation fallback.
 
 use super::parser;
 use super::undo;
 
 use sha2::{Digest, Sha256};
 
+/// Bitcoin mainnet magic bytes (used by fixtures here).
 const MAGIC: [u8; 4] = [0xF9, 0xBE, 0xB4, 0xD9];
 
+/// Format a structured error string with code prefix.
 fn err(code: &str, msg: impl AsRef<str>) -> String {
     format!("{code}: {}", msg.as_ref())
 }
 
+/// Check whether an XOR key is all-zero.
+///
+/// Fixtures commonly use an all-zero key → no real decoding needed.
 fn key_is_all_zero(key: &[u8]) -> bool {
     key.iter().all(|&b| b == 0)
 }
@@ -19,12 +37,17 @@ fn key_is_all_zero(key: &[u8]) -> bool {
 pub(crate) type RecordRange = std::ops::Range<usize>;
 
 /// rev*.dat record with the 32-byte trailer preserved.
+///
+/// The trailer is kept so we can optionally use it for O(1) pairing.
 #[derive(Clone, Debug)]
 struct RevRecord {
     payload: RecordRange,
     trailer: RecordRange, // 32 bytes
 }
 
+/// XOR-decode a buffer using repeating key with positional shift.
+///
+/// `shift` allows decoding of files where logical offset differs from 0.
 pub(crate) fn xor_decode_with_shift(mut data: Vec<u8>, key: &[u8], shift: usize) -> Vec<u8> {
     if key.is_empty() {
         return data;
@@ -36,11 +59,13 @@ pub(crate) fn xor_decode_with_shift(mut data: Vec<u8>, key: &[u8], shift: usize)
     data
 }
 
+/// Parse strict blk*.dat-style framing into zero-copy payload ranges.
+///
+/// Format: MAGIC(4) | size(u32 LE) | payload(size)
 pub(crate) fn read_dat_records_strict(
     buf: &[u8],
     kind: &'static str,
 ) -> Result<Vec<RecordRange>, String> {
-    // blk*.dat framing: MAGIC(4) | size(u32 LE) | payload(size)
     let mut out: Vec<RecordRange> = Vec::new();
     let mut i: usize = 0;
 
@@ -80,11 +105,11 @@ pub(crate) fn read_dat_records_strict(
     Ok(out)
 }
 
+/// Parse strict rev*.dat framing including 32-byte trailer.
+///
+/// Format:
+///   MAGIC(4) | size(u32 LE) | undo_payload(size) | trailer(32)
 fn read_rev_records_strict(buf: &[u8], kind: &'static str) -> Result<Vec<RevRecord>, String> {
-    // Bitcoin Core-like rev*.dat framing:
-    //   MAGIC(4) | size(u32 LE) | undo_payload(size) | trailer(32)
-    // The fixtures include the 32-byte trailer per record.
-    // We keep it so we can (optionally) use it for O(1) pairing.
     let mut out: Vec<RevRecord> = Vec::new();
     let mut i: usize = 0;
 
@@ -128,12 +153,14 @@ fn read_rev_records_strict(buf: &[u8], kind: &'static str) -> Result<Vec<RevReco
     Ok(out)
 }
 
+/// Read 32 bytes from a buffer range.
 fn read32(buf: &[u8], r: &std::ops::Range<usize>) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&buf[r.clone()]);
     out
 }
 
+/// Double SHA256 (Bitcoin-style hash).
 fn dsha256_bytes(data: &[u8]) -> [u8; 32] {
     let h1 = Sha256::digest(data);
     let h2 = Sha256::digest(h1);
@@ -142,12 +169,13 @@ fn dsha256_bytes(data: &[u8]) -> [u8; 32] {
     out
 }
 
-// (legacy helper retained for potential future use; not used in current pairing logic)
 #[allow(dead_code)]
+/// Compute checksum of undo payload (legacy helper).
 fn rev_checksum(undo_payload: &[u8]) -> [u8; 32] {
     dsha256_bytes(undo_payload)
 }
 
+/// Compute block hash (little-endian internal representation).
 fn block_hash_le(block_payload: &[u8]) -> Result<[u8; 32], String> {
     if block_payload.len() < 80 {
         return Err(err("INVALID_BLOCK", "block payload too small for header"));
@@ -155,16 +183,12 @@ fn block_hash_le(block_payload: &[u8]) -> Result<[u8; 32], String> {
     Ok(dsha256_bytes(&block_payload[..80]))
 }
 
-/// Attempt fast-path pairing.
+/// Attempt fast pairing first, then fallback to validation-based pairing.
 ///
-/// Order between blk*.dat and rev*.dat is *often* aligned in practice (height order),
-/// but is not guaranteed (reorgs, pruned/partial datasets, etc.).
-///
-/// We therefore implement a **safe** two-stage strategy:
-/// 1) **Default hot path**: index-based pairing (block[i] ↔ rev[i]) *only if* cheap
-///    structural invariants hold for **every** record.
-/// 2) Optional trailer-based pairing (opt-in) for additional speed when trailer meaning is known.
-/// 3) Correctness fallback: invariant bucketing + full `validate_undo_payload_against_block`.
+/// Strategy:
+///   1) Try index-based alignment if structurally plausible.
+///   2) Optional trailer-based pairing (env-controlled).
+///   3) Fallback: bucket by undo_count + full validation.
 fn pair_rev_to_blocks_fast_then_fallback(
     blk_buf: &[u8],
     blk_ranges: &[RecordRange],
@@ -178,19 +202,12 @@ fn pair_rev_to_blocks_fast_then_fallback(
         return Err(err("NO_RECORDS_FOUND", "rev: no records found"));
     }
 
-    // --- NEW DEFAULT HOT PATH -------------------------------------------------
-    // Try the cheap, Core-like sequential pairing first.
-    // This is only accepted when *all* records satisfy the structural invariant:
-    //   undo_txundo_count == block_tx_count - 1  (or == block_tx_count in rare cases).
-    if let Some(paired) = pair_rev_to_blocks_index_if_plausible(blk_buf, blk_ranges, rev_buf, rev_recs)? {
+    if let Some(paired) =
+        pair_rev_to_blocks_index_if_plausible(blk_buf, blk_ranges, rev_buf, rev_recs)?
+    {
         return Ok(paired);
     }
 
-    // Optional diagnostics to understand what trailer likely represents.
-// This is intentionally cheap and off by default.
-let diag = std::env::var("CHAINLENS_REV_TRAILER_DIAG").is_ok();
-
-    // Build trailer index: trailer_bytes -> rev indices (Vec for collision safety).
     let mut by_trailer: std::collections::HashMap<[u8; 32], Vec<usize>> =
         std::collections::HashMap::new();
     for (j, rr) in rev_recs.iter().enumerate() {
@@ -201,10 +218,8 @@ let diag = std::env::var("CHAINLENS_REV_TRAILER_DIAG").is_ok();
     let mut used = vec![false; rev_recs.len()];
     let mut out: Vec<Option<RecordRange>> = vec![None; blk_ranges.len()];
 
-    // Trailer fast-path toggle. We keep it opt-in until trailer meaning is confirmed.
-let fast_enabled = std::env::var("CHAINLENS_PAIRING_FAST").is_ok();
-
-let mut matched_fast = 0usize;
+    let fast_enabled = std::env::var("CHAINLENS_PAIRING_FAST").is_ok();
+    let mut matched_fast = 0usize;
 
     if fast_enabled {
         for (i, br) in blk_ranges.iter().enumerate() {
@@ -212,12 +227,10 @@ let mut matched_fast = 0usize;
             let bh = block_hash_le(block)?;
 
             if let Some(cands) = by_trailer.get(&bh) {
-                // Only accept when exactly one unused candidate exists.
                 let mut chosen: Option<usize> = None;
                 for &j in cands {
                     if !used[j] {
                         if chosen.is_some() {
-                            // Ambiguous.
                             chosen = None;
                             break;
                         }
@@ -234,42 +247,6 @@ let mut matched_fast = 0usize;
         }
     }
 
-    if diag {
-        // Quick signal: how many rev trailers equal dSHA256(undo_payload)?
-        // and how many trailers match some block_hash (whether used or not).
-        let mut trailer_eq_undo_checksum = 0usize;
-        let mut trailer_matches_any_blockhash = 0usize;
-
-        // Build a set of block hashes for membership test.
-        let mut blockhash_set: std::collections::HashSet<[u8; 32]> =
-            std::collections::HashSet::with_capacity(blk_ranges.len());
-        for br in blk_ranges {
-            let block = &blk_buf[br.clone()];
-            if let Ok(bh) = block_hash_le(block) {
-                blockhash_set.insert(bh);
-            }
-        }
-
-        // Sample up to 64 rev records.
-        let sample_n = rev_recs.len().min(64);
-        for rr in rev_recs.iter().take(sample_n) {
-            let undo_payload = &rev_buf[rr.payload.clone()];
-            let t = read32(rev_buf, &rr.trailer);
-            if rev_checksum(undo_payload) == t {
-                trailer_eq_undo_checksum += 1;
-            }
-            if blockhash_set.contains(&t) {
-                trailer_matches_any_blockhash += 1;
-            }
-        }
-
-        eprintln!(
-            "[chainlens] rev trailer diag: sample_n={sample_n} eq(dsha256(undo))={trailer_eq_undo_checksum} matches_any_blockhash={trailer_matches_any_blockhash} fast_matched={matched_fast}/{}",
-            blk_ranges.len()
-        );
-    }
-
-    // Fallback fill for any blocks we did not match via fast-path.
     let filled = pair_rev_to_blocks_fallback_validate_fill(
         blk_buf,
         blk_ranges,
@@ -279,7 +256,6 @@ let mut matched_fast = 0usize;
         &mut out,
     )?;
 
-    // Convert out -> Vec<RecordRange> in block order.
     let mut final_out: Vec<RecordRange> = Vec::with_capacity(blk_ranges.len());
     for (i, opt) in out.into_iter().enumerate() {
         let Some(r) = opt else {
@@ -288,13 +264,11 @@ let mut matched_fast = 0usize;
         final_out.push(r);
     }
 
-    // Optional stats
     if std::env::var("CHAINLENS_PAIRING_STATS").is_ok() {
-        let matched_fallback = filled;
         eprintln!(
             "[chainlens] pairing: fast={} fallback={} total_blocks={}",
             matched_fast,
-            matched_fallback,
+            filled,
             blk_ranges.len()
         );
     }
@@ -302,12 +276,9 @@ let mut matched_fast = 0usize;
     Ok(final_out)
 }
 
-/// Existing (correctness) pairing algorithm: bucket by undo_count invariant and validate.
+/// Ultra-cheap index-based pairing.
 ///
-/// This is now used as a fallback and can skip already-used rev records.
-// ------------------------------------------------------------
-// NEW: Index-based pairing with ultra-cheap plausibility checks
-// ------------------------------------------------------------
+/// Accept only if ALL records satisfy the undo_count invariant.
 fn pair_rev_to_blocks_index_if_plausible(
     blk_buf: &[u8],
     blk_ranges: &[RecordRange],
@@ -318,7 +289,6 @@ fn pair_rev_to_blocks_index_if_plausible(
         return Ok(None);
     }
 
-    // Require full plausibility for every record to avoid silent mispairing.
     let mut out: Vec<RecordRange> = Vec::with_capacity(blk_ranges.len());
 
     for (i, (br, rr)) in blk_ranges.iter().zip(rev_recs.iter()).enumerate() {
@@ -333,9 +303,7 @@ fn pair_rev_to_blocks_index_if_plausible(
 
         let undo_cnt = undo::undo_txundo_count_fast(undo_payload)?;
 
-        // Accept only if the invariant holds.
         if !(undo_cnt == expected || undo_cnt == txc) {
-            // Not plausibly aligned → fall back to validate-based matching.
             if std::env::var("CHAINLENS_PAIRING_STATS").is_ok() {
                 eprintln!(
                     "[chainlens] pairing: index hotpath rejected at i={} (txc={}, undo_cnt={}, expected={})",
@@ -348,19 +316,10 @@ fn pair_rev_to_blocks_index_if_plausible(
         out.push(rr.payload.clone());
     }
 
-    if std::env::var("CHAINLENS_PAIRING_STATS").is_ok() {
-        eprintln!(
-            "[chainlens] pairing: index hotpath accepted for {} blocks",
-            blk_ranges.len()
-        );
-    }
-
     Ok(Some(out))
 }
 
-/// Existing (correctness) pairing algorithm: bucket by undo_count invariant and validate.
-///
-/// This is now used as a fallback and can skip already-used rev records.
+/// Fallback pairing using structural bucketing + semantic validation.
 fn pair_rev_to_blocks_fallback_validate_fill(
     blk_buf: &[u8],
     blk_ranges: &[RecordRange],
@@ -369,7 +328,6 @@ fn pair_rev_to_blocks_fallback_validate_fill(
     used: &mut [bool],
     out: &mut [Option<RecordRange>],
 ) -> Result<usize, String> {
-    // Index rev records by their leading txundo-count varint.
     let mut by_undo_cnt: std::collections::HashMap<u64, Vec<usize>> =
         std::collections::HashMap::new();
     for (j, rr) in rev_recs.iter().enumerate() {
@@ -385,7 +343,7 @@ fn pair_rev_to_blocks_fallback_validate_fill(
 
     for (i, br) in blk_ranges.iter().enumerate() {
         if out[i].is_some() {
-            continue; // already paired by fast-path
+            continue;
         }
 
         let block = &blk_buf[br.clone()];
@@ -396,7 +354,6 @@ fn pair_rev_to_blocks_fallback_validate_fill(
 
         let expected = txc.saturating_sub(1);
 
-        // Candidate rev indices (try exact expected first, then txc).
         let mut cand: Vec<usize> = Vec::new();
         if let Some(v) = by_undo_cnt.get(&expected) {
             cand.extend_from_slice(v);
@@ -436,6 +393,7 @@ fn pair_rev_to_blocks_fallback_validate_fill(
     Ok(matched)
 }
 
+/// Validate block payload structurally + verify merkle root.
 fn validate_block_payload(block: &[u8]) -> Result<(), String> {
     let mut bc = parser::Cursor::new(block);
 
@@ -443,7 +401,6 @@ fn validate_block_payload(block: &[u8]) -> Result<(), String> {
         return Err(err("INVALID_BLOCK", "block payload too small for header"));
     }
 
-    // Avoid header Vec copy.
     let header = bc.take(80)?;
     let mut hc = parser::Cursor::new(header);
 
@@ -466,7 +423,6 @@ fn validate_block_payload(block: &[u8]) -> Result<(), String> {
         return Err(err("INVALID_BLOCK", "tx_count=0"));
     }
 
-    // Hot path: avoid materializing raw tx bytes.
     let mut txids_le: Vec<[u8; 32]> = Vec::with_capacity(tx_count as usize);
     for _ in 0..tx_count {
         let txid_le = parser::parse_tx_skip_and_txid_le(block, &mut bc)?;
@@ -481,6 +437,7 @@ fn validate_block_payload(block: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Decode blk file with best-effort key validation.
 fn decode_blk_best(blk_raw: Vec<u8>, key: &[u8]) -> Result<Vec<u8>, String> {
     let blk = if key.is_empty() || key_is_all_zero(key) {
         blk_raw
@@ -488,18 +445,12 @@ fn decode_blk_best(blk_raw: Vec<u8>, key: &[u8]) -> Result<Vec<u8>, String> {
         xor_decode_with_shift(blk_raw, key, 0)
     };
 
-    // Fast path: fixtures use an all-zero XOR key. In that case, we can skip the
-    // expensive merkle validation pass here.
-    //
-    // If you want strict key verification (e.g. for debugging), set:
-    //   CHAINLENS_STRICT_KEY=1
     let strict_key = std::env::var("CHAINLENS_STRICT_KEY").is_ok();
     if strict_key || !(key.is_empty() || key_is_all_zero(key)) {
         let recs = read_dat_records_strict(&blk, "blk")?;
         if recs.is_empty() {
             return Err(err("BLK_DECODE_FAILED", "no blk records"));
         }
-        // Validate first record as a sanity check for key correctness.
         let first = &blk[recs[0].clone()];
         validate_block_payload(first).map_err(|e| err("BLK_DECODE_FAILED", e))?;
     }
@@ -507,6 +458,7 @@ fn decode_blk_best(blk_raw: Vec<u8>, key: &[u8]) -> Result<Vec<u8>, String> {
     Ok(blk)
 }
 
+/// Decode blk and return buffer + record ranges.
 pub(crate) fn decode_blk_best_to_records(
     blk_raw: Vec<u8>,
     key: &[u8],
@@ -516,6 +468,7 @@ pub(crate) fn decode_blk_best_to_records(
     Ok((blk, blk_ranges))
 }
 
+/// Decode rev file and pair undo payloads to blocks.
 fn decode_rev_records_against_blocks(
     rev_raw: Vec<u8>,
     key: &[u8],
@@ -529,16 +482,9 @@ fn decode_rev_records_against_blocks(
 
     let rev_recs = read_rev_records_strict(&rev, "rev")?;
 
-    // Fast-path (optional) using the 32-byte trailer, then fallback to current validate-based pairing.
     let paired_undo_ranges =
         pair_rev_to_blocks_fast_then_fallback(blk_buf, blk_ranges, &rev, &rev_recs)?;
 
-    // Pairing already performed full structural validation via
-    // `validate_undo_payload_against_block` for each chosen (block, undo) pair (fallback path).
-    // Avoid re-validating here to keep block-mode fast.
-    //
-    // If you want a redundant validation pass (debugging), set:
-    //   CHAINLENS_STRICT_UNDO=1
     if std::env::var("CHAINLENS_STRICT_UNDO").is_ok() {
         for (i, (br, ur)) in blk_ranges.iter().zip(paired_undo_ranges.iter()).enumerate() {
             let block = &blk_buf[br.clone()];
@@ -555,6 +501,8 @@ fn decode_rev_records_against_blocks(
     Ok((rev, paired_undo_ranges))
 }
 
+/// Decode blk + rev together and return:
+///   (blk_buf, blk_ranges, rev_buf, undo_ranges)
 pub(crate) fn decode_blk_and_rev_best(
     blk_raw: Vec<u8>,
     rev_raw: Vec<u8>,
@@ -562,6 +510,7 @@ pub(crate) fn decode_blk_and_rev_best(
 ) -> Result<(Vec<u8>, Vec<RecordRange>, Vec<u8>, Vec<RecordRange>), String> {
     let blk = decode_blk_best(blk_raw, key)?;
     let blk_ranges = read_dat_records_strict(&blk, "blk")?;
-    let (rev, undo_ranges) = decode_rev_records_against_blocks(rev_raw, key, &blk, &blk_ranges)?;
+    let (rev, undo_ranges) =
+        decode_rev_records_against_blocks(rev_raw, key, &blk, &blk_ranges)?;
     Ok((blk, blk_ranges, rev, undo_ranges))
 }

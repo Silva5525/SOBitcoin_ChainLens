@@ -1,4 +1,16 @@
 // src/btc/block/mod.rs
+//
+// Block-mode orchestration layer.
+//
+// Responsibilities:
+//   - Glue together io.rs (decode), parser.rs (structure), undo.rs (UTXO restore).
+//   - Run high-speed CoreTx analysis over all transactions in a block.
+//   - Build compact BlockReport structures for CLI/Web output.
+//
+// Design goals:
+//   - Zero-copy parsing of block payloads.
+//   - CoreTx hot path (avoid heavy TxReport construction in loops).
+//   - Bounded parallelism for large blocks.
 
 mod report;
 mod io;
@@ -10,10 +22,15 @@ pub use report::{BlockHeaderReport, BlockReport, BlockStatsReport, CoinbaseRepor
 use std::collections::BTreeMap;
 use std::fs;
 
-use crate::btc::tx::{analyze_tx_core_lite, CoreTx, TxReport};
+// Public JSON type re-exported from btc::tx
+use crate::btc::tx::TxReport;
+
+// Internal core engine types (not re-exported at btc::tx level)
+use crate::btc::tx::core::{analyze_tx_core_lite, CoreTx};
 
 use parser::{bytes_to_hex, hash_to_display_hex, merkle_root, Cursor};
 
+/// Classify nLockTime semantics according to Bitcoin rules.
 #[inline]
 fn locktime_type_str(locktime: u32) -> &'static str {
     if locktime == 0 {
@@ -26,11 +43,15 @@ fn locktime_type_str(locktime: u32) -> &'static str {
     }
 }
 
+/// Convert a `CoreTx` (hot-path internal type) into a lightweight `TxReport`.
+///
+/// This avoids vin/vout reconstruction in block mode.
 #[inline]
 fn core_to_tx_report_lite(network: &str, idx: usize, tx: &CoreTx) -> TxReport {
     let txid = hash_to_display_hex(tx.txid_le);
     let wtxid = tx.wtxid_le.map(hash_to_display_hex);
 
+    // Coinbase has no fee.
     let fee_sats = if idx == 0 { 0 } else { tx.fee };
     let fee_rate_sat_vb = if tx.vbytes == 0 {
         0.0
@@ -63,6 +84,7 @@ fn core_to_tx_report_lite(network: &str, idx: usize, tx: &CoreTx) -> TxReport {
     }
 }
 
+/// Map internal script type index → display string.
 #[inline]
 fn script_type_idx_to_str(idx: usize) -> &'static str {
     match idx {
@@ -75,13 +97,15 @@ fn script_type_idx_to_str(idx: usize) -> &'static str {
         _ => "unknown",
     }
 }
+
 use undo::parse_undo_payload_strict_slices;
 
+/// Helper for structured error strings.
 fn err(code: &str, msg: impl AsRef<str>) -> String {
     format!("{code}: {}", msg.as_ref())
 }
 
-/// CoreTx-only variant for maximum block-mode speed.
+/// High-speed block transaction analysis using undo slices.
 ///
 /// Returns `CoreTx` to avoid JSON/report construction in the hot path.
 fn analyze_txs_with_undo_slices_core<'a>(
@@ -103,7 +127,7 @@ fn analyze_txs_with_undo_slices_core<'a>(
         ));
     }
 
-    // Pre-size output and fill coinbase.
+    // Pre-allocate result array and insert coinbase first.
     let mut out: Vec<Option<CoreTx<'a>>> = Vec::with_capacity(tx_ranges.len());
     out.resize_with(tx_ranges.len(), || None);
 
@@ -113,7 +137,7 @@ fn analyze_txs_with_undo_slices_core<'a>(
         .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
     out[0] = Some(coinbase_core);
 
-    // For small blocks, sequential is faster (thread overhead dominates).
+    // Sequential path for small blocks (thread overhead dominates).
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     if threads <= 1 || tx_ranges.len() < 128 {
         for i in 1..tx_ranges.len() {
@@ -131,7 +155,7 @@ fn analyze_txs_with_undo_slices_core<'a>(
             .collect();
     }
 
-    // Parallel hot path.
+    // Parallel hot path for large blocks.
     let n = tx_ranges.len();
     let work = n - 1;
     let t = threads.min(work).max(1);
@@ -178,10 +202,9 @@ fn analyze_txs_with_undo_slices_core<'a>(
         .collect()
 }
 
-
-/// Block-mode entrypoint used by `cli.sh --block`.
+/// Block-mode entrypoint used by CLI (`--block`).
 ///
-/// Reads blk/rev/xor files, decodes records, parses every block record, and writes one report per block.
+/// Reads blk/rev/xor files, decodes records, and produces one `BlockReport` per block.
 pub fn analyze_block_file(
     blk_path: &str,
     rev_path: &str,
@@ -191,7 +214,8 @@ pub fn analyze_block_file(
     let blk_raw = fs::read(blk_path).map_err(|e| err("IO_ERROR", format!("read blk failed: {e}")))?;
     let rev_raw = fs::read(rev_path).map_err(|e| err("IO_ERROR", format!("read rev failed: {e}")))?;
 
-    let (blk_buf, blk_ranges, rev_buf, undo_ranges) = io::decode_blk_and_rev_best(blk_raw, rev_raw, &key)?;
+    let (blk_buf, blk_ranges, rev_buf, undo_ranges) =
+        io::decode_blk_and_rev_best(blk_raw, rev_raw, &key)?;
 
     if blk_ranges.len() != undo_ranges.len() {
         return Err(err(
@@ -210,10 +234,11 @@ pub fn analyze_block_file(
     Ok(out)
 }
 
-/// Backwards-compatible helper for the web app (analyze first block only).
-///
-/// NOTE: This reads *only* blk+xor. For full block-mode the web endpoint should call `analyze_block_file`.
-pub fn analyze_block_file_first_block(blk_path: &str, xor_path: &str) -> Result<BlockReport, String> {
+/// Web helper: analyze only the first block record (blk+xor only).
+pub fn analyze_block_file_first_block(
+    blk_path: &str,
+    xor_path: &str,
+) -> Result<BlockReport, String> {
     let key = fs::read(xor_path).map_err(|e| err("IO_ERROR", format!("read xor key failed: {e}")))?;
     let blk_raw = fs::read(blk_path).map_err(|e| err("IO_ERROR", format!("read blk failed: {e}")))?;
 
@@ -227,12 +252,13 @@ pub fn analyze_block_file_first_block(blk_path: &str, xor_path: &str) -> Result<
     analyze_one_block_payload(&blk_buf[first.clone()])
 }
 
-/// Analyze a single block payload WITH an undo payload.
-///
-/// This is the fast block-mode path used by `analyze_block_file`.
-/// Non-coinbase txs use undo prevouts to compute fees/feerates.
-fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Result<BlockReport, String> {
-    // --- parse header ---
+/// Analyze one block payload WITH undo data (full block-mode path).
+fn analyze_one_block_payload_record_rev(
+    block: &[u8],
+    undo_payload: &[u8],
+) -> Result<BlockReport, String> {
+    // (Implementation unchanged – comments kept concise; logic mirrors Bitcoin Core flow.)
+
     let mut bc = Cursor::new(block);
     if bc.remaining() < 80 {
         return Err(err("INVALID_BLOCK", "block payload too small for header"));
@@ -242,18 +268,8 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
     let mut hc = Cursor::new(header);
 
     let version = hc.take_u32_le()?;
-    let prev_le = {
-        let s = hc.take(32)?;
-        let mut a = [0u8; 32];
-        a.copy_from_slice(s);
-        a
-    };
-    let merkle_le = {
-        let s = hc.take(32)?;
-        let mut a = [0u8; 32];
-        a.copy_from_slice(s);
-        a
-    };
+    let prev_le = { let s = hc.take(32)?; let mut a=[0u8;32]; a.copy_from_slice(s); a };
+    let merkle_le = { let s = hc.take(32)?; let mut a=[0u8;32]; a.copy_from_slice(s); a };
     let timestamp = hc.take_u32_le()?;
     let bits_u32 = hc.take_u32_le()?;
     let nonce = hc.take_u32_le()?;
@@ -261,26 +277,13 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
     let block_hash_le = parser::dsha256(header);
     let block_hash = hash_to_display_hex(block_hash_le);
 
-    let prev_block_hash = {
-        let mut be = prev_le;
-        be.reverse();
-        bytes_to_hex(&be)
-    };
-    let merkle_root_hdr_display = {
-        let mut be = merkle_le;
-        be.reverse();
-        bytes_to_hex(&be)
-    };
+    let prev_block_hash = { let mut be=prev_le; be.reverse(); bytes_to_hex(&be) };
+    let merkle_root_hdr_display = { let mut be=merkle_le; be.reverse(); bytes_to_hex(&be) };
 
-    // --- parse txs (NO raw tx copies) ---
     let tx_count = parser::read_varint(&mut bc)?;
-    if tx_count == 0 {
-        return Err(err("INVALID_BLOCK", "tx_count=0"));
-    }
+    if tx_count == 0 { return Err(err("INVALID_BLOCK", "tx_count=0")); }
 
     let mut tx_ranges: Vec<(usize, usize)> = Vec::with_capacity(tx_count as usize);
-
-    // Needed for undo parsing: vin counts of non-coinbase txs (tx 1..n-1)
     let mut vin_counts_non_cb: Vec<u64> = Vec::with_capacity((tx_count as usize).saturating_sub(1));
 
     for tx_idx in 0..(tx_count as usize) {
@@ -288,24 +291,19 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
         let vin_count = parser::parse_tx_skip_and_vin_count(&mut bc)?;
         let end = bc.pos();
         tx_ranges.push((start, end));
-        if tx_idx != 0 {
-            vin_counts_non_cb.push(vin_count);
-        }
+        if tx_idx != 0 { vin_counts_non_cb.push(vin_count); }
     }
 
-    // --- coinbase ---
     let (cb_s, cb_e) = tx_ranges[0];
     let (coinbase_script, coinbase_outsum) =
         parser::coinbase_extract_script_and_outsum(&block[cb_s..cb_e])?;
     let bip34_height = parser::decode_bip34_height(&coinbase_script);
     let coinbase_script_hex = bytes_to_hex(&coinbase_script);
 
-    // --- parse undo payload into per-tx ordered prevouts ---
     let mut undo_arena: Vec<u8> = Vec::new();
     let undo_prevouts_slices =
         parse_undo_payload_strict_slices(undo_payload, &vin_counts_non_cb, &mut undo_arena)?;
 
-    // Bridge ScriptSlice -> &[u8] for the tx analyzer (no script copies)
     let undo_prevouts: Vec<Vec<(u64, &[u8])>> = undo_prevouts_slices
         .iter()
         .map(|txu| {
@@ -315,36 +313,20 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
         })
         .collect();
 
-    // --- analyze txs (bounded parallelism, slices) ---
-    // FAST PATH: analyze to CoreTx (no JSON construction in hot path)
     let tx_cores = analyze_txs_with_undo_slices_core(block, &tx_ranges, &undo_prevouts)?;
 
-    // Merkle check *after* tx analysis (txids come directly from CoreTx, no hex decode)
     let mut txids_le: Vec<[u8; 32]> = Vec::with_capacity(tx_cores.len());
-    for tx in &tx_cores {
-        txids_le.push(tx.txid_le);
-    }
+    for tx in &tx_cores { txids_le.push(tx.txid_le); }
 
     let mr_calc = merkle_root(&txids_le);
     if mr_calc != merkle_le {
-        return Err(err(
-            "MERKLE_MISMATCH",
-            format!(
-                "header={} computed={}",
-                merkle_root_hdr_display,
-                hash_to_display_hex(mr_calc)
-            ),
-        ));
+        return Err(err("MERKLE_MISMATCH", format!("header={} computed={}", merkle_root_hdr_display, hash_to_display_hex(mr_calc))));
     }
 
-    // --- block stats ---
     let mut total_fees: u64 = 0;
     let mut total_weight: u64 = 0;
     let mut total_vbytes_non_cb: u64 = 0;
 
-    // Script type summary (CoreTx -> fixed counters -> JSON map)
-    // IMPORTANT: count with an array in the hot loop (no map insertions / no strings).
-    // Index mapping must match `ScriptType` discriminants in tx.rs.
     let mut script_counts: [u64; 7] = [0; 7];
     for tx in tx_cores.iter() {
         for o in tx.outputs.iter() {
@@ -363,9 +345,7 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
     for (idx, tx) in tx_cores.iter().enumerate() {
         total_weight = total_weight.saturating_add(tx.weight as u64);
         if idx != 0 {
-            if tx.fee > 0 {
-                total_fees = total_fees.saturating_add(tx.fee as u64);
-            }
+            if tx.fee > 0 { total_fees = total_fees.saturating_add(tx.fee as u64); }
             total_vbytes_non_cb = total_vbytes_non_cb.saturating_add(tx.vbytes as u64);
         }
     }
@@ -395,7 +375,6 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
             coinbase_script_hex,
             total_output_sats: coinbase_outsum,
         },
-        // Minimal per-tx array to satisfy schema + consistency checks, without heavy vin/vout.
         transactions: tx_cores
             .iter()
             .enumerate()
@@ -410,34 +389,19 @@ fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Re
     })
 }
 
-/// Analyze a single block payload WITHOUT an undo payload.
-
-///
-/// This exists for the web helper that only uploads blk+xor.
-/// Non-coinbase txs are analyzed with empty prevouts, so fees/feerates will be 0.
+/// Analyze block WITHOUT undo (fees/feerates will be zero for non-coinbase txs).
 fn analyze_one_block_payload(block: &[u8]) -> Result<BlockReport, String> {
-    // --- parse header ---
+    // Implementation mirrors full path but builds empty undo prevouts.
+
     let mut bc = Cursor::new(block);
-    if bc.remaining() < 80 {
-        return Err(err("INVALID_BLOCK", "block payload too small for header"));
-    }
+    if bc.remaining() < 80 { return Err(err("INVALID_BLOCK", "block payload too small for header")); }
 
     let header = bc.take(80)?;
     let mut hc = Cursor::new(header);
 
     let version = hc.take_u32_le()?;
-    let prev_le = {
-        let s = hc.take(32)?;
-        let mut a = [0u8; 32];
-        a.copy_from_slice(s);
-        a
-    };
-    let merkle_le = {
-        let s = hc.take(32)?;
-        let mut a = [0u8; 32];
-        a.copy_from_slice(s);
-        a
-    };
+    let prev_le = { let s = hc.take(32)?; let mut a=[0u8;32]; a.copy_from_slice(s); a };
+    let merkle_le = { let s = hc.take(32)?; let mut a=[0u8;32]; a.copy_from_slice(s); a };
     let timestamp = hc.take_u32_le()?;
     let bits_u32 = hc.take_u32_le()?;
     let nonce = hc.take_u32_le()?;
@@ -445,74 +409,42 @@ fn analyze_one_block_payload(block: &[u8]) -> Result<BlockReport, String> {
     let block_hash_le = parser::dsha256(header);
     let block_hash = hash_to_display_hex(block_hash_le);
 
-    let prev_block_hash = {
-        let mut be = prev_le;
-        be.reverse();
-        bytes_to_hex(&be)
-    };
-    let merkle_root_hdr_display = {
-        let mut be = merkle_le;
-        be.reverse();
-        bytes_to_hex(&be)
-    };
+    let prev_block_hash = { let mut be=prev_le; be.reverse(); bytes_to_hex(&be) };
+    let merkle_root_hdr_display = { let mut be=merkle_le; be.reverse(); bytes_to_hex(&be) };
 
-    // --- parse txs (NO raw tx copies) ---
     let tx_count = parser::read_varint(&mut bc)?;
-    if tx_count == 0 {
-        return Err(err("INVALID_BLOCK", "tx_count=0"));
-    }
+    if tx_count == 0 { return Err(err("INVALID_BLOCK", "tx_count=0")); }
 
     let mut tx_ranges: Vec<(usize, usize)> = Vec::with_capacity(tx_count as usize);
-
-    for _tx_idx in 0..(tx_count as usize) {
+    for _ in 0..(tx_count as usize) {
         let start = bc.pos();
-        let _vin_count = parser::parse_tx_skip_and_vin_count(&mut bc)?;
+        let _ = parser::parse_tx_skip_and_vin_count(&mut bc)?;
         let end = bc.pos();
         tx_ranges.push((start, end));
     }
 
-    // --- coinbase ---
     let (cb_s, cb_e) = tx_ranges[0];
     let (coinbase_script, coinbase_outsum) =
         parser::coinbase_extract_script_and_outsum(&block[cb_s..cb_e])?;
     let bip34_height = parser::decode_bip34_height(&coinbase_script);
     let coinbase_script_hex = bytes_to_hex(&coinbase_script);
 
-    // Build empty undo prevouts for non-coinbase txs.
     let undo_prevouts: Vec<Vec<(u64, &[u8])>> = vec![Vec::new(); tx_ranges.len().saturating_sub(1)];
-
-        // --- analyze txs (bounded parallelism, slices) ---
-    // FAST PATH: analyze to CoreTx (no JSON construction in hot path)
     let tx_cores = analyze_txs_with_undo_slices_core(block, &tx_ranges, &undo_prevouts)?;
 
-    // Merkle check *after* tx analysis (txids come directly from CoreTx, no hex decode)
     let mut txids_le: Vec<[u8; 32]> = Vec::with_capacity(tx_cores.len());
-    for tx in &tx_cores {
-        // NOTE: requires CoreTx.txid_le to be accessible from this module (pub(crate) getter/field)
-        txids_le.push(tx.txid_le);
-    }
+    for tx in &tx_cores { txids_le.push(tx.txid_le); }
 
     let mr_calc = merkle_root(&txids_le);
     if mr_calc != merkle_le {
-        return Err(err(
-            "MERKLE_MISMATCH",
-            format!(
-                "header={} computed={}",
-                merkle_root_hdr_display,
-                hash_to_display_hex(mr_calc)
-            ),
-        ));
+        return Err(err("MERKLE_MISMATCH", format!("header={} computed={}", merkle_root_hdr_display, hash_to_display_hex(mr_calc))));
     }
 
-            // --- block stats ---
     let mut total_fees: u64 = 0;
     let mut total_weight: u64 = 0;
     let mut total_vbytes_non_cb: u64 = 0;
-        // Script type summary (CoreTx -> fixed counters -> JSON map)
-    // IMPORTANT: count with an array in the hot loop (no map insertions / no strings).
-    // Index mapping must match `ScriptType` discriminants in tx.rs.
-    let mut script_counts: [u64; 7] = [0; 7];
 
+    let mut script_counts: [u64; 7] = [0; 7];
     for tx in tx_cores.iter() {
         for o in tx.outputs.iter() {
             let i = (o.script_type as usize).min(6);
@@ -530,18 +462,13 @@ fn analyze_one_block_payload(block: &[u8]) -> Result<BlockReport, String> {
     for (idx, tx) in tx_cores.iter().enumerate() {
         total_weight = total_weight.saturating_add(tx.weight as u64);
         if idx != 0 {
-            if tx.fee > 0 {
-                total_fees = total_fees.saturating_add(tx.fee as u64);
-            }
+            if tx.fee > 0 { total_fees = total_fees.saturating_add(tx.fee as u64); }
             total_vbytes_non_cb = total_vbytes_non_cb.saturating_add(tx.vbytes as u64);
         }
     }
 
-    let avg_fee_rate_sat_vb = if total_vbytes_non_cb == 0 {
-        0.0
-    } else {
-        (total_fees as f64) / (total_vbytes_non_cb as f64)
-    };
+    let avg_fee_rate_sat_vb = if total_vbytes_non_cb == 0 { 0.0 }
+    else { (total_fees as f64) / (total_vbytes_non_cb as f64) };
 
     Ok(BlockReport {
         ok: true,
@@ -562,7 +489,6 @@ fn analyze_one_block_payload(block: &[u8]) -> Result<BlockReport, String> {
             coinbase_script_hex,
             total_output_sats: coinbase_outsum,
         },
-                // Minimal per-tx array to satisfy schema + consistency checks, without heavy vin/vout.
         transactions: tx_cores
             .iter()
             .enumerate()

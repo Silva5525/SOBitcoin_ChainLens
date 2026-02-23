@@ -1,11 +1,27 @@
 <!doctype html>
+<!--
+  ChainLens UI (single static page)
+
+  Goals:
+    - Zero-build, zero-deps HTML served via Rust `include_str!()`.
+    - Friendly fixture editor + deterministic rendering of analyzer JSON.
+    - Works offline except for calls to the local API.
+
+  API endpoints used:
+    - GET  /api/health
+    - POST /api/analyze
+-->
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ChainLens — Bitcoin Transaction Visualizer</title>
+
   <script>
-    // Minimal "utility" CSS (no external deps). Inspired by Tailwind spacing/typography.
+    // -------------------------------------------------------------------------
+    // Minimal inlined CSS
+    // -------------------------------------------------------------------------
+    // No external dependencies (Tailwind-like spacing/typography, but static).
     const css = `
       :root{--bg:#0b0f19;--panel:#111827;--panel2:#0f172a;--text:#e5e7eb;--muted:#9ca3af;--line:#1f2937;--ok:#34d399;--warn:#fbbf24;--bad:#fb7185;--accent:#60a5fa;}
       *{box-sizing:border-box} html,body{height:100%}
@@ -59,11 +75,15 @@
       .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:22px;background:rgba(17,24,39,.92);border:1px solid var(--line);padding:10px 12px;border-radius:14px;box-shadow:0 18px 40px rgba(0,0,0,.35);opacity:0;pointer-events:none;transition:opacity .18s}
       .toast.show{opacity:1}
     `;
-    const style = document.createElement('style'); style.textContent = css; document.head.appendChild(style);
+    const style = document.createElement('style');
+    style.textContent = css;
+    document.head.appendChild(style);
   </script>
 </head>
+
 <body>
   <div class="wrap">
+    <!-- Top bar: brand + health indicator -->
     <div class="top">
       <div class="brand">
         <div class="logo"></div>
@@ -80,7 +100,7 @@
     </div>
 
     <div class="grid">
-      <!-- Left: Input / Story -->
+      <!-- Left: input + narrative -->
       <div class="card">
         <div class="hd">
           <div>
@@ -113,6 +133,7 @@
             <button class="btn" id="btnClear">Clear</button>
           </div>
 
+          <!-- Primary tabs: human story / flow diagram / raw JSON -->
           <div style="margin-top:14px" class="tabs">
             <div class="tab active" data-tab="story">Story</div>
             <div class="tab" data-tab="graph">Flow</div>
@@ -136,7 +157,7 @@
         </div>
       </div>
 
-      <!-- Right: Results -->
+      <!-- Right: summary + tables -->
       <div class="card">
         <div class="hd">
           <div>
@@ -149,6 +170,7 @@
           </div>
         </div>
         <div class="bd">
+          <!-- KPIs show the most important transaction fields -->
           <div class="kpi">
             <div class="k"><div class="n">TXID</div><div class="v" id="k_txid">—</div><div class="s" id="k_txid_s"></div></div>
             <div class="k"><div class="n">Fee</div><div class="v" id="k_fee">—</div><div class="s" id="k_feerate">—</div></div>
@@ -163,6 +185,7 @@
             </div>
           </div>
 
+          <!-- Secondary tabs: tables / script distribution / technical dump -->
           <div style="margin-top:12px" class="tabs">
             <div class="tab active" data-tab2="io">Inputs & Outputs</div>
             <div class="tab" data-tab2="scripts">Scripts</div>
@@ -202,8 +225,12 @@
   <div class="toast" id="toast"></div>
 
   <script>
-    // ---------- helpers ----------
+    // -------------------------------------------------------------------------
+    // Small DOM helpers
+    // -------------------------------------------------------------------------
     const $ = (id) => document.getElementById(id);
+
+    // Lightweight toast notification.
     const toast = (msg) => {
       const t = $('toast');
       t.textContent = msg;
@@ -211,10 +238,12 @@
       setTimeout(() => t.classList.remove('show'), 1200);
     };
 
+    // Safe JSON parse for user-provided fixture text.
     function safeJsonParse(s) {
       try { return [JSON.parse(s), null]; } catch (e) { return [null, e]; }
     }
 
+    // Format satoshi integers for human consumption.
     function sats(n){
       if (n === null || n === undefined) return '—';
       const x = Number(n);
@@ -222,6 +251,7 @@
       return x.toLocaleString('en-US');
     }
 
+    // Shorten long hex strings for UI display.
     function shortHex(h, n=10){
       if (!h || typeof h !== 'string') return '—';
       if (h.length <= n*2) return h;
@@ -230,7 +260,9 @@
 
     function setText(id, v){ $(id).textContent = v; }
 
-    // ---------- tabs ----------
+    // -------------------------------------------------------------------------
+    // Tabs
+    // -------------------------------------------------------------------------
     document.querySelectorAll('[data-tab]').forEach(el => {
       el.addEventListener('click', () => {
         document.querySelectorAll('[data-tab]').forEach(x => x.classList.remove('active'));
@@ -251,7 +283,9 @@
       });
     });
 
-    // ---------- health ----------
+    // -------------------------------------------------------------------------
+    // API health
+    // -------------------------------------------------------------------------
     async function checkHealth(){
       try {
         const r = await fetch('/api/health', {cache:'no-store'});
@@ -274,7 +308,9 @@
     $('btnHealth').addEventListener('click', checkHealth);
     checkHealth();
 
-    // ---------- load file ----------
+    // -------------------------------------------------------------------------
+    // Fixture input helpers (file load / example / clear)
+    // -------------------------------------------------------------------------
     $('btnLoad').addEventListener('click', async () => {
       const f = $('file').files?.[0];
       if (!f) return toast('Pick a JSON file first');
@@ -301,14 +337,18 @@
       toast('Cleared');
     });
 
-    // ---------- copy JSON ----------
+    // -------------------------------------------------------------------------
+    // Clipboard
+    // -------------------------------------------------------------------------
     $('btnCopy').addEventListener('click', async () => {
       const txt = $('jsonFull').textContent;
       await navigator.clipboard.writeText(txt);
       toast('Copied');
     });
 
-    // ---------- technical toggle ----------
+    // -------------------------------------------------------------------------
+    // Technical view toggle
+    // -------------------------------------------------------------------------
     let showTech = false;
     $('btnToggleTech').addEventListener('click', () => {
       showTech = !showTech;
@@ -320,7 +360,10 @@
       }
     });
 
-    // ---------- render ----------
+    // -------------------------------------------------------------------------
+    // Rendering
+    // -------------------------------------------------------------------------
+    // Maps analyzer report JSON to DOM widgets.
     function render(report){
       const txid = report?.txid || report?.txid_hex || report?.id || '—';
       const fee = report?.fee_sats;
@@ -339,6 +382,7 @@
       setText('k_sw', is_segwit ? 'yes' : 'no');
       setText('k_sw_s', savings ? (sats(savings.saved_vbytes) + ' vB saved') : '');
 
+      // Render warnings as stacked lines.
       const ws = report?.warnings || [];
       if (!ws.length) {
         $('warnings').innerHTML = '<span class="ok">none</span>';
@@ -350,6 +394,7 @@
         }).join('<br/>');
       }
 
+      // Inputs table.
       const inBody = $('tbl_in').querySelector('tbody');
       inBody.innerHTML = '';
       const vins = report?.inputs || report?.vin || [];
@@ -367,6 +412,7 @@
         inBody.appendChild(tr);
       });
 
+      // Outputs table.
       const outBody = $('tbl_out').querySelector('tbody');
       outBody.innerHTML = '';
       const vouts = report?.outputs || report?.vout || [];
@@ -384,6 +430,7 @@
         outBody.appendChild(tr);
       });
 
+      // Script type distribution (if provided by analyzer).
       const dist = report?.script_type_summary || report?.output_script_type_summary || null;
       const sb = $('scriptBars');
       sb.innerHTML = '';
@@ -407,6 +454,7 @@
         sb.innerHTML = '<div class="mini">No script summary available in the report.</div>';
       }
 
+      // Technical section.
       const ltType = report?.locktime_type;
       const ltVal = report?.locktime_value;
       setText('t_lock', ltVal == null ? '—' : String(ltVal));
@@ -415,6 +463,7 @@
       setText('t_rbf', rbf === true ? 'signaling' : (rbf === false ? 'no' : '—'));
       setText('t_rbf_s', rbf === true ? 'At least one input opts in (BIP125).' : '');
 
+      // Story summary (human-friendly sentence).
       const insum = report?.inputs_sum_sats ?? report?.total_in_sats;
       const outsum = report?.outputs_sum_sats ?? report?.total_out_sats;
       const feeText = fee == null ? 'an unknown fee' : (sats(fee) + ' sats');
@@ -426,13 +475,16 @@
       parts.push(`SegWit: <b>${is_segwit ? 'yes' : 'no'}</b>.`);
       $('storyText').innerHTML = parts.join(' ');
 
+      // Raw / full JSON panes.
       const pretty = JSON.stringify(report, null, 2);
       $('rawOut').textContent = pretty;
       $('jsonFull').textContent = pretty;
 
+      // Flow diagram.
       drawFlow(vins, vouts, fee);
     }
 
+    // Draw a simple value-flow diagram (inputs -> tx -> outputs + fee).
     function drawFlow(vins, vouts, fee){
       const svg = $('flow');
       svg.innerHTML = '';
@@ -484,6 +536,7 @@
       link(590, 58, 720, 58, base);
       link(590, 74, 720, 138, Math.max(6, base * (feeVal/totalIn)));
 
+      // Draw a limited number of per-input/per-output links for readability.
       const maxItems = 8;
       const inIdx = vins.length > maxItems ? Array.from({length:maxItems}, (_,i)=>i) : Array.from({length:vins.length}, (_,i)=>i);
       const outIdx = vouts.length > maxItems ? Array.from({length:maxItems}, (_,i)=>i) : Array.from({length:vouts.length}, (_,i)=>i);
@@ -499,11 +552,17 @@
       });
     }
 
+    // -------------------------------------------------------------------------
+    // Analyze action
+    // -------------------------------------------------------------------------
     $('btnAnalyze').addEventListener('click', async () => {
       const txt = $('fixture').value.trim();
       if (!txt) return toast('Paste fixture JSON first');
+
       const [obj, err] = safeJsonParse(txt);
       if (err) return toast('Invalid JSON');
+
+      // If the fixture omitted network, use the UI selection.
       if (!obj.network) obj.network = $('network').value;
 
       $('btnAnalyze').disabled = true;
@@ -514,7 +573,10 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(obj),
         });
+
         const j = await r.json();
+
+        // Standard error shape from the backend is `{ ok:false, error:{code,message} }`.
         if (!r.ok || !j || j.ok === false) {
           const code = j?.error?.code || 'HTTP_'+r.status;
           const msg = j?.error?.message || 'Request failed';
@@ -524,6 +586,8 @@
           toast('Error');
           return;
         }
+
+        // Some server variants wrap as `{report: ...}`.
         const report = j.report || j;
         render(report);
         toast('Done');
@@ -538,5 +602,3 @@
   </script>
 </body>
 </html>
-*/
-
