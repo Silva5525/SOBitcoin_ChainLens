@@ -1338,8 +1338,9 @@ fn build_tx_report(network: &str, core: CoreTx, flags: TxComputeFlags) -> Result
                 if let Ok(s) = std::str::from_utf8(&data) {
                     op_return_data_utf8 = Some(s.to_string());
                 }
-                // protocol detection is optional; keep None for now
-                op_return_protocol = None;
+                // Protocol detection (minimal): schema requires a non-null enum for OP_RETURN.
+                // We default to "unknown" unless we detect a known prefix.
+                op_return_protocol = Some("unknown".to_string());
             }
         }
 
