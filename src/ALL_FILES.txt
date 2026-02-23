@@ -529,31 +529,16 @@ fn block_hash_le(block_payload: &[u8]) -> Result<[u8; 32], String> {
     Ok(dsha256_bytes(&block_payload[..80]))
 }
 
-/// Helpers to extract structural counts from block and undo payloads.
+/// Attempt fast-path pairing.
 ///
-/// We do not rely on on-disk ordering between blk*.dat and rev*.dat.
-/// Instead, pairing is done using structural invariants and full validation
-/// against the block's transactions.
-fn block_tx_count(block: &[u8]) -> Result<u64, String> {
-    let mut bc = parser::Cursor::new(block);
-    if bc.remaining() < 80 {
-        return Err(err("INVALID_BLOCK", "block payload too small for header"));
-    }
-    bc.take(80)?;
-    parser::read_varint(&mut bc).map_err(|e| err("INVALID_BLOCK", e))
-}
-
-fn undo_txundo_count(undo_payload: &[u8]) -> Result<u64, String> {
-    let mut uc = parser::Cursor::new(undo_payload);
-    parser::read_varint(&mut uc).map_err(|e| err("INVALID_UNDO", e))
-}
-
-/// Attempt fast-path pairing using the 32-byte rev trailer.
+/// Order between blk*.dat and rev*.dat is *often* aligned in practice (height order),
+/// but is not guaranteed (reorgs, pruned/partial datasets, etc.).
 ///
-/// This is only safe if the trailer is some block identifier we can compute per block
-/// (most likely block_hash). We therefore:
-/// - only take the fast-path when the match is **unique** and **unused**
-/// - fill remaining blocks via the existing invariant+validate fallback.
+/// We therefore implement a **safe** two-stage strategy:
+/// 1) **Default hot path**: index-based pairing (block[i] ↔ rev[i]) *only if* cheap
+///    structural invariants hold for **every** record.
+/// 2) Optional trailer-based pairing (opt-in) for additional speed when trailer meaning is known.
+/// 3) Correctness fallback: invariant bucketing + full `validate_undo_payload_against_block`.
 fn pair_rev_to_blocks_fast_then_fallback(
     blk_buf: &[u8],
     blk_ranges: &[RecordRange],
@@ -567,9 +552,17 @@ fn pair_rev_to_blocks_fast_then_fallback(
         return Err(err("NO_RECORDS_FOUND", "rev: no records found"));
     }
 
+    // --- NEW DEFAULT HOT PATH -------------------------------------------------
+    // Try the cheap, Core-like sequential pairing first.
+    // This is only accepted when *all* records satisfy the structural invariant:
+    //   undo_txundo_count == block_tx_count - 1  (or == block_tx_count in rare cases).
+    if let Some(paired) = pair_rev_to_blocks_index_if_plausible(blk_buf, blk_ranges, rev_buf, rev_recs)? {
+        return Ok(paired);
+    }
+
     // Optional diagnostics to understand what trailer likely represents.
-    // This is intentionally cheap and off by default.
-    let diag = std::env::var("CHAINLENS_REV_TRAILER_DIAG").is_ok();
+// This is intentionally cheap and off by default.
+let diag = std::env::var("CHAINLENS_REV_TRAILER_DIAG").is_ok();
 
     // Build trailer index: trailer_bytes -> rev indices (Vec for collision safety).
     let mut by_trailer: std::collections::HashMap<[u8; 32], Vec<usize>> =
@@ -582,10 +575,10 @@ fn pair_rev_to_blocks_fast_then_fallback(
     let mut used = vec![false; rev_recs.len()];
     let mut out: Vec<Option<RecordRange>> = vec![None; blk_ranges.len()];
 
-    // Fast-path toggle. We keep it opt-in until trailer meaning is confirmed.
-    let fast_enabled = std::env::var("CHAINLENS_PAIRING_FAST").is_ok();
+    // Trailer fast-path toggle. We keep it opt-in until trailer meaning is confirmed.
+let fast_enabled = std::env::var("CHAINLENS_PAIRING_FAST").is_ok();
 
-    let mut matched_fast = 0usize;
+let mut matched_fast = 0usize;
 
     if fast_enabled {
         for (i, br) in blk_ranges.iter().enumerate() {
@@ -686,6 +679,62 @@ fn pair_rev_to_blocks_fast_then_fallback(
 /// Existing (correctness) pairing algorithm: bucket by undo_count invariant and validate.
 ///
 /// This is now used as a fallback and can skip already-used rev records.
+// ------------------------------------------------------------
+// NEW: Index-based pairing with ultra-cheap plausibility checks
+// ------------------------------------------------------------
+fn pair_rev_to_blocks_index_if_plausible(
+    blk_buf: &[u8],
+    blk_ranges: &[RecordRange],
+    rev_buf: &[u8],
+    rev_recs: &[RevRecord],
+) -> Result<Option<Vec<RecordRange>>, String> {
+    if blk_ranges.len() != rev_recs.len() {
+        return Ok(None);
+    }
+
+    // Require full plausibility for every record to avoid silent mispairing.
+    let mut out: Vec<RecordRange> = Vec::with_capacity(blk_ranges.len());
+
+    for (i, (br, rr)) in blk_ranges.iter().zip(rev_recs.iter()).enumerate() {
+        let block = &blk_buf[br.clone()];
+        let undo_payload = &rev_buf[rr.payload.clone()];
+
+        let txc = parser::block_tx_count_fast(block)?;
+        if txc == 0 {
+            return Ok(None);
+        }
+        let expected = txc.saturating_sub(1);
+
+        let undo_cnt = undo::undo_txundo_count_fast(undo_payload)?;
+
+        // Accept only if the invariant holds.
+        if !(undo_cnt == expected || undo_cnt == txc) {
+            // Not plausibly aligned → fall back to validate-based matching.
+            if std::env::var("CHAINLENS_PAIRING_STATS").is_ok() {
+                eprintln!(
+                    "[chainlens] pairing: index hotpath rejected at i={} (txc={}, undo_cnt={}, expected={})",
+                    i, txc, undo_cnt, expected
+                );
+            }
+            return Ok(None);
+        }
+
+        out.push(rr.payload.clone());
+    }
+
+    if std::env::var("CHAINLENS_PAIRING_STATS").is_ok() {
+        eprintln!(
+            "[chainlens] pairing: index hotpath accepted for {} blocks",
+            blk_ranges.len()
+        );
+    }
+
+    Ok(Some(out))
+}
+
+/// Existing (correctness) pairing algorithm: bucket by undo_count invariant and validate.
+///
+/// This is now used as a fallback and can skip already-used rev records.
 fn pair_rev_to_blocks_fallback_validate_fill(
     blk_buf: &[u8],
     blk_ranges: &[RecordRange],
@@ -702,7 +751,7 @@ fn pair_rev_to_blocks_fallback_validate_fill(
             continue;
         }
         let undo_payload = &rev_buf[rr.payload.clone()];
-        let undo_cnt = undo_txundo_count(undo_payload)?;
+        let undo_cnt = undo::undo_txundo_count_fast(undo_payload)?;
         by_undo_cnt.entry(undo_cnt).or_default().push(j);
     }
 
@@ -714,7 +763,7 @@ fn pair_rev_to_blocks_fallback_validate_fill(
         }
 
         let block = &blk_buf[br.clone()];
-        let txc = block_tx_count(block)?;
+        let txc = parser::block_tx_count_fast(block)?;
         if txc == 0 {
             return Err(err("INVALID_BLOCK", format!("block[{i}] tx_count=0")));
         }
@@ -893,1979 +942,6 @@ pub(crate) fn decode_blk_and_rev_best(
 
 
 # =================== btc/block/mod.rs
-
-// src/btc/block/mod.rs
-
-mod report;
-mod io;
-mod parser;
-mod undo;
-
-pub use report::{BlockHeaderReport, BlockReport, BlockStatsReport, CoinbaseReport};
-
-use std::collections::BTreeMap;
-use std::fs;
-
-use crate::btc::tx::analyze_tx_from_bytes_ordered_lite;
-
-use io::decode_blk_and_rev_best;
-use parser::{bytes_to_hex, hash_to_display_hex, merkle_root, Cursor};
-use undo::parse_undo_payload_strict_slices;
-
-fn err(code: &str, msg: impl AsRef<str>) -> String {
-    format!("{code}: {}", msg.as_ref())
-}
-
-#[inline]
-fn bump_script_summary<'a>(m: &mut BTreeMap<&'a str, u64>, script_type: &'a str) {
-    let key = if script_type.is_empty() { "unknown" } else { script_type };
-    *m.entry(key).or_insert(0) += 1;
-}
-
-fn txid_display_hex_to_le(s: &str) -> Result<[u8; 32], String> {
-    let mut be = [0u8; 32];
-    let raw = hex::decode(s).map_err(|_| err("INVALID_TXID", "txid is not valid hex"))?;
-    if raw.len() != 32 {
-        return Err(err("INVALID_TXID", "txid wrong length"));
-    }
-    be.copy_from_slice(&raw);
-    be.reverse(); // display hex = BE, merkle uses LE
-    Ok(be)
-}
-
-/// Analyze all txs in a block (coinbase + non-coinbase) using undo prevouts.
-///
-/// Hot path: avoid per-tx `Vec<u8>` copies by passing `&block[start..end]` slices.
-/// Also uses bounded parallelism for non-coinbase txs.
-fn analyze_txs_with_undo_slices(
-    block: &[u8],
-    tx_ranges: &[(usize, usize)],
-    undo_prevouts: &[Vec<(u64, &[u8])>],
-) -> Result<Vec<crate::btc::tx::TxReport>, String> {
-    use crate::btc::tx::TxReport;
-
-    if tx_ranges.is_empty() {
-        return Err(err("INVALID_BLOCK", "block has zero transactions"));
-    }
-    if tx_ranges.len().saturating_sub(1) != undo_prevouts.len() {
-        return Err(err(
-            "UNDO_MISMATCH",
-            format!(
-                "undo tx count mismatch: non_cb_txs={} undo_txs={}",
-                tx_ranges.len().saturating_sub(1),
-                undo_prevouts.len()
-            ),
-        ));
-    }
-
-    // Pre-size output and fill coinbase.
-    // Note: `vec![None; n]` requires `Option<TxReport>: Clone` which we don't want.
-    let mut out: Vec<Option<TxReport>> = Vec::with_capacity(tx_ranges.len());
-    out.resize_with(tx_ranges.len(), || None);
-
-    let (cb_s, cb_e) = tx_ranges[0];
-    let empty: &[(u64, &[u8])] = &[];
-    let coinbase_report = analyze_tx_from_bytes_ordered_lite("mainnet", &block[cb_s..cb_e], empty)
-        .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
-    out[0] = Some(coinbase_report);
-
-    // For small blocks, sequential is faster (thread overhead dominates).
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    if threads <= 1 || tx_ranges.len() < 128 {
-        for i in 1..tx_ranges.len() {
-            let (s, e) = tx_ranges[i];
-            let per_in = &undo_prevouts[i - 1];
-            let rep = analyze_tx_from_bytes_ordered_lite("mainnet", &block[s..e], per_in)
-                .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
-            out[i] = Some(rep);
-        }
-
-        return out
-            .into_iter()
-            .enumerate()
-            .map(|(i, x)| x.ok_or_else(|| err("INTERNAL", format!("missing tx report at index {i}"))))
-            .collect();
-    }
-
-    // Parallel hot path.
-    let n = tx_ranges.len();
-    let work = n - 1;
-    let t = threads.min(work).max(1);
-    let chunk = (work + t - 1) / t;
-
-    std::thread::scope(|scope| -> Result<(), String> {
-        let mut handles = Vec::with_capacity(t);
-
-        for tid in 0..t {
-            let start_i = 1 + tid * chunk;
-            let end_i = (start_i + chunk).min(n);
-            if start_i >= end_i {
-                continue;
-            }
-
-            handles.push(scope.spawn(move || -> Result<Vec<(usize, TxReport)>, String> {
-                let mut local: Vec<(usize, TxReport)> = Vec::with_capacity(end_i - start_i);
-                for i in start_i..end_i {
-                    let (s, e) = tx_ranges[i];
-                    let per_in = &undo_prevouts[i - 1];
-                    let rep = analyze_tx_from_bytes_ordered_lite("mainnet", &block[s..e], per_in)
-                        .map_err(|e| err("ANALYZE_TX_FAILED", e))?;
-                    local.push((i, rep));
-                }
-                Ok(local)
-            }));
-        }
-
-        for h in handles {
-            let local = h
-                .join()
-                .map_err(|_| err("THREAD_PANIC", "tx analysis thread panicked"))??;
-            for (i, rep) in local {
-                out[i] = Some(rep);
-            }
-        }
-
-        Ok(())
-    })?;
-
-    out.into_iter()
-        .enumerate()
-        .map(|(i, x)| x.ok_or_else(|| err("INTERNAL", format!("missing tx report at index {i}"))))
-        .collect()
-}
-
-/// Block-mode entrypoint used by `cli.sh --block`.
-///
-/// Reads blk/rev/xor files, decodes records, parses every block record, and writes one report per block.
-pub fn analyze_block_file(
-    blk_path: &str,
-    rev_path: &str,
-    xor_path: &str,
-) -> Result<Vec<BlockReport>, String> {
-    let key = fs::read(xor_path).map_err(|e| err("IO_ERROR", format!("read xor key failed: {e}")))?;
-    let blk_raw = fs::read(blk_path).map_err(|e| err("IO_ERROR", format!("read blk failed: {e}")))?;
-    let rev_raw = fs::read(rev_path).map_err(|e| err("IO_ERROR", format!("read rev failed: {e}")))?;
-
-    let (blk_buf, blk_ranges, rev_buf, undo_ranges) = decode_blk_and_rev_best(blk_raw, rev_raw, &key)?;
-
-    if blk_ranges.len() != undo_ranges.len() {
-        return Err(err(
-            "RECORD_COUNT_MISMATCH",
-            format!("blk records={} rev records={}", blk_ranges.len(), undo_ranges.len()),
-        ));
-    }
-
-    let mut out = Vec::with_capacity(blk_ranges.len());
-    for (br, ur) in blk_ranges.iter().zip(undo_ranges.iter()) {
-        let block = &blk_buf[br.clone()];
-        let undo_payload = &rev_buf[ur.clone()];
-        out.push(analyze_one_block_payload_record_rev(block, undo_payload)?);
-    }
-
-    Ok(out)
-}
-
-/// Backwards-compatible helper for the web app (analyze first block only).
-///
-/// NOTE: This reads *only* blk+xor. For full block-mode the web endpoint should call `analyze_block_file`.
-pub fn analyze_block_file_first_block(blk_path: &str, xor_path: &str) -> Result<BlockReport, String> {
-    let key = fs::read(xor_path).map_err(|e| err("IO_ERROR", format!("read xor key failed: {e}")))?;
-    let blk_raw = fs::read(blk_path).map_err(|e| err("IO_ERROR", format!("read blk failed: {e}")))?;
-
-    let (blk_buf, blk_ranges) = io::decode_blk_best_to_records(blk_raw, &key)?;
-
-    let first = blk_ranges
-        .into_iter()
-        .next()
-        .ok_or_else(|| err("INVALID_BLOCK", "no block records"))?;
-
-    analyze_one_block_payload(&blk_buf[first.clone()])
-}
-
-/// Analyze a single block payload WITHOUT an undo payload.
-///
-/// This exists for the web helper that only uploads blk+xor.
-/// Non-coinbase txs are analyzed with empty prevouts, so fees/feerates will be 0.
-fn analyze_one_block_payload(block: &[u8]) -> Result<BlockReport, String> {
-    // --- parse header ---
-    let mut bc = Cursor::new(block);
-    if bc.remaining() < 80 {
-        return Err(err("INVALID_BLOCK", "block payload too small for header"));
-    }
-
-    let header = bc.take(80)?;
-    let mut hc = Cursor::new(header);
-
-    let version = hc.take_u32_le()?;
-    let prev_le = {
-        let s = hc.take(32)?;
-        let mut a = [0u8; 32];
-        a.copy_from_slice(s);
-        a
-    };
-    let merkle_le = {
-        let s = hc.take(32)?;
-        let mut a = [0u8; 32];
-        a.copy_from_slice(s);
-        a
-    };
-    let timestamp = hc.take_u32_le()?;
-    let bits_u32 = hc.take_u32_le()?;
-    let nonce = hc.take_u32_le()?;
-
-    let block_hash_le = parser::dsha256(header);
-    let block_hash = hash_to_display_hex(block_hash_le);
-
-    let prev_block_hash = {
-        let mut be = prev_le;
-        be.reverse();
-        bytes_to_hex(&be)
-    };
-    let merkle_root_hdr_display = {
-        let mut be = merkle_le;
-        be.reverse();
-        bytes_to_hex(&be)
-    };
-
-    // --- parse txs (NO raw tx copies) ---
-    let tx_count = parser::read_varint(&mut bc)?;
-    if tx_count == 0 {
-        return Err(err("INVALID_BLOCK", "tx_count=0"));
-    }
-
-    let mut tx_ranges: Vec<(usize, usize)> = Vec::with_capacity(tx_count as usize);
-
-    for _tx_idx in 0..(tx_count as usize) {
-        let start = bc.pos();
-        let _vin_count = parser::parse_tx_skip_and_vin_count(&mut bc)?;
-        let end = bc.pos();
-        tx_ranges.push((start, end));
-    }
-
-    // --- coinbase ---
-    let (cb_s, cb_e) = tx_ranges[0];
-    let (coinbase_script, coinbase_outsum) =
-        parser::coinbase_extract_script_and_outsum(&block[cb_s..cb_e])?;
-    let bip34_height = parser::decode_bip34_height(&coinbase_script);
-    let coinbase_script_hex = bytes_to_hex(&coinbase_script);
-
-    // Build empty undo prevouts for non-coinbase txs.
-    let undo_prevouts: Vec<Vec<(u64, &[u8])>> = vec![Vec::new(); tx_ranges.len().saturating_sub(1)];
-
-    // --- analyze txs (bounded parallelism, slices) ---
-    let tx_reports = analyze_txs_with_undo_slices(block, &tx_ranges, &undo_prevouts)?;
-
-    // Merkle check *after* tx analysis (txids come from TxReport)
-    let mut txids_le: Vec<[u8; 32]> = Vec::with_capacity(tx_reports.len());
-    for tx in &tx_reports {
-        txids_le.push(txid_display_hex_to_le(&tx.txid)?);
-    }
-
-    let mr_calc = merkle_root(&txids_le);
-    if mr_calc != merkle_le {
-        return Err(err(
-            "MERKLE_MISMATCH",
-            format!(
-                "header={} computed={}",
-                merkle_root_hdr_display,
-                hash_to_display_hex(mr_calc)
-            ),
-        ));
-    }
-
-    // --- block stats ---
-    let mut total_fees: u64 = 0;
-    let mut total_weight: u64 = 0;
-    let mut total_vbytes_non_cb: u64 = 0;
-    let mut script_summary_ref: BTreeMap<&str, u64> = BTreeMap::new();
-
-    for (idx, tx) in tx_reports.iter().enumerate() {
-        total_weight = total_weight.saturating_add(tx.weight as u64);
-
-        if idx != 0 {
-            if tx.fee_sats > 0 {
-                total_fees = total_fees.saturating_add(tx.fee_sats as u64);
-            }
-            total_vbytes_non_cb = total_vbytes_non_cb.saturating_add(tx.vbytes as u64);
-        }
-
-        for o in &tx.vout {
-            bump_script_summary(&mut script_summary_ref, &o.script_type);
-        }
-    }
-
-    let mut script_summary: BTreeMap<String, u64> = BTreeMap::new();
-    for (k, v) in script_summary_ref {
-        script_summary.insert(k.to_string(), v);
-    }
-
-    let avg_fee_rate_sat_vb = if total_vbytes_non_cb == 0 {
-        0.0
-    } else {
-        (total_fees as f64) / (total_vbytes_non_cb as f64)
-    };
-
-    Ok(BlockReport {
-        ok: true,
-        mode: "block",
-        block_header: BlockHeaderReport {
-            version,
-            prev_block_hash,
-            merkle_root: merkle_root_hdr_display,
-            merkle_root_valid: true,
-            timestamp,
-            bits: format!("{bits_u32:08x}"),
-            nonce,
-            block_hash,
-        },
-        tx_count,
-        coinbase: CoinbaseReport {
-            bip34_height,
-            coinbase_script_hex,
-            total_output_sats: coinbase_outsum,
-        },
-        transactions: tx_reports,
-        block_stats: BlockStatsReport {
-            total_fees_sats: total_fees,
-            total_weight,
-            avg_fee_rate_sat_vb,
-            script_type_summary: script_summary,
-        },
-    })
-}
-
-fn analyze_one_block_payload_record_rev(block: &[u8], undo_payload: &[u8]) -> Result<BlockReport, String> {
-    // --- parse header ---
-    let mut bc = Cursor::new(block);
-    if bc.remaining() < 80 {
-        return Err(err("INVALID_BLOCK", "block payload too small for header"));
-    }
-
-    // zero-copy: header ist jetzt ein Slice
-    let header = bc.take(80)?;
-    let mut hc = Cursor::new(header);
-
-    let version = hc.take_u32_le()?;
-    let prev_le = {
-        let s = hc.take(32)?;
-        let mut a = [0u8; 32];
-        a.copy_from_slice(s);
-        a
-    };
-    let merkle_le = {
-        let s = hc.take(32)?;
-        let mut a = [0u8; 32];
-        a.copy_from_slice(s);
-        a
-    };
-    let timestamp = hc.take_u32_le()?;
-    let bits_u32 = hc.take_u32_le()?;
-    let nonce = hc.take_u32_le()?;
-
-    let block_hash_le = parser::dsha256(header);
-    let block_hash = hash_to_display_hex(block_hash_le);
-
-    let prev_block_hash = {
-        let mut be = prev_le;
-        be.reverse();
-        bytes_to_hex(&be)
-    };
-    let merkle_root_hdr_display = {
-        let mut be = merkle_le;
-        be.reverse();
-        bytes_to_hex(&be)
-    };
-
-    // --- parse txs (NO raw tx copies) ---
-    let tx_count = parser::read_varint(&mut bc)?;
-
-    let mut tx_ranges: Vec<(usize, usize)> = Vec::with_capacity(tx_count as usize);
-    // Build vin counts for non-coinbase txs in the SAME pass (no second parse).
-    let mut vin_counts_non_cb: Vec<u64> = Vec::with_capacity((tx_count as usize).saturating_sub(1));
-
-    for tx_idx in 0..(tx_count as usize) {
-        let start = bc.pos();
-        let vin_count = parser::parse_tx_skip_and_vin_count(&mut bc)?;
-        let end = bc.pos();
-        tx_ranges.push((start, end));
-        if tx_idx != 0 {
-            vin_counts_non_cb.push(vin_count);
-        }
-    }
-
-    // --- coinbase ---
-    let (cb_s, cb_e) = tx_ranges[0];
-    let (coinbase_script, coinbase_outsum) =
-        parser::coinbase_extract_script_and_outsum(&block[cb_s..cb_e])?;
-    let bip34_height = parser::decode_bip34_height(&coinbase_script);
-    let coinbase_script_hex = bytes_to_hex(&coinbase_script);
-
-    // Parse undo as zero-copy script slices (raw scripts point into undo payload; expanded scripts live in arena).
-    let mut undo_arena: Vec<u8> = Vec::new();
-    let undo_prevouts_slices = parse_undo_payload_strict_slices(undo_payload, &vin_counts_non_cb, &mut undo_arena)?;
-
-    // Materialize borrowed script slices for the tx analyzer (no script copies).
-    let undo_prevouts: Vec<Vec<(u64, &[u8])>> = undo_prevouts_slices
-        .iter()
-        .map(|txu| {
-            txu.iter()
-                .map(|(v, spk_slice)| (*v, spk_slice.as_slice(undo_payload, &undo_arena)))
-                .collect()
-        })
-        .collect();
-
-    // --- analyze txs (bounded parallelism, slices) ---
-    let tx_reports = analyze_txs_with_undo_slices(block, &tx_ranges, &undo_prevouts)?;
-
-    // Merkle check *after* tx analysis (txids come from TxReport)
-    let mut txids_le: Vec<[u8; 32]> = Vec::with_capacity(tx_reports.len());
-    for tx in &tx_reports {
-        txids_le.push(txid_display_hex_to_le(&tx.txid)?);
-    }
-
-    let mr_calc = merkle_root(&txids_le);
-    if mr_calc != merkle_le {
-        return Err(err(
-            "MERKLE_MISMATCH",
-            format!(
-                "header={} computed={}",
-                merkle_root_hdr_display,
-                hash_to_display_hex(mr_calc)
-            ),
-        ));
-    }
-
-    // --- block stats ---
-    let mut total_fees: u64 = 0;
-    let mut total_weight: u64 = 0;
-    let mut total_vbytes_non_cb: u64 = 0;
-    let mut script_summary_ref: BTreeMap<&str, u64> = BTreeMap::new();
-
-    for (idx, tx) in tx_reports.iter().enumerate() {
-        total_weight = total_weight.saturating_add(tx.weight as u64);
-
-        if idx != 0 {
-            if tx.fee_sats > 0 {
-                total_fees = total_fees.saturating_add(tx.fee_sats as u64);
-            }
-            total_vbytes_non_cb = total_vbytes_non_cb.saturating_add(tx.vbytes as u64);
-        }
-
-        for o in &tx.vout {
-            bump_script_summary(&mut script_summary_ref, &o.script_type);
-        }
-    }
-
-    // Materialize once into the report-required type.
-
-    let mut script_summary: BTreeMap<String, u64> = BTreeMap::new();
-    for (k, v) in script_summary_ref {
-        script_summary.insert(k.to_string(), v);
-    }
-
-    let avg_fee_rate_sat_vb = if total_vbytes_non_cb == 0 {
-        0.0
-    } else {
-        (total_fees as f64) / (total_vbytes_non_cb as f64)
-    };
-
-    Ok(BlockReport {
-        ok: true,
-        mode: "block",
-        block_header: BlockHeaderReport {
-            version,
-            prev_block_hash,
-            merkle_root: merkle_root_hdr_display,
-            merkle_root_valid: true,
-            timestamp,
-            bits: format!("{bits_u32:08x}"),
-            nonce,
-            block_hash,
-        },
-        tx_count,
-        coinbase: CoinbaseReport {
-            bip34_height,
-            coinbase_script_hex,
-            total_output_sats: coinbase_outsum,
-        },
-        transactions: tx_reports,
-        block_stats: BlockStatsReport {
-            total_fees_sats: total_fees,
-            total_weight,
-            avg_fee_rate_sat_vb,
-            script_type_summary: script_summary,
-        },
-    })
-}
-
-
-# =================== btc/block/parser.rs
-
-
-// src/btc/block/parser.rs
-
-use sha2::{Digest, Sha256};
-
-fn err(code: &str, msg: impl AsRef<str>) -> String {
-    format!("{code}: {}", msg.as_ref())
-}
-
-pub(crate) fn ensure_len(kind: &str, field: &str, val: u64, max: u64) -> Result<(), String> {
-    if val > max {
-        return Err(err(
-            "INSANE_LEN",
-            format!("{kind}: {field} too large: {val} > {max}"),
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) struct Cursor<'a> {
-    pub(crate) b: &'a [u8],
-    pub(crate) i: usize,
-}
-
-impl<'a> Cursor<'a> {
-    pub(crate) fn new(b: &'a [u8]) -> Self {
-        Self { b, i: 0 }
-    }
-    pub(crate) fn pos(&self) -> usize {
-        self.i
-    }
-    pub(crate) fn remaining(&self) -> usize {
-        self.b.len().saturating_sub(self.i)
-    }
-    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        if self.i + n > self.b.len() {
-            return Err(err(
-                "UNEXPECTED_EOF",
-                format!(
-                    "unexpected EOF at pos={} need={} have_remaining={}",
-                    self.i,
-                    n,
-                    self.b.len().saturating_sub(self.i)
-                ),
-            ));
-        }
-        let s = &self.b[self.i..self.i + n];
-        self.i += n;
-        Ok(s)
-    }
-    pub(crate) fn take_u8(&mut self) -> Result<u8, String> {
-        Ok(self.take(1)?[0])
-    }
-    pub(crate) fn take_u16_le(&mut self) -> Result<u16, String> {
-        let s = self.take(2)?;
-        Ok(u16::from_le_bytes([s[0], s[1]]))
-    }
-    pub(crate) fn take_u32_le(&mut self) -> Result<u32, String> {
-        let s = self.take(4)?;
-        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-    pub(crate) fn take_u64_le(&mut self) -> Result<u64, String> {
-        let s = self.take(8)?;
-        Ok(u64::from_le_bytes([
-            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-        ]))
-    }
-}
-
-pub(crate) fn bytes_to_hex(b: &[u8]) -> String {
-    hex::encode(b)
-}
-
-pub(crate) fn dsha256(data: &[u8]) -> [u8; 32] {
-    let h1 = Sha256::digest(data);
-    let h2 = Sha256::digest(h1);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&h2);
-    out
-}
-
-pub(crate) fn hash_to_display_hex(hash_le: [u8; 32]) -> String {
-    let mut be = hash_le;
-    be.reverse();
-    bytes_to_hex(&be)
-}
-
-pub(crate) fn read_varint(c: &mut Cursor) -> Result<u64, String> {
-    let first = c.take_u8()? as u64;
-    match first {
-        0x00..=0xfc => Ok(first),
-        0xfd => Ok(c.take_u16_le()? as u64),
-        0xfe => Ok(c.take_u32_le()? as u64),
-        0xff => Ok(c.take_u64_le()?),
-        _ => Err(err("INVALID_VARINT", "invalid varint prefix")),
-    }
-}
-
-#[inline]
-fn sha256d_finish(h: Sha256) -> [u8; 32] {
-    let h1 = h.finalize();
-    let h2 = Sha256::digest(h1);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&h2);
-    out
-}
-
-#[inline]
-fn sha256_update_varint(h: &mut Sha256, n: u64) {
-    match n {
-        0x00..=0xfc => h.update([n as u8]),
-        0xfd..=0xffff => {
-            h.update([0xfd]);
-            h.update((n as u16).to_le_bytes());
-        }
-        0x1_0000..=0xffff_ffff => {
-            h.update([0xfe]);
-            h.update((n as u32).to_le_bytes());
-        }
-        _ => {
-            h.update([0xff]);
-            h.update(n.to_le_bytes());
-        }
-    }
-}
-
-pub(crate) fn merkle_root(txids_le: &[[u8; 32]]) -> [u8; 32] {
-    if txids_le.is_empty() {
-        return [0u8; 32];
-    }
-    let mut level: Vec<[u8; 32]> = txids_le.to_vec();
-    while level.len() > 1 {
-        if level.len() % 2 == 1 {
-            level.push(*level.last().unwrap());
-        }
-        let mut next = Vec::with_capacity(level.len() / 2);
-        for pair in level.chunks(2) {
-            let mut buf = [0u8; 64];
-            buf[..32].copy_from_slice(&pair[0]);
-            buf[32..].copy_from_slice(&pair[1]);
-            next.push(dsha256(&buf));
-        }
-        level = next;
-    }
-    level[0]
-}
-
-pub(crate) fn parse_tx_skip_and_txid_le(
-    block: &[u8],
-    bc: &mut Cursor,
-) -> Result<[u8; 32], String> {
-    // Backwards-compatible wrapper.
-    let (txid, _vin_count) = parse_tx_skip_and_txid_le_and_vin_count(block, bc)?;
-    Ok(txid)
-}
-
-/// Skip a transaction in `block` at the current cursor position, returning both the txid (LE)
-/// and the vin_count.
-///
-/// This avoids a second parse when callers need vin_count (e.g. undo pairing/validation).
-pub(crate) fn parse_tx_skip_and_txid_le_and_vin_count(
-    block: &[u8],
-    bc: &mut Cursor,
-) -> Result<([u8; 32], u64), String> {
-    let start = bc.pos();
-
-    let version = bc.take_u32_le()?;
-
-    let peek = bc.take_u8()?;
-    let segwit = if peek == 0x00 {
-        let flag = bc.take_u8()?;
-        if flag != 0x01 {
-            return Err(err("INVALID_TX", "invalid segwit flag"));
-        }
-        true
-    } else {
-        bc.i -= 1;
-        false
-    };
-
-    if !segwit {
-        let vin_count = read_varint(bc)?;
-        ensure_len("tx", "vin_count", vin_count, 50_000)?;
-        for _ in 0..vin_count {
-            let _ = bc.take(32)?;
-            let _ = bc.take(4)?;
-            let script_len = read_varint(bc)?;
-            ensure_len("tx", "script_sig_len", script_len, 1_000_000)?;
-            let _ = bc.take(script_len as usize)?;
-            let _ = bc.take(4)?;
-        }
-
-        let vout_count = read_varint(bc)?;
-        ensure_len("tx", "vout_count", vout_count, 50_000)?;
-        for _ in 0..vout_count {
-            let _ = bc.take(8)?;
-            let spk_len = read_varint(bc)?;
-            ensure_len("tx", "script_pubkey_len", spk_len, 10_000)?;
-            let _ = bc.take(spk_len as usize)?;
-        }
-
-        let _ = bc.take(4)?; // locktime
-        let end = bc.pos();
-        return Ok((dsha256(&block[start..end]), vin_count));
-    }
-
-    // Segwit: stream stripped serialization directly into hasher.
-    let mut h = Sha256::new();
-    h.update(version.to_le_bytes());
-
-    let vin_count = read_varint(bc)?;
-    ensure_len("tx", "vin_count", vin_count, 50_000)?;
-    sha256_update_varint(&mut h, vin_count);
-
-    for _ in 0..vin_count {
-        let prev_txid = bc.take(32)?;
-        let vout = bc.take(4)?;
-        h.update(prev_txid);
-        h.update(vout);
-
-        let script_len = read_varint(bc)?;
-        ensure_len("tx", "script_sig_len", script_len, 1_000_000)?;
-        sha256_update_varint(&mut h, script_len);
-        let script = bc.take(script_len as usize)?;
-        h.update(script);
-
-        let seq = bc.take(4)?;
-        h.update(seq);
-    }
-
-    let vout_count = read_varint(bc)?;
-    ensure_len("tx", "vout_count", vout_count, 50_000)?;
-    sha256_update_varint(&mut h, vout_count);
-
-    for _ in 0..vout_count {
-        let value = bc.take(8)?;
-        h.update(value);
-
-        let spk_len = read_varint(bc)?;
-        ensure_len("tx", "script_pubkey_len", spk_len, 10_000)?;
-        sha256_update_varint(&mut h, spk_len);
-        let spk = bc.take(spk_len as usize)?;
-        h.update(spk);
-    }
-
-    // Skip witness (not hashed into txid).
-    for _ in 0..vin_count {
-        let n_items = read_varint(bc)?;
-        ensure_len("tx", "witness_item_count", n_items, 10_000)?;
-        for _ in 0..n_items {
-            let item_len = read_varint(bc)?;
-            ensure_len("tx", "witness_item_len", item_len, 4_000_000)?;
-            let _ = bc.take(item_len as usize)?;
-        }
-    }
-
-    let lock = bc.take(4)?;
-    h.update(lock);
-
-    Ok((sha256d_finish(h), vin_count))
-}
-
-/// Skip a transaction and return only the vin_count.
-///
-/// This is cheaper than computing txid and is useful when callers only need
-/// input counts (e.g. undo parsing/validation).
-pub(crate) fn parse_tx_skip_and_vin_count(bc: &mut Cursor) -> Result<u64, String> {
-    let _version = bc.take_u32_le()?;
-
-    // Detect segwit marker/flag.
-    let peek = bc.take_u8()?;
-    let segwit = if peek == 0x00 {
-        let flag = bc.take_u8()?;
-        if flag != 0x01 {
-            return Err(err("INVALID_TX", "invalid segwit flag"));
-        }
-        true
-    } else {
-        bc.i -= 1;
-        false
-    };
-
-    // vin
-    let vin_count = read_varint(bc)?;
-    ensure_len("tx", "vin_count", vin_count, 50_000)?;
-    for _ in 0..vin_count {
-        let _ = bc.take(32)?;
-        let _ = bc.take(4)?;
-        let script_len = read_varint(bc)?;
-        ensure_len("tx", "script_sig_len", script_len, 1_000_000)?;
-        let _ = bc.take(script_len as usize)?;
-        let _ = bc.take(4)?;
-    }
-
-    // vout
-    let vout_count = read_varint(bc)?;
-    ensure_len("tx", "vout_count", vout_count, 50_000)?;
-    for _ in 0..vout_count {
-        let _ = bc.take(8)?;
-        let spk_len = read_varint(bc)?;
-        ensure_len("tx", "script_pubkey_len", spk_len, 10_000)?;
-        let _ = bc.take(spk_len as usize)?;
-    }
-
-    // witness (only present in segwit txs)
-    if segwit {
-        for _ in 0..vin_count {
-            let n_items = read_varint(bc)?;
-            ensure_len("tx", "witness_item_count", n_items, 10_000)?;
-            for _ in 0..n_items {
-                let item_len = read_varint(bc)?;
-                ensure_len("tx", "witness_item_len", item_len, 4_000_000)?;
-                let _ = bc.take(item_len as usize)?;
-            }
-        }
-    }
-
-    let _ = bc.take(4)?; // locktime
-    Ok(vin_count)
-}
-
-pub(crate) fn decode_bip34_height(coinbase_script: &[u8]) -> u64 {
-    if coinbase_script.is_empty() {
-        return 0;
-    }
-    let n = coinbase_script[0] as usize;
-    if n == 0 || 1 + n > coinbase_script.len() || n > 8 {
-        return 0;
-    }
-    let mut val: u64 = 0;
-    for (i, b) in coinbase_script[1..1 + n].iter().enumerate() {
-        val |= (*b as u64) << (8 * i);
-    }
-    val
-}
-
-pub(crate) fn coinbase_extract_script_and_outsum(
-    raw_tx: &[u8],
-) -> Result<(Vec<u8>, u64), String> {
-    let mut c = Cursor::new(raw_tx);
-    let _version = c.take_u32_le()?;
-
-    let p = c.take_u8()?;
-    if p == 0x00 {
-        let _ = c.take_u8()?;
-    } else {
-        c.i -= 1;
-    }
-
-    let vin_n = read_varint(&mut c)?;
-    if vin_n != 1 {
-        return Err(err("INVALID_COINBASE", "coinbase must have exactly 1 input"));
-    }
-
-    let prev = c.take(32)?;
-    let vout = c.take_u32_le()?;
-    if prev.iter().any(|&b| b != 0) || vout != 0xffff_ffff {
-        return Err(err(
-            "INVALID_COINBASE",
-            "coinbase input outpoint must be (32x00, vout=0xffffffff)",
-        ));
-    }
-
-    let script_len = read_varint(&mut c)? as usize;
-    let script = c.take(script_len)?.to_vec();
-
-    let _ = c.take(4)?;
-
-    let vout_n = read_varint(&mut c)?;
-    let mut outsum: u64 = 0;
-    for _ in 0..vout_n {
-        let value = c.take_u64_le()?;
-        outsum = outsum.saturating_add(value);
-        let spk_len = read_varint(&mut c)? as usize;
-        let _ = c.take(spk_len)?;
-    }
-
-    Ok((script, outsum))
-}
-
-
-# =================== btc/block/undo.rs
-
-// src/btc/block/undo.rs
-
-use super::parser;
-
-use k256::elliptic_curve::sec1::ToEncodedPoint;
-use k256::PublicKey;
-
-// Zero-copy representation for scriptPubKey bytes in undo payload.
-// Some scripts are stored raw inside the undo payload; others are stored in a compressed form and
-// must be expanded. Expanded scripts are appended into a shared arena buffer.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ScriptSrc {
-    Undo,
-    Arena,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ScriptSlice {
-    pub src: ScriptSrc,
-    pub start: usize,
-    pub len: usize,
-}
-
-#[allow(dead_code)]
-impl ScriptSlice {
-    #[inline]
-    pub fn as_slice<'a>(&self, undo_payload: &'a [u8], arena: &'a [u8]) -> &'a [u8] {
-        match self.src {
-            ScriptSrc::Undo => &undo_payload[self.start..self.start + self.len],
-            ScriptSrc::Arena => &arena[self.start..self.start + self.len],
-        }
-    }
-}
-
-#[allow(dead_code)]
-type UndoPrevoutsSlices = Vec<Vec<(u64, ScriptSlice)>>;
-
-fn err(code: &str, msg: impl AsRef<str>) -> String {
-    format!("{code}: {}", msg.as_ref())
-}
-
-fn ensure_len(kind: &str, field: &str, val: u64, max: u64) -> Result<(), String> {
-    parser::ensure_len(kind, field, val, max)
-}
-
-fn read_varint_core(c: &mut parser::Cursor) -> Result<u64, String> {
-    // Bitcoin Core base-128 VarInt encoding (serialize.h)
-    let mut n: u64 = 0;
-    loop {
-        let ch = c.take_u8()? as u64;
-        let data = ch & 0x7f;
-        n = (n << 7) | data;
-        if (ch & 0x80) != 0 {
-            n = n.checked_add(1).ok_or_else(|| err("VARINT_OVERFLOW", "core varint overflow"))?;
-            continue;
-        }
-        return Ok(n);
-    }
-}
-
-fn read_compactsize(c: &mut parser::Cursor) -> Result<u64, String> {
-    // Bitcoin CompactSize
-    let first = c.take_u8()?;
-    match first {
-        0x00..=0xfc => Ok(first as u64),
-        0xfd => Ok(c.take_u16_le()? as u64),
-        0xfe => Ok(c.take_u32_le()? as u64),
-        0xff => Ok(c.take_u64_le()?),
-    }
-}
-
-fn decompress_amount(x: u64) -> u64 {
-    if x == 0 {
-        return 0;
-    }
-    let mut x = x - 1;
-    let e = (x % 10) as u32;
-    x /= 10;
-
-    let mut n: u64;
-    if e < 9 {
-        let d = (x % 9) + 1;
-        x /= 9;
-        n = x * 10 + d;
-    } else {
-        n = x + 1;
-    }
-
-    for _ in 0..e {
-        n *= 10;
-    }
-    n
-}
-
-fn decompress_uncompressed_pubkey_from_x(x32: &[u8], y_is_odd: bool) -> Result<Vec<u8>, String> {
-    if x32.len() != 32 {
-        return Err(err("INVALID_PUBKEY", "x32 must be 32 bytes"));
-    }
-
-    let mut comp = [0u8; 33];
-    comp[0] = if y_is_odd { 0x03 } else { 0x02 };
-    comp[1..].copy_from_slice(x32);
-
-    let pk = PublicKey::from_sec1_bytes(&comp)
-        .map_err(|_| err("INVALID_PUBKEY", "failed to decompress pubkey from x"))?;
-
-    let enc = pk.to_encoded_point(false);
-    let bytes = enc.as_bytes();
-    if bytes.len() != 65 || bytes[0] != 0x04 {
-        return Err(err("INVALID_PUBKEY", "unexpected uncompressed encoding"));
-    }
-
-    Ok(bytes.to_vec())
-}
-
-
-// Zero-copy variant: returns a ScriptSlice into either undo_payload (raw scripts) or the arena
-// (expanded standard scripts). No per-script Vec allocations.
-#[allow(dead_code)]
-fn read_compressed_script_slice(c: &mut parser::Cursor, arena: &mut Vec<u8>) -> Result<ScriptSlice, String> {
-    // ScriptCompressor uses Bitcoin Core base-128 VarInt (not CompactSize).
-    let nsize = read_varint_core(c)?;
-
-    match nsize {
-        0 => {
-            // P2PKH
-            let h160 = c.take(20)?;
-            let start = arena.len();
-            arena.extend_from_slice(&[0x76, 0xa9, 0x14]);
-            arena.extend_from_slice(h160);
-            arena.extend_from_slice(&[0x88, 0xac]);
-            let len = arena.len() - start;
-            Ok(ScriptSlice { src: ScriptSrc::Arena, start, len })
-        }
-        1 => {
-            // P2SH
-            let h160 = c.take(20)?;
-            let start = arena.len();
-            arena.extend_from_slice(&[0xa9, 0x14]);
-            arena.extend_from_slice(h160);
-            arena.push(0x87);
-            let len = arena.len() - start;
-            Ok(ScriptSlice { src: ScriptSrc::Arena, start, len })
-        }
-        2 | 3 => {
-            // P2PK (compressed pubkey)
-            let x = c.take(32)?;
-            let prefix = if nsize == 2 { 0x02 } else { 0x03 };
-            let start = arena.len();
-            arena.push(0x21);
-            arena.push(prefix);
-            arena.extend_from_slice(x);
-            arena.push(0xac);
-            let len = arena.len() - start;
-            Ok(ScriptSlice { src: ScriptSrc::Arena, start, len })
-        }
-        4 | 5 => {
-            // P2PK (uncompressed pubkey)
-            let x = c.take(32)?;
-            let y_is_odd = nsize == 5;
-            let pubkey65 = decompress_uncompressed_pubkey_from_x(x, y_is_odd)?;
-            let start = arena.len();
-            arena.push(0x41);
-            arena.extend_from_slice(&pubkey65);
-            arena.push(0xac);
-            let len = arena.len() - start;
-            Ok(ScriptSlice { src: ScriptSrc::Arena, start, len })
-        }
-        _ => {
-            if nsize < 6 {
-                return Err(err("INVALID_SCRIPT_COMPRESSION", "nsize < 6 unexpected"));
-            }
-
-            let raw_len_u64 = nsize - 6;
-            ensure_len("undo", "compressed_script_raw_len", raw_len_u64, 100_000)?;
-
-            let raw_len: usize = usize::try_from(raw_len_u64)
-                .map_err(|_| err("LEN_OVERFLOW", format!("raw_len too large for usize: {raw_len_u64}")))?;
-
-            // Raw script is already present in the undo payload; return a view into it.
-            let start = c.pos();
-            let _ = c.take(raw_len)?;
-            Ok(ScriptSlice { src: ScriptSrc::Undo, start, len: raw_len })
-        }
-    }
-}
-
-
-#[allow(dead_code)]
-fn read_one_inundo_slice(rc: &mut parser::Cursor, arena: &mut Vec<u8>) -> Result<(u64, ScriptSlice), String> {
-    let ncode = read_varint_core(rc)?;
-    let height = ncode >> 1;
-
-    if height > 0 {
-        let _tx_version = read_varint_core(rc)?;
-    }
-
-    let comp_amt = read_varint_core(rc)?;
-    let spk = read_compressed_script_slice(rc, arena)?;
-    let value_sats = decompress_amount(comp_amt);
-
-    if spk.len > 100_000 {
-        return Err(err("INSANE_LEN", format!("spk too large: {}", spk.len)));
-    }
-
-    Ok((value_sats, spk))
-}
-
-#[allow(dead_code)]
-fn read_undo_for_block_from_cursor_slices(
-    rc: &mut parser::Cursor,
-    vin_counts_non_cb: &[u64],
-    arena: &mut Vec<u8>,
-) -> Result<UndoPrevoutsSlices, String> {
-    let n_txundo = read_compactsize(rc)?;
-    ensure_len("undo", "n_txundo", n_txundo, 200_000)?;
-
-    let expected = vin_counts_non_cb.len() as u64;
-
-    let mut has_cb_undo = false;
-    if n_txundo == expected {
-        // ok
-    } else if n_txundo == expected.saturating_add(1) {
-        has_cb_undo = true;
-    } else {
-        return Err(err(
-            "UNDO_MISMATCH",
-            format!(
-                "undo txundo count mismatch: undo={}, expected={} (or {} if coinbase included)",
-                n_txundo,
-                expected,
-                expected.saturating_add(1)
-            ),
-        ));
-    }
-
-    if has_cb_undo {
-        let cb_vin_n = read_compactsize(rc)?;
-        if cb_vin_n != 0 {
-            return Err(err(
-                "UNDO_MISMATCH",
-                format!("coinbase undo present but vin_n != 0: got={cb_vin_n}"),
-            ));
-        }
-    }
-
-    let mut all: UndoPrevoutsSlices = Vec::with_capacity(vin_counts_non_cb.len());
-
-    for (txundo_idx, &vin_expected) in vin_counts_non_cb.iter().enumerate() {
-        let vin_n = read_compactsize(rc)?;
-        ensure_len("undo", "vin_count", vin_n, 100_000)?;
-
-        if vin_n != vin_expected {
-            return Err(err(
-                "UNDO_MISMATCH",
-                format!(
-                    "undo vin count mismatch: txundo_idx={} undo={} expected={}",
-                    txundo_idx, vin_n, vin_expected
-                ),
-            ));
-        }
-
-        let mut ins: Vec<(u64, ScriptSlice)> = Vec::with_capacity(vin_n as usize);
-        for _ in 0..(vin_n as usize) {
-            ins.push(read_one_inundo_slice(rc, arena)?);
-        }
-        all.push(ins);
-    }
-
-    Ok(all)
-}
-
-// Zero-copy strict parser: returns ScriptSlice references that can be materialized as &[u8]
-// using ScriptSlice::as_slice(undo_payload, arena).
-#[allow(dead_code)]
-pub(crate) fn parse_undo_payload_strict_slices(
-    undo_payload: &[u8],
-    vin_counts_non_cb: &[u64],
-    arena: &mut Vec<u8>,
-) -> Result<UndoPrevoutsSlices, String> {
-    let mut uc = parser::Cursor::new(undo_payload);
-    let v = read_undo_for_block_from_cursor_slices(&mut uc, vin_counts_non_cb, arena)?;
-    if uc.remaining() != 0 {
-        return Err(err(
-            "UNDO_TRAILING_BYTES",
-            format!("undo payload has {} trailing bytes", uc.remaining()),
-        ));
-    }
-    Ok(v)
-}
-
-pub(crate) fn extract_vin_count(raw_tx: &[u8]) -> Result<u64, String> {
-    let mut c = parser::Cursor::new(raw_tx);
-    let _ver = c.take_u32_le()?;
-
-    let p = c.take_u8()?;
-    if p == 0x00 {
-        let _f = c.take_u8()?;
-    } else {
-        c.i -= 1;
-    }
-
-    parser::read_varint(&mut c)
-}
-
-pub(crate) fn extract_vin_count_from_slice(raw_tx: &[u8]) -> Result<u64, String> {
-    extract_vin_count(raw_tx)
-}
-
-#[inline]
-fn skip_compressed_script(rc: &mut parser::Cursor) -> Result<(), String> {
-    // ScriptCompressor uses Bitcoin Core base-128 VarInt (not CompactSize).
-    let nsize = read_varint_core(rc)?;
-
-    match nsize {
-        0 | 1 => {
-            // P2PKH or P2SH: 20-byte hash160
-            let _ = rc.take(20)?;
-            Ok(())
-        }
-        2 | 3 | 4 | 5 => {
-            // P2PK: 32-byte X coordinate (compressed or uncompressed key)
-            let _ = rc.take(32)?;
-            Ok(())
-        }
-        _ => {
-            if nsize < 6 {
-                return Err(err("INVALID_SCRIPT_COMPRESSION", "nsize < 6 unexpected"));
-            }
-            let raw_len_u64 = nsize - 6;
-            ensure_len("undo", "compressed_script_raw_len", raw_len_u64, 100_000)?;
-            let raw_len: usize = usize::try_from(raw_len_u64)
-                .map_err(|_| err("LEN_OVERFLOW", format!("raw_len too large for usize: {raw_len_u64}")))?;
-            let _ = rc.take(raw_len)?;
-            Ok(())
-        }
-    }
-}
-
-#[inline]
-fn skip_one_inundo(rc: &mut parser::Cursor) -> Result<(), String> {
-    // Matches read_one_inundo/read_one_inundo_slice structure:
-    //   ncode (varint_core)
-    //   optional tx_version (varint_core) if height>0
-    //   comp_amt (varint_core)
-    //   compressed_script (varint_core + payload)
-    let ncode = read_varint_core(rc)?;
-    let height = ncode >> 1;
-    if height > 0 {
-        let _tx_version = read_varint_core(rc)?;
-    }
-    let _comp_amt = read_varint_core(rc)?;
-    skip_compressed_script(rc)?;
-    Ok(())
-}
-
-fn validate_undo_payload_strict_structure(
-    undo_payload: &[u8],
-    vin_counts_non_cb: &[u64],
-) -> Result<(), String> {
-    let mut uc = parser::Cursor::new(undo_payload);
-
-    // CBlockUndo: CompactSize(nTxUndo)
-    // Usually tx_count - 1, but some fixtures include an extra empty CTxUndo for coinbase.
-    let n_txundo = read_compactsize(&mut uc)?;
-    ensure_len("undo", "n_txundo", n_txundo, 200_000)?;
-
-    let expected = vin_counts_non_cb.len() as u64;
-
-    let mut has_cb_undo = false;
-    if n_txundo == expected {
-        // ok
-    } else if n_txundo == expected.saturating_add(1) {
-        has_cb_undo = true;
-    } else {
-        return Err(err(
-            "UNDO_MISMATCH",
-            format!(
-                "undo txundo count mismatch: undo={}, expected={} (or {} if coinbase included)",
-                n_txundo,
-                expected,
-                expected.saturating_add(1)
-            ),
-        ));
-    }
-
-    if has_cb_undo {
-        let cb_vin_n = read_compactsize(&mut uc)?;
-        if cb_vin_n != 0 {
-            return Err(err(
-                "UNDO_MISMATCH",
-                format!("coinbase undo present but vin_n != 0: got={cb_vin_n}"),
-            ));
-        }
-    }
-
-    for (txundo_idx, &vin_expected) in vin_counts_non_cb.iter().enumerate() {
-        let vin_n = read_compactsize(&mut uc)?;
-        ensure_len("undo", "vin_count", vin_n, 100_000)?;
-
-        if vin_n != vin_expected {
-            return Err(err(
-                "UNDO_MISMATCH",
-                format!(
-                    "undo vin count mismatch: txundo_idx={} undo={} expected={}",
-                    txundo_idx, vin_n, vin_expected
-                ),
-            ));
-        }
-
-        // Skip vin_n inputs.
-        for _ in 0..(vin_n as usize) {
-            skip_one_inundo(&mut uc)?;
-        }
-    }
-
-    if uc.remaining() != 0 {
-        return Err(err(
-            "UNDO_TRAILING_BYTES",
-            format!("undo payload has {} trailing bytes", uc.remaining()),
-        ));
-    }
-
-    Ok(())
-}
-
-// --- Drop-in replacement for your existing function ---
-// This preserves the external signature but makes it much faster.
-// It still computes vin_counts_non_cb the same way as before; a further speedup
-// is possible by adding a parser helper that returns vin_count during skip.
-
-pub(crate) fn validate_undo_payload_against_block(
-    block: &[u8],
-    undo_payload: &[u8],
-) -> Result<(), String> {
-    let mut bc = parser::Cursor::new(block);
-
-    if bc.remaining() < 80 {
-        return Err(err("INVALID_BLOCK", "block payload too small for header"));
-    }
-
-    // Skip header (no allocation)
-    let _header = bc.take(80)?;
-
-    let tx_count = parser::read_varint(&mut bc)?;
-    if tx_count == 0 {
-        return Err(err("INVALID_BLOCK", "block has zero transactions"));
-    }
-
-    // We only need vin-counts for non-coinbase txs.
-    // Parse each tx as a slice range without copying.
-    let mut vin_counts_non_cb: Vec<u64> =
-        Vec::with_capacity((tx_count as usize).saturating_sub(1));
-
-    for tx_idx in 0..(tx_count as usize) {
-        let start = bc.pos();
-        let _txid_le = parser::parse_tx_skip_and_txid_le(block, &mut bc)?;
-        let end = bc.pos();
-
-        if tx_idx == 0 {
-            // coinbase: ignore
-            continue;
-        }
-
-        vin_counts_non_cb.push(extract_vin_count_from_slice(&block[start..end])?);
-    }
-
-    // FAST structural validation (no script allocations, no pubkey decompression)
-    validate_undo_payload_strict_structure(undo_payload, &vin_counts_non_cb)
-}
-
-
-# =================== btc/block/report.rs
-
-// src/btc/block/report.rs
-
-use serde::Serialize;
-use std::collections::BTreeMap;
-
-use crate::btc::tx::TxReport;
-
-#[derive(Debug, Serialize)]
-pub struct BlockReport {
-    pub ok: bool,
-    /// Always "block" in block parsing mode.
-    pub mode: &'static str,
-    pub block_header: BlockHeaderReport,
-    pub tx_count: u64,
-    pub coinbase: CoinbaseReport,
-    pub transactions: Vec<TxReport>,
-    pub block_stats: BlockStatsReport,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BlockHeaderReport {
-    pub version: u32,
-    pub prev_block_hash: String,
-    pub merkle_root: String,
-    pub merkle_root_valid: bool,
-    pub timestamp: u32,
-    pub bits: String,
-    pub nonce: u32,
-    pub block_hash: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CoinbaseReport {
-    pub bip34_height: u64,
-    pub coinbase_script_hex: String,
-    pub total_output_sats: u64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BlockStatsReport {
-    pub total_fees_sats: u64,
-    pub total_weight: u64,
-    pub avg_fee_rate_sat_vb: f64,
-    /// Map of script_type -> count. Using BTreeMap keeps JSON output deterministic.
-    pub script_type_summary: BTreeMap<String, u64>,
-}
-
-
-# =================== btc/mod.rs
-
-// src/btc/mod.rs
-
-// This module organizes Bitcoin functionality.
-// Submodules define transaction and block analysis.
-// Accessible as `chainlens::btc::tx` and `chainlens::btc::block`.
-pub mod block;
-pub mod tx;
-
-
-# =================== btc/web/static/index.html
-
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ChainLens — Bitcoin Transaction Visualizer</title>
-  <script>
-    // Minimal "utility" CSS (no external deps). Inspired by Tailwind spacing/typography.
-    const css = `
-      :root{--bg:#0b0f19;--panel:#111827;--panel2:#0f172a;--text:#e5e7eb;--muted:#9ca3af;--line:#1f2937;--ok:#34d399;--warn:#fbbf24;--bad:#fb7185;--accent:#60a5fa;}
-      *{box-sizing:border-box} html,body{height:100%}
-      body{margin:0;font:14px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; background:radial-gradient(1200px 800px at 20% 0%, #0b1227 0%, var(--bg) 55%); color:var(--text)}
-      a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
-      .wrap{max-width:1180px;margin:0 auto;padding:24px}
-      .top{display:flex;gap:14px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}
-      .brand{display:flex;gap:12px;align-items:center}
-      .logo{width:40px;height:40px;border-radius:14px;background:linear-gradient(135deg,#2563eb,#22c55e);box-shadow:0 10px 24px rgba(0,0,0,.35)}
-      h1{margin:0;font-size:18px;letter-spacing:.2px}
-      .sub{margin-top:2px;color:var(--muted);font-size:12.5px}
-      .pill{display:inline-flex;gap:8px;align-items:center;border:1px solid var(--line);background:rgba(17,24,39,.65);padding:6px 10px;border-radius:999px;color:var(--muted)}
-      .pill b{color:var(--text);font-weight:600}
-      .grid{display:grid;grid-template-columns:1.1fr .9fr;gap:14px;margin-top:16px}
-      @media (max-width: 980px){.grid{grid-template-columns:1fr}}
-      .card{background:rgba(17,24,39,.75);border:1px solid var(--line);border-radius:18px;box-shadow:0 20px 45px rgba(0,0,0,.25)}
-      .card .hd{padding:14px 14px 10px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:10px}
-      .card .bd{padding:14px}
-      .title{font-size:13px;color:var(--muted)}
-      .btn{cursor:pointer;border:1px solid var(--line);background:rgba(15,23,42,.9);color:var(--text);padding:10px 12px;border-radius:14px;display:inline-flex;gap:8px;align-items:center}
-      .btn:hover{border-color:#334155}
-      .btn:disabled{opacity:.55;cursor:not-allowed}
-      .btn.primary{background:linear-gradient(135deg,#2563eb,#22c55e);border-color:transparent}
-      .btn.ghost{background:transparent}
-      .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-      textarea,input,select{width:100%;border:1px solid var(--line);background:rgba(15,23,42,.9);color:var(--text);border-radius:14px;padding:10px 12px;outline:none}
-      textarea{min-height:160px;resize:vertical}
-      label{display:block;color:var(--muted);font-size:12px;margin-bottom:6px}
-      .kpi{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
-      @media (max-width: 980px){.kpi{grid-template-columns:repeat(2,1fr)}}
-      .k{padding:12px;border:1px solid var(--line);border-radius:16px;background:rgba(15,23,42,.7)}
-      .k .n{color:var(--muted);font-size:11.5px}
-      .k .v{margin-top:6px;font-size:16px;font-weight:650}
-      .k .s{margin-top:3px;color:var(--muted);font-size:12px}
-      .bad{color:var(--bad)} .ok{color:var(--ok)} .warn{color:var(--warn)}
-      .tabs{display:flex;gap:8px;flex-wrap:wrap}
-      .tab{padding:7px 10px;border-radius:999px;border:1px solid var(--line);background:rgba(15,23,42,.7);color:var(--muted);cursor:pointer}
-      .tab.active{background:rgba(96,165,250,.18);color:var(--text);border-color:rgba(96,165,250,.35)}
-      table{width:100%;border-collapse:separate;border-spacing:0 8px}
-      th{color:var(--muted);font-size:11.5px;text-align:left;font-weight:600;padding:0 8px}
-      td{padding:10px 8px;background:rgba(15,23,42,.7);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
-      tr td:first-child{border-left:1px solid var(--line);border-top-left-radius:14px;border-bottom-left-radius:14px}
-      tr td:last-child{border-right:1px solid var(--line);border-top-right-radius:14px;border-bottom-right-radius:14px}
-      code, pre{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
-      pre{margin:0;padding:12px;border-radius:16px;border:1px solid var(--line);background:rgba(15,23,42,.85);overflow:auto;max-height:360px}
-      .mini{font-size:12px;color:var(--muted)}
-      .bar{height:10px;border-radius:999px;background:rgba(148,163,184,.18);overflow:hidden;border:1px solid rgba(148,163,184,.15)}
-      .bar > div{height:100%;background:linear-gradient(90deg,#60a5fa,#22c55e)}
-      .svgbox{border:1px solid var(--line);background:rgba(15,23,42,.6);border-radius:18px;overflow:hidden}
-      .hint{color:var(--muted);font-size:12px}
-      .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:22px;background:rgba(17,24,39,.92);border:1px solid var(--line);padding:10px 12px;border-radius:14px;box-shadow:0 18px 40px rgba(0,0,0,.35);opacity:0;pointer-events:none;transition:opacity .18s}
-      .toast.show{opacity:1}
-    `;
-    const style = document.createElement('style'); style.textContent = css; document.head.appendChild(style);
-  </script>
-</head>
-<body>
-  <div class="wrap">
-    <div class="top">
-      <div class="brand">
-        <div class="logo"></div>
-        <div>
-          <h1>ChainLens</h1>
-          <div class="sub">Bitcoin transaction & block analysis — fast, deterministic, fixture-friendly.</div>
-        </div>
-      </div>
-      <div class="row">
-        <div class="pill"><span>API</span> <b id="apiState">checking…</b></div>
-        <button class="btn" id="btnHealth">Check health</button>
-        <a class="btn ghost" href="/api/health" target="_blank" rel="noopener">/api/health</a>
-      </div>
-    </div>
-
-    <div class="grid">
-      <!-- Left: Input / Story -->
-      <div class="card">
-        <div class="hd">
-          <div>
-            <div class="title">Input</div>
-            <div style="font-weight:650;font-size:14px">Analyze a transaction fixture</div>
-          </div>
-          <div class="row">
-            <select id="network">
-              <option value="mainnet">mainnet</option>
-              <option value="testnet">testnet</option>
-              <option value="signet">signet</option>
-              <option value="regtest">regtest</option>
-            </select>
-            <button class="btn primary" id="btnAnalyze">Analyze</button>
-          </div>
-        </div>
-        <div class="bd">
-          <div class="row" style="justify-content:space-between;align-items:flex-end">
-            <div style="flex:1">
-              <label>Paste fixture JSON (recommended)</label>
-              <textarea id="fixture" spellcheck="false" placeholder='{"network":"mainnet","raw_tx":"...","prevouts":[...]}'></textarea>
-              <div class="hint" style="margin-top:8px">Tip: you can also load a file. The UI posts to <code>/api/analyze</code>.</div>
-            </div>
-          </div>
-
-          <div class="row" style="margin-top:10px">
-            <input type="file" id="file" accept="application/json" />
-            <button class="btn" id="btnLoad">Load JSON</button>
-            <button class="btn" id="btnExample">Example</button>
-            <button class="btn" id="btnClear">Clear</button>
-          </div>
-
-          <div style="margin-top:14px" class="tabs">
-            <div class="tab active" data-tab="story">Story</div>
-            <div class="tab" data-tab="graph">Flow</div>
-            <div class="tab" data-tab="raw">Raw JSON</div>
-          </div>
-
-          <div id="tab_story" style="margin-top:12px">
-            <div class="mini" id="storyText">Run an analysis to see a human-readable summary here.</div>
-          </div>
-
-          <div id="tab_graph" style="display:none;margin-top:12px">
-            <div class="svgbox">
-              <svg id="flow" width="100%" height="260" viewBox="0 0 980 260" preserveAspectRatio="none"></svg>
-            </div>
-            <div class="hint" style="margin-top:8px">Left = inputs (prevouts), Right = outputs. Fee is shown as a separate sink.</div>
-          </div>
-
-          <div id="tab_raw" style="display:none;margin-top:12px">
-            <pre id="rawOut">{}</pre>
-          </div>
-        </div>
-      </div>
-
-      <!-- Right: Results -->
-      <div class="card">
-        <div class="hd">
-          <div>
-            <div class="title">Report</div>
-            <div style="font-weight:650;font-size:14px">Transaction summary</div>
-          </div>
-          <div class="row">
-            <button class="btn" id="btnCopy">Copy JSON</button>
-            <button class="btn" id="btnToggleTech">Show technical details</button>
-          </div>
-        </div>
-        <div class="bd">
-          <div class="kpi">
-            <div class="k"><div class="n">TXID</div><div class="v" id="k_txid">—</div><div class="s" id="k_txid_s"></div></div>
-            <div class="k"><div class="n">Fee</div><div class="v" id="k_fee">—</div><div class="s" id="k_feerate">—</div></div>
-            <div class="k"><div class="n">Size</div><div class="v" id="k_vb">—</div><div class="s" id="k_wt">—</div></div>
-            <div class="k"><div class="n">SegWit</div><div class="v" id="k_sw">—</div><div class="s" id="k_sw_s">—</div></div>
-          </div>
-
-          <div style="margin-top:12px" class="row">
-            <div style="flex:1">
-              <div class="mini">Warnings</div>
-              <div id="warnings" class="mini" style="margin-top:6px">—</div>
-            </div>
-          </div>
-
-          <div style="margin-top:12px" class="tabs">
-            <div class="tab active" data-tab2="io">Inputs & Outputs</div>
-            <div class="tab" data-tab2="scripts">Scripts</div>
-            <div class="tab" data-tab2="tech">Technical</div>
-          </div>
-
-          <div id="tab2_io" style="margin-top:12px">
-            <div class="mini">Inputs</div>
-            <div style="margin-top:6px;overflow:auto">
-              <table id="tbl_in"><thead><tr><th>#</th><th>Spend type</th><th>Value (sats)</th><th>Outpoint</th></tr></thead><tbody></tbody></table>
-            </div>
-            <div class="mini" style="margin-top:12px">Outputs</div>
-            <div style="margin-top:6px;overflow:auto">
-              <table id="tbl_out"><thead><tr><th>#</th><th>Script type</th><th>Value (sats)</th><th>Address/Asm</th></tr></thead><tbody></tbody></table>
-            </div>
-          </div>
-
-          <div id="tab2_scripts" style="display:none;margin-top:12px">
-            <div class="mini">Script type distribution (by output count)</div>
-            <div style="margin-top:8px" id="scriptBars"></div>
-          </div>
-
-          <div id="tab2_tech" style="display:none;margin-top:12px">
-            <div class="mini">Locktimes</div>
-            <div style="margin-top:8px" class="row">
-              <div class="k" style="flex:1"><div class="n">Locktime</div><div class="v" id="t_lock">—</div><div class="s" id="t_lock_s">—</div></div>
-              <div class="k" style="flex:1"><div class="n">RBF</div><div class="v" id="t_rbf">—</div><div class="s" id="t_rbf_s">—</div></div>
-            </div>
-            <div style="margin-top:10px" class="mini">Full report JSON</div>
-            <div style="margin-top:8px"><pre id="jsonFull">{}</pre></div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="toast" id="toast"></div>
-
-  <script>
-    // ---------- helpers ----------
-    const $ = (id) => document.getElementById(id);
-    const toast = (msg) => {
-      const t = $('toast');
-      t.textContent = msg;
-      t.classList.add('show');
-      setTimeout(() => t.classList.remove('show'), 1200);
-    };
-
-    function safeJsonParse(s) {
-      try { return [JSON.parse(s), null]; } catch (e) { return [null, e]; }
-    }
-
-    function sats(n){
-      if (n === null || n === undefined) return '—';
-      const x = Number(n);
-      if (!Number.isFinite(x)) return String(n);
-      return x.toLocaleString('en-US');
-    }
-
-    function shortHex(h, n=10){
-      if (!h || typeof h !== 'string') return '—';
-      if (h.length <= n*2) return h;
-      return h.slice(0,n) + '…' + h.slice(-n);
-    }
-
-    function setText(id, v){ $(id).textContent = v; }
-
-    // ---------- tabs ----------
-    document.querySelectorAll('[data-tab]').forEach(el => {
-      el.addEventListener('click', () => {
-        document.querySelectorAll('[data-tab]').forEach(x => x.classList.remove('active'));
-        el.classList.add('active');
-        ['story','graph','raw'].forEach(t => {
-          $('tab_'+t).style.display = (t === el.dataset.tab) ? '' : 'none';
-        });
-      });
-    });
-
-    document.querySelectorAll('[data-tab2]').forEach(el => {
-      el.addEventListener('click', () => {
-        document.querySelectorAll('[data-tab2]').forEach(x => x.classList.remove('active'));
-        el.classList.add('active');
-        ['io','scripts','tech'].forEach(t => {
-          $('tab2_'+t).style.display = (t === el.dataset.tab2) ? '' : 'none';
-        });
-      });
-    });
-
-    // ---------- health ----------
-    async function checkHealth(){
-      try {
-        const r = await fetch('/api/health', {cache:'no-store'});
-        const j = await r.json();
-        if (r.ok && j && j.ok === true) {
-          setText('apiState', 'ok');
-          $('apiState').className = 'ok';
-          return true;
-        }
-        setText('apiState', 'error');
-        $('apiState').className = 'bad';
-        return false;
-      } catch {
-        setText('apiState', 'offline');
-        $('apiState').className = 'bad';
-        return false;
-      }
-    }
-
-    $('btnHealth').addEventListener('click', checkHealth);
-    checkHealth();
-
-    // ---------- load file ----------
-    $('btnLoad').addEventListener('click', async () => {
-      const f = $('file').files?.[0];
-      if (!f) return toast('Pick a JSON file first');
-      const txt = await f.text();
-      $('fixture').value = txt;
-      toast('Loaded');
-    });
-
-    $('btnExample').addEventListener('click', () => {
-      $('fixture').value = JSON.stringify({
-        network: $('network').value,
-        raw_tx: "<paste-raw-tx-hex-here>",
-        prevouts: [
-          { txid: "<txid>", vout: 0, value_sats: 100000, script_pubkey_hex: "<hex>" }
-        ]
-      }, null, 2);
-      toast('Example inserted');
-    });
-
-    $('btnClear').addEventListener('click', () => {
-      $('fixture').value = '';
-      $('rawOut').textContent = '{}';
-      $('jsonFull').textContent = '{}';
-      toast('Cleared');
-    });
-
-    // ---------- copy JSON ----------
-    $('btnCopy').addEventListener('click', async () => {
-      const txt = $('jsonFull').textContent;
-      await navigator.clipboard.writeText(txt);
-      toast('Copied');
-    });
-
-    // ---------- technical toggle ----------
-    let showTech = false;
-    $('btnToggleTech').addEventListener('click', () => {
-      showTech = !showTech;
-      $('btnToggleTech').textContent = showTech ? 'Hide technical details' : 'Show technical details';
-      if (showTech){
-        document.querySelector('[data-tab2="tech"]').click();
-      } else {
-        document.querySelector('[data-tab2="io"]').click();
-      }
-    });
-
-    // ---------- render ----------
-    function render(report){
-      const txid = report?.txid || report?.txid_hex || report?.id || '—';
-      const fee = report?.fee_sats;
-      const feerate = report?.fee_rate_sat_vb;
-      const vbytes = report?.vbytes;
-      const weight = report?.weight;
-      const is_segwit = report?.is_segwit;
-      const savings = report?.segwit_savings;
-
-      setText('k_txid', shortHex(txid, 14));
-      setText('k_txid_s', txid && txid !== '—' ? txid : '');
-      setText('k_fee', fee == null ? '—' : (sats(fee) + ' sats'));
-      setText('k_feerate', feerate == null ? '—' : (Number(feerate).toFixed(1) + ' sat/vB'));
-      setText('k_vb', vbytes == null ? '—' : (sats(vbytes) + ' vB'));
-      setText('k_wt', weight == null ? '—' : (sats(weight) + ' WU'));
-      setText('k_sw', is_segwit ? 'yes' : 'no');
-      setText('k_sw_s', savings ? (sats(savings.saved_vbytes) + ' vB saved') : '');
-
-      const ws = report?.warnings || [];
-      if (!ws.length) {
-        $('warnings').innerHTML = '<span class="ok">none</span>';
-      } else {
-        $('warnings').innerHTML = ws.map(w => {
-          const code = w.code || w;
-          const msg = w.message ? ` — ${w.message}` : '';
-          return `<span class="warn"><b>${code}</b>${msg}</span>`;
-        }).join('<br/>');
-      }
-
-      const inBody = $('tbl_in').querySelector('tbody');
-      inBody.innerHTML = '';
-      const vins = report?.inputs || report?.vin || [];
-      vins.forEach((vin, idx) => {
-        const spend = vin?.spend_type || vin?.type || '—';
-        const value = vin?.prevout_value_sats ?? vin?.value_sats ?? vin?.value ?? null;
-        const op = vin?.outpoint || (vin?.prevout_txid && (vin.prevout_txid + ':' + vin.prevout_vout));
-        const tr = document.createElement('tr');
-        tr.innerHTML = `
-          <td>${idx}</td>
-          <td><code>${spend}</code></td>
-          <td>${sats(value)}</td>
-          <td><code>${op ? shortHex(String(op), 16) : '—'}</code></td>
-        `;
-        inBody.appendChild(tr);
-      });
-
-      const outBody = $('tbl_out').querySelector('tbody');
-      outBody.innerHTML = '';
-      const vouts = report?.outputs || report?.vout || [];
-      vouts.forEach((vout, idx) => {
-        const st = vout?.script_type || vout?.type || '—';
-        const value = vout?.value_sats ?? vout?.value ?? null;
-        const addr = vout?.address || vout?.script_asm || vout?.script_pubkey_asm || '—';
-        const tr = document.createElement('tr');
-        tr.innerHTML = `
-          <td>${idx}</td>
-          <td><code>${st}</code></td>
-          <td>${sats(value)}</td>
-          <td><code>${String(addr).slice(0,64)}${String(addr).length>64?'…':''}</code></td>
-        `;
-        outBody.appendChild(tr);
-      });
-
-      const dist = report?.script_type_summary || report?.output_script_type_summary || null;
-      const sb = $('scriptBars');
-      sb.innerHTML = '';
-      if (dist && typeof dist === 'object') {
-        const entries = Object.entries(dist).sort((a,b)=>b[1]-a[1]);
-        const total = entries.reduce((s,[,v])=>s+Number(v||0),0) || 1;
-        entries.forEach(([k,v]) => {
-          const pct = (Number(v||0)/total)*100;
-          const div = document.createElement('div');
-          div.style.marginBottom = '10px';
-          div.innerHTML = `
-            <div class="row" style="justify-content:space-between">
-              <div><code>${k}</code></div>
-              <div class="mini">${v} (${pct.toFixed(1)}%)</div>
-            </div>
-            <div class="bar" style="margin-top:6px"><div style="width:${pct}%"></div></div>
-          `;
-          sb.appendChild(div);
-        });
-      } else {
-        sb.innerHTML = '<div class="mini">No script summary available in the report.</div>';
-      }
-
-      const ltType = report?.locktime_type;
-      const ltVal = report?.locktime_value;
-      setText('t_lock', ltVal == null ? '—' : String(ltVal));
-      setText('t_lock_s', ltType ? String(ltType) : '');
-      const rbf = report?.rbf_signaling;
-      setText('t_rbf', rbf === true ? 'signaling' : (rbf === false ? 'no' : '—'));
-      setText('t_rbf_s', rbf === true ? 'At least one input opts in (BIP125).' : '');
-
-      const insum = report?.inputs_sum_sats ?? report?.total_in_sats;
-      const outsum = report?.outputs_sum_sats ?? report?.total_out_sats;
-      const feeText = fee == null ? 'an unknown fee' : (sats(fee) + ' sats');
-      const rateText = feerate == null ? 'unknown fee rate' : (Number(feerate).toFixed(1) + ' sat/vB');
-      const parts = [];
-      if (txid && txid !== '—') parts.push(`<b>TXID</b> <code>${txid}</code>.`);
-      if (insum != null && outsum != null) parts.push(`Moves <b>${sats(insum)}</b> sats in and <b>${sats(outsum)}</b> sats out.`);
-      parts.push(`Pays <b>${feeText}</b> at <b>${rateText}</b>.`);
-      parts.push(`SegWit: <b>${is_segwit ? 'yes' : 'no'}</b>.`);
-      $('storyText').innerHTML = parts.join(' ');
-
-      const pretty = JSON.stringify(report, null, 2);
-      $('rawOut').textContent = pretty;
-      $('jsonFull').textContent = pretty;
-
-      drawFlow(vins, vouts, fee);
-    }
-
-    function drawFlow(vins, vouts, fee){
-      const svg = $('flow');
-      svg.innerHTML = '';
-      const inVals = vins.map(v => Number(v?.prevout_value_sats ?? v?.value_sats ?? v?.value ?? 0)).map(x=>Number.isFinite(x)?x:0);
-      const outVals = vouts.map(v => Number(v?.value_sats ?? v?.value ?? 0)).map(x=>Number.isFinite(x)?x:0);
-      const totalIn = inVals.reduce((a,b)=>a+b,0) || 1;
-      const totalOut = outVals.reduce((a,b)=>a+b,0);
-      const feeVal = Number.isFinite(Number(fee)) ? Number(fee) : Math.max(totalIn - totalOut, 0);
-
-      function node(x,y,w,h,label,sub){
-        const g = document.createElementNS('http://www.w3.org/2000/svg','g');
-        const r = document.createElementNS('http://www.w3.org/2000/svg','rect');
-        r.setAttribute('x',x); r.setAttribute('y',y);
-        r.setAttribute('width',w); r.setAttribute('height',h);
-        r.setAttribute('rx',14);
-        r.setAttribute('fill','rgba(17,24,39,0.9)');
-        r.setAttribute('stroke','rgba(31,41,55,1)');
-        g.appendChild(r);
-        const t = document.createElementNS('http://www.w3.org/2000/svg','text');
-        t.setAttribute('x',x+12); t.setAttribute('y',y+22);
-        t.setAttribute('fill','#e5e7eb'); t.setAttribute('font-size','12'); t.textContent = label;
-        g.appendChild(t);
-        const s = document.createElementNS('http://www.w3.org/2000/svg','text');
-        s.setAttribute('x',x+12); s.setAttribute('y',y+42);
-        s.setAttribute('fill','#9ca3af'); s.setAttribute('font-size','11'); s.textContent = sub || '';
-        g.appendChild(s);
-        svg.appendChild(g);
-      }
-
-      function link(x1,y1,x2,y2,thick){
-        const p = document.createElementNS('http://www.w3.org/2000/svg','path');
-        const c = (x2-x1)*0.45;
-        const d = `M ${x1} ${y1} C ${x1+c} ${y1}, ${x2-c} ${y2}, ${x2} ${y2}`;
-        p.setAttribute('d', d);
-        p.setAttribute('fill','none');
-        p.setAttribute('stroke','rgba(96,165,250,0.55)');
-        p.setAttribute('stroke-width', Math.max(1.5, thick));
-        p.setAttribute('stroke-linecap','round');
-        svg.appendChild(p);
-      }
-
-      node(60, 30, 200, 56, `Inputs (${vins.length})`, `${sats(totalIn)} sats`);
-      node(390, 30, 200, 56, 'Transaction', 'value flow');
-      node(720, 30, 200, 56, `Outputs (${vouts.length})`, `${sats(totalOut)} sats`);
-      node(720, 110, 200, 56, 'Fee', `${sats(feeVal)} sats`);
-
-      const base = 18;
-      link(260, 58, 390, 58, base);
-      link(590, 58, 720, 58, base);
-      link(590, 74, 720, 138, Math.max(6, base * (feeVal/totalIn)));
-
-      const maxItems = 8;
-      const inIdx = vins.length > maxItems ? Array.from({length:maxItems}, (_,i)=>i) : Array.from({length:vins.length}, (_,i)=>i);
-      const outIdx = vouts.length > maxItems ? Array.from({length:maxItems}, (_,i)=>i) : Array.from({length:vouts.length}, (_,i)=>i);
-      inIdx.forEach((i, k) => {
-        const y = 110 + k*16;
-        const thick = 2 + 10*(inVals[i]/totalIn);
-        link(260, 58, 390, y, thick);
-      });
-      outIdx.forEach((i, k) => {
-        const y = 110 + k*16;
-        const thick = 2 + 10*(outVals[i]/(totalOut||1));
-        link(590, 58, 720, y, thick);
-      });
-    }
-
-    $('btnAnalyze').addEventListener('click', async () => {
-      const txt = $('fixture').value.trim();
-      if (!txt) return toast('Paste fixture JSON first');
-      const [obj, err] = safeJsonParse(txt);
-      if (err) return toast('Invalid JSON');
-      if (!obj.network) obj.network = $('network').value;
-
-      $('btnAnalyze').disabled = true;
-      $('btnAnalyze').textContent = 'Analyzing…';
-      try {
-        const r = await fetch('/api/analyze', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(obj),
-        });
-        const j = await r.json();
-        if (!r.ok || !j || j.ok === false) {
-          const code = j?.error?.code || 'HTTP_'+r.status;
-          const msg = j?.error?.message || 'Request failed';
-          $('storyText').innerHTML = `<span class="bad"><b>${code}</b> — ${msg}</span>`;
-          $('rawOut').textContent = JSON.stringify(j, null, 2);
-          $('jsonFull').textContent = JSON.stringify(j, null, 2);
-          toast('Error');
-          return;
-        }
-        const report = j.report || j;
-        render(report);
-        toast('Done');
-      } catch (e) {
-        $('storyText').innerHTML = `<span class="bad"><b>NETWORK</b> — ${String(e)}</span>`;
-        toast('Network error');
-      } finally {
-        $('btnAnalyze').disabled = false;
-        $('btnAnalyze').textContent = 'Analyze';
-      }
-    });
-  </script>
-</body>
-</html>
-*/
-
-
-
-# =================== btc/tx.rs
 
 // src/btc/tx.rs
 
@@ -4324,6 +2400,3061 @@ pub fn analyze_tx(network: &str, raw_tx_hex: &str, prevouts: &[Prevout]) -> Resu
     }
 }
 
+# =================== btc/block/parser.rs
+
+
+// src/btc/block/parser.rs
+
+use sha2::{Digest, Sha256};
+
+fn err(code: &str, msg: impl AsRef<str>) -> String {
+    format!("{code}: {}", msg.as_ref())
+}
+
+pub(crate) fn ensure_len(kind: &str, field: &str, val: u64, max: u64) -> Result<(), String> {
+    if val > max {
+        return Err(err(
+            "INSANE_LEN",
+            format!("{kind}: {field} too large: {val} > {max}"),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) struct Cursor<'a> {
+    pub(crate) b: &'a [u8],
+    pub(crate) i: usize,
+}
+
+impl<'a> Cursor<'a> {
+    pub(crate) fn new(b: &'a [u8]) -> Self {
+        Self { b, i: 0 }
+    }
+    pub(crate) fn pos(&self) -> usize {
+        self.i
+    }
+    pub(crate) fn remaining(&self) -> usize {
+        self.b.len().saturating_sub(self.i)
+    }
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        if self.i + n > self.b.len() {
+            return Err(err(
+                "UNEXPECTED_EOF",
+                format!(
+                    "unexpected EOF at pos={} need={} have_remaining={}",
+                    self.i,
+                    n,
+                    self.b.len().saturating_sub(self.i)
+                ),
+            ));
+        }
+        let s = &self.b[self.i..self.i + n];
+        self.i += n;
+        Ok(s)
+    }
+    pub(crate) fn take_u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+    pub(crate) fn take_u16_le(&mut self) -> Result<u16, String> {
+        let s = self.take(2)?;
+        Ok(u16::from_le_bytes([s[0], s[1]]))
+    }
+    pub(crate) fn take_u32_le(&mut self) -> Result<u32, String> {
+        let s = self.take(4)?;
+        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    pub(crate) fn take_u64_le(&mut self) -> Result<u64, String> {
+        let s = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
+    }
+}
+
+pub(crate) fn bytes_to_hex(b: &[u8]) -> String {
+    hex::encode(b)
+}
+
+pub(crate) fn dsha256(data: &[u8]) -> [u8; 32] {
+    let h1 = Sha256::digest(data);
+    let h2 = Sha256::digest(h1);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h2);
+    out
+}
+
+pub(crate) fn hash_to_display_hex(hash_le: [u8; 32]) -> String {
+    let mut be = hash_le;
+    be.reverse();
+    bytes_to_hex(&be)
+}
+
+pub(crate) fn read_varint(c: &mut Cursor) -> Result<u64, String> {
+    let first = c.take_u8()? as u64;
+    match first {
+        0x00..=0xfc => Ok(first),
+        0xfd => Ok(c.take_u16_le()? as u64),
+        0xfe => Ok(c.take_u32_le()? as u64),
+        0xff => Ok(c.take_u64_le()?),
+        _ => Err(err("INVALID_VARINT", "invalid varint prefix")),
+    }
+}
+
+// ------------------------------------------------------------
+// Hot-path helpers (max speed)
+// ------------------------------------------------------------
+/// Read Bitcoin CompactSize/VarInt directly from a byte-slice cursor.
+///
+/// This avoids `Cursor` construction and is suitable for ultra-cheap checks in hot paths
+/// (e.g. blk↔rev pairing).
+#[inline]
+pub(crate) fn read_varint_bytes(input: &mut &[u8]) -> Result<u64, String> {
+    if input.is_empty() {
+        return Err(err("UNEXPECTED_EOF", "varint: empty input"));
+    }
+    let first = input[0];
+    *input = &input[1..];
+
+    match first {
+        0x00..=0xfc => Ok(first as u64),
+        0xfd => {
+            if input.len() < 2 {
+                return Err(err("UNEXPECTED_EOF", "varint: 0xfd missing 2 bytes"));
+            }
+            let v = u16::from_le_bytes([input[0], input[1]]) as u64;
+            *input = &input[2..];
+            Ok(v)
+        }
+        0xfe => {
+            if input.len() < 4 {
+                return Err(err("UNEXPECTED_EOF", "varint: 0xfe missing 4 bytes"));
+            }
+            let v = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as u64;
+            *input = &input[4..];
+            Ok(v)
+        }
+        0xff => {
+            if input.len() < 8 {
+                return Err(err("UNEXPECTED_EOF", "varint: 0xff missing 8 bytes"));
+            }
+            let v = u64::from_le_bytes([
+                input[0], input[1], input[2], input[3],
+                input[4], input[5], input[6], input[7],
+            ]);
+            *input = &input[8..];
+            Ok(v)
+        }
+    }
+}
+
+/// Ultra-cheap extraction of the block transaction count from a raw block payload.
+///
+/// Block payload format: 80-byte header followed by CompactSize(tx_count).
+///
+/// This is intentionally minimal and intended for fast-path plausibility checks.
+#[inline]
+pub(crate) fn block_tx_count_fast(block_payload: &[u8]) -> Result<u64, String> {
+    if block_payload.len() < 81 {
+        return Err(err("UNEXPECTED_EOF", "block: too small for header + tx_count"));
+    }
+    let mut cur = &block_payload[80..];
+    let txc = read_varint_bytes(&mut cur)?;
+    // Conservative sanity bound. Real blocks are far below this, but allow wiggle room.
+    ensure_len("block", "tx_count", txc, 200_000)?;
+    Ok(txc)
+}
+
+#[inline]
+fn sha256d_finish(h: Sha256) -> [u8; 32] {
+    let h1 = h.finalize();
+    let h2 = Sha256::digest(h1);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h2);
+    out
+}
+
+#[inline]
+fn sha256_update_varint(h: &mut Sha256, n: u64) {
+    match n {
+        0x00..=0xfc => h.update([n as u8]),
+        0xfd..=0xffff => {
+            h.update([0xfd]);
+            h.update((n as u16).to_le_bytes());
+        }
+        0x1_0000..=0xffff_ffff => {
+            h.update([0xfe]);
+            h.update((n as u32).to_le_bytes());
+        }
+        _ => {
+            h.update([0xff]);
+            h.update(n.to_le_bytes());
+        }
+    }
+}
+
+pub(crate) fn merkle_root(txids_le: &[[u8; 32]]) -> [u8; 32] {
+    if txids_le.is_empty() {
+        return [0u8; 32];
+    }
+    let mut level: Vec<[u8; 32]> = txids_le.to_vec();
+    while level.len() > 1 {
+        if level.len() % 2 == 1 {
+            level.push(*level.last().unwrap());
+        }
+        let mut next = Vec::with_capacity(level.len() / 2);
+        for pair in level.chunks(2) {
+            let mut buf = [0u8; 64];
+            buf[..32].copy_from_slice(&pair[0]);
+            buf[32..].copy_from_slice(&pair[1]);
+            next.push(dsha256(&buf));
+        }
+        level = next;
+    }
+    level[0]
+}
+
+pub(crate) fn parse_tx_skip_and_txid_le(
+    block: &[u8],
+    bc: &mut Cursor,
+) -> Result<[u8; 32], String> {
+    // Backwards-compatible wrapper.
+    let (txid, _vin_count) = parse_tx_skip_and_txid_le_and_vin_count(block, bc)?;
+    Ok(txid)
+}
+
+/// Skip a transaction in `block` at the current cursor position, returning both the txid (LE)
+/// and the vin_count.
+///
+/// This avoids a second parse when callers need vin_count (e.g. undo pairing/validation).
+pub(crate) fn parse_tx_skip_and_txid_le_and_vin_count(
+    block: &[u8],
+    bc: &mut Cursor,
+) -> Result<([u8; 32], u64), String> {
+    let start = bc.pos();
+
+    let version = bc.take_u32_le()?;
+
+    let peek = bc.take_u8()?;
+    let segwit = if peek == 0x00 {
+        let flag = bc.take_u8()?;
+        if flag != 0x01 {
+            return Err(err("INVALID_TX", "invalid segwit flag"));
+        }
+        true
+    } else {
+        bc.i -= 1;
+        false
+    };
+
+    if !segwit {
+        let vin_count = read_varint(bc)?;
+        ensure_len("tx", "vin_count", vin_count, 50_000)?;
+        for _ in 0..vin_count {
+            let _ = bc.take(32)?;
+            let _ = bc.take(4)?;
+            let script_len = read_varint(bc)?;
+            ensure_len("tx", "script_sig_len", script_len, 1_000_000)?;
+            let _ = bc.take(script_len as usize)?;
+            let _ = bc.take(4)?;
+        }
+
+        let vout_count = read_varint(bc)?;
+        ensure_len("tx", "vout_count", vout_count, 50_000)?;
+        for _ in 0..vout_count {
+            let _ = bc.take(8)?;
+            let spk_len = read_varint(bc)?;
+            ensure_len("tx", "script_pubkey_len", spk_len, 10_000)?;
+            let _ = bc.take(spk_len as usize)?;
+        }
+
+        let _ = bc.take(4)?; // locktime
+        let end = bc.pos();
+        return Ok((dsha256(&block[start..end]), vin_count));
+    }
+
+    // Segwit: stream stripped serialization directly into hasher.
+    let mut h = Sha256::new();
+    h.update(version.to_le_bytes());
+
+    let vin_count = read_varint(bc)?;
+    ensure_len("tx", "vin_count", vin_count, 50_000)?;
+    sha256_update_varint(&mut h, vin_count);
+
+    for _ in 0..vin_count {
+        let prev_txid = bc.take(32)?;
+        let vout = bc.take(4)?;
+        h.update(prev_txid);
+        h.update(vout);
+
+        let script_len = read_varint(bc)?;
+        ensure_len("tx", "script_sig_len", script_len, 1_000_000)?;
+        sha256_update_varint(&mut h, script_len);
+        let script = bc.take(script_len as usize)?;
+        h.update(script);
+
+        let seq = bc.take(4)?;
+        h.update(seq);
+    }
+
+    let vout_count = read_varint(bc)?;
+    ensure_len("tx", "vout_count", vout_count, 50_000)?;
+    sha256_update_varint(&mut h, vout_count);
+
+    for _ in 0..vout_count {
+        let value = bc.take(8)?;
+        h.update(value);
+
+        let spk_len = read_varint(bc)?;
+        ensure_len("tx", "script_pubkey_len", spk_len, 10_000)?;
+        sha256_update_varint(&mut h, spk_len);
+        let spk = bc.take(spk_len as usize)?;
+        h.update(spk);
+    }
+
+    // Skip witness (not hashed into txid).
+    for _ in 0..vin_count {
+        let n_items = read_varint(bc)?;
+        ensure_len("tx", "witness_item_count", n_items, 10_000)?;
+        for _ in 0..n_items {
+            let item_len = read_varint(bc)?;
+            ensure_len("tx", "witness_item_len", item_len, 4_000_000)?;
+            let _ = bc.take(item_len as usize)?;
+        }
+    }
+
+    let lock = bc.take(4)?;
+    h.update(lock);
+
+    Ok((sha256d_finish(h), vin_count))
+}
+
+/// Skip a transaction and return only the vin_count.
+///
+/// This is cheaper than computing txid and is useful when callers only need
+/// input counts (e.g. undo parsing/validation).
+pub(crate) fn parse_tx_skip_and_vin_count(bc: &mut Cursor) -> Result<u64, String> {
+    let _version = bc.take_u32_le()?;
+
+    // Detect segwit marker/flag.
+    let peek = bc.take_u8()?;
+    let segwit = if peek == 0x00 {
+        let flag = bc.take_u8()?;
+        if flag != 0x01 {
+            return Err(err("INVALID_TX", "invalid segwit flag"));
+        }
+        true
+    } else {
+        bc.i -= 1;
+        false
+    };
+
+    // vin
+    let vin_count = read_varint(bc)?;
+    ensure_len("tx", "vin_count", vin_count, 50_000)?;
+    for _ in 0..vin_count {
+        let _ = bc.take(32)?;
+        let _ = bc.take(4)?;
+        let script_len = read_varint(bc)?;
+        ensure_len("tx", "script_sig_len", script_len, 1_000_000)?;
+        let _ = bc.take(script_len as usize)?;
+        let _ = bc.take(4)?;
+    }
+
+    // vout
+    let vout_count = read_varint(bc)?;
+    ensure_len("tx", "vout_count", vout_count, 50_000)?;
+    for _ in 0..vout_count {
+        let _ = bc.take(8)?;
+        let spk_len = read_varint(bc)?;
+        ensure_len("tx", "script_pubkey_len", spk_len, 10_000)?;
+        let _ = bc.take(spk_len as usize)?;
+    }
+
+    // witness (only present in segwit txs)
+    if segwit {
+        for _ in 0..vin_count {
+            let n_items = read_varint(bc)?;
+            ensure_len("tx", "witness_item_count", n_items, 10_000)?;
+            for _ in 0..n_items {
+                let item_len = read_varint(bc)?;
+                ensure_len("tx", "witness_item_len", item_len, 4_000_000)?;
+                let _ = bc.take(item_len as usize)?;
+            }
+        }
+    }
+
+    let _ = bc.take(4)?; // locktime
+    Ok(vin_count)
+}
+
+pub(crate) fn decode_bip34_height(coinbase_script: &[u8]) -> u64 {
+    if coinbase_script.is_empty() {
+        return 0;
+    }
+    let n = coinbase_script[0] as usize;
+    if n == 0 || 1 + n > coinbase_script.len() || n > 8 {
+        return 0;
+    }
+    let mut val: u64 = 0;
+    for (i, b) in coinbase_script[1..1 + n].iter().enumerate() {
+        val |= (*b as u64) << (8 * i);
+    }
+    val
+}
+
+pub(crate) fn coinbase_extract_script_and_outsum(
+    raw_tx: &[u8],
+) -> Result<(Vec<u8>, u64), String> {
+    let mut c = Cursor::new(raw_tx);
+    let _version = c.take_u32_le()?;
+
+    let p = c.take_u8()?;
+    if p == 0x00 {
+        let _ = c.take_u8()?;
+    } else {
+        c.i -= 1;
+    }
+
+    let vin_n = read_varint(&mut c)?;
+    if vin_n != 1 {
+        return Err(err("INVALID_COINBASE", "coinbase must have exactly 1 input"));
+    }
+
+    let prev = c.take(32)?;
+    let vout = c.take_u32_le()?;
+    if prev.iter().any(|&b| b != 0) || vout != 0xffff_ffff {
+        return Err(err(
+            "INVALID_COINBASE",
+            "coinbase input outpoint must be (32x00, vout=0xffffffff)",
+        ));
+    }
+
+    let script_len = read_varint(&mut c)? as usize;
+    let script = c.take(script_len)?.to_vec();
+
+    let _ = c.take(4)?;
+
+    let vout_n = read_varint(&mut c)?;
+    let mut outsum: u64 = 0;
+    for _ in 0..vout_n {
+        let value = c.take_u64_le()?;
+        outsum = outsum.saturating_add(value);
+        let spk_len = read_varint(&mut c)? as usize;
+        let _ = c.take(spk_len)?;
+    }
+
+    Ok((script, outsum))
+}
+
+
+# =================== btc/block/undo.rs
+
+// src/btc/block/undo.rs
+
+use super::parser;
+
+use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::PublicKey;
+
+// Zero-copy representation for scriptPubKey bytes in undo payload.
+// Some scripts are stored raw inside the undo payload; others are stored in a compressed form and
+// must be expanded. Expanded scripts are appended into a shared arena buffer.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ScriptSrc {
+    Undo,
+    Arena,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScriptSlice {
+    pub src: ScriptSrc,
+    pub start: usize,
+    pub len: usize,
+}
+
+#[allow(dead_code)]
+impl ScriptSlice {
+    #[inline]
+    pub fn as_slice<'a>(&self, undo_payload: &'a [u8], arena: &'a [u8]) -> &'a [u8] {
+        match self.src {
+            ScriptSrc::Undo => &undo_payload[self.start..self.start + self.len],
+            ScriptSrc::Arena => &arena[self.start..self.start + self.len],
+        }
+    }
+}
+
+#[allow(dead_code)]
+type UndoPrevoutsSlices = Vec<Vec<(u64, ScriptSlice)>>;
+
+fn err(code: &str, msg: impl AsRef<str>) -> String {
+    format!("{code}: {}", msg.as_ref())
+}
+
+fn ensure_len(kind: &str, field: &str, val: u64, max: u64) -> Result<(), String> {
+    parser::ensure_len(kind, field, val, max)
+}
+
+fn read_varint_core(c: &mut parser::Cursor) -> Result<u64, String> {
+    // Bitcoin Core base-128 VarInt encoding (serialize.h)
+    let mut n: u64 = 0;
+    loop {
+        let ch = c.take_u8()? as u64;
+        let data = ch & 0x7f;
+        n = (n << 7) | data;
+        if (ch & 0x80) != 0 {
+            n = n.checked_add(1).ok_or_else(|| err("VARINT_OVERFLOW", "core varint overflow"))?;
+            continue;
+        }
+        return Ok(n);
+    }
+}
+
+fn read_compactsize(c: &mut parser::Cursor) -> Result<u64, String> {
+    // Bitcoin CompactSize
+    let first = c.take_u8()?;
+    match first {
+        0x00..=0xfc => Ok(first as u64),
+        0xfd => Ok(c.take_u16_le()? as u64),
+        0xfe => Ok(c.take_u32_le()? as u64),
+        0xff => Ok(c.take_u64_le()?),
+    }
+}
+
+// ------------------------------------------------------------
+// Hot-path helpers
+// ------------------------------------------------------------
+/// Ultra-cheap read of the number of `CTxUndo` entries in a `CBlockUndo` payload.
+///
+/// This reads only the leading CompactSize (`nTxUndo`) and performs the same sanity bound
+/// used by the strict parser.
+///
+/// Intended for fast blk↔rev pairing in `block/io.rs`.
+#[inline]
+pub(crate) fn undo_txundo_count_fast(undo_payload: &[u8]) -> Result<u64, String> {
+    let mut c = parser::Cursor::new(undo_payload);
+    let n = read_compactsize(&mut c)?;
+    ensure_len("undo", "n_txundo", n, 200_000)?;
+    Ok(n)
+}
+
+/// Even cheaper variant that operates on a byte slice cursor and also returns bytes consumed.
+///
+/// This avoids constructing `parser::Cursor` and is useful if you already have a `&[u8]` cursor.
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn undo_txundo_count_fast_bytes(input: &mut &[u8]) -> Result<u64, String> {
+    if input.is_empty() {
+        return Err(err("COMPACTSIZE_EOF", "empty input"));
+    }
+    let first = input[0];
+    *input = &input[1..];
+
+    let n = match first {
+        0x00..=0xfc => first as u64,
+        0xfd => {
+            if input.len() < 2 {
+                return Err(err("COMPACTSIZE_EOF", "0xfd but missing 2 bytes"));
+            }
+            let v = u16::from_le_bytes([input[0], input[1]]) as u64;
+            *input = &input[2..];
+            v
+        }
+        0xfe => {
+            if input.len() < 4 {
+                return Err(err("COMPACTSIZE_EOF", "0xfe but missing 4 bytes"));
+            }
+            let v = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as u64;
+            *input = &input[4..];
+            v
+        }
+        0xff => {
+            if input.len() < 8 {
+                return Err(err("COMPACTSIZE_EOF", "0xff but missing 8 bytes"));
+            }
+            let v = u64::from_le_bytes([
+                input[0], input[1], input[2], input[3],
+                input[4], input[5], input[6], input[7],
+            ]);
+            *input = &input[8..];
+            v
+        }
+    };
+
+    ensure_len("undo", "n_txundo", n, 200_000)?;
+    Ok(n)
+}
+
+
+fn decompress_amount(x: u64) -> u64 {
+    if x == 0 {
+        return 0;
+    }
+    let mut x = x - 1;
+    let e = (x % 10) as u32;
+    x /= 10;
+
+    let mut n: u64;
+    if e < 9 {
+        let d = (x % 9) + 1;
+        x /= 9;
+        n = x * 10 + d;
+    } else {
+        n = x + 1;
+    }
+
+    for _ in 0..e {
+        n *= 10;
+    }
+    n
+}
+
+fn decompress_uncompressed_pubkey_from_x(x32: &[u8], y_is_odd: bool) -> Result<Vec<u8>, String> {
+    if x32.len() != 32 {
+        return Err(err("INVALID_PUBKEY", "x32 must be 32 bytes"));
+    }
+
+    let mut comp = [0u8; 33];
+    comp[0] = if y_is_odd { 0x03 } else { 0x02 };
+    comp[1..].copy_from_slice(x32);
+
+    let pk = PublicKey::from_sec1_bytes(&comp)
+        .map_err(|_| err("INVALID_PUBKEY", "failed to decompress pubkey from x"))?;
+
+    let enc = pk.to_encoded_point(false);
+    let bytes = enc.as_bytes();
+    if bytes.len() != 65 || bytes[0] != 0x04 {
+        return Err(err("INVALID_PUBKEY", "unexpected uncompressed encoding"));
+    }
+
+    Ok(bytes.to_vec())
+}
+
+
+// Zero-copy variant: returns a ScriptSlice into either undo_payload (raw scripts) or the arena
+// (expanded standard scripts). No per-script Vec allocations.
+#[allow(dead_code)]
+fn read_compressed_script_slice(c: &mut parser::Cursor, arena: &mut Vec<u8>) -> Result<ScriptSlice, String> {
+    // ScriptCompressor uses Bitcoin Core base-128 VarInt (not CompactSize).
+    let nsize = read_varint_core(c)?;
+
+    match nsize {
+        0 => {
+            // P2PKH
+            let h160 = c.take(20)?;
+            let start = arena.len();
+            arena.extend_from_slice(&[0x76, 0xa9, 0x14]);
+            arena.extend_from_slice(h160);
+            arena.extend_from_slice(&[0x88, 0xac]);
+            let len = arena.len() - start;
+            Ok(ScriptSlice { src: ScriptSrc::Arena, start, len })
+        }
+        1 => {
+            // P2SH
+            let h160 = c.take(20)?;
+            let start = arena.len();
+            arena.extend_from_slice(&[0xa9, 0x14]);
+            arena.extend_from_slice(h160);
+            arena.push(0x87);
+            let len = arena.len() - start;
+            Ok(ScriptSlice { src: ScriptSrc::Arena, start, len })
+        }
+        2 | 3 => {
+            // P2PK (compressed pubkey)
+            let x = c.take(32)?;
+            let prefix = if nsize == 2 { 0x02 } else { 0x03 };
+            let start = arena.len();
+            arena.push(0x21);
+            arena.push(prefix);
+            arena.extend_from_slice(x);
+            arena.push(0xac);
+            let len = arena.len() - start;
+            Ok(ScriptSlice { src: ScriptSrc::Arena, start, len })
+        }
+        4 | 5 => {
+            // P2PK (uncompressed pubkey)
+            let x = c.take(32)?;
+            let y_is_odd = nsize == 5;
+            let pubkey65 = decompress_uncompressed_pubkey_from_x(x, y_is_odd)?;
+            let start = arena.len();
+            arena.push(0x41);
+            arena.extend_from_slice(&pubkey65);
+            arena.push(0xac);
+            let len = arena.len() - start;
+            Ok(ScriptSlice { src: ScriptSrc::Arena, start, len })
+        }
+        _ => {
+            if nsize < 6 {
+                return Err(err("INVALID_SCRIPT_COMPRESSION", "nsize < 6 unexpected"));
+            }
+
+            let raw_len_u64 = nsize - 6;
+            ensure_len("undo", "compressed_script_raw_len", raw_len_u64, 100_000)?;
+
+            let raw_len: usize = usize::try_from(raw_len_u64)
+                .map_err(|_| err("LEN_OVERFLOW", format!("raw_len too large for usize: {raw_len_u64}")))?;
+
+            // Raw script is already present in the undo payload; return a view into it.
+            let start = c.pos();
+            let _ = c.take(raw_len)?;
+            Ok(ScriptSlice { src: ScriptSrc::Undo, start, len: raw_len })
+        }
+    }
+}
+
+
+#[allow(dead_code)]
+fn read_one_inundo_slice(rc: &mut parser::Cursor, arena: &mut Vec<u8>) -> Result<(u64, ScriptSlice), String> {
+    let ncode = read_varint_core(rc)?;
+    let height = ncode >> 1;
+
+    if height > 0 {
+        let _tx_version = read_varint_core(rc)?;
+    }
+
+    let comp_amt = read_varint_core(rc)?;
+    let spk = read_compressed_script_slice(rc, arena)?;
+    let value_sats = decompress_amount(comp_amt);
+
+    if spk.len > 100_000 {
+        return Err(err("INSANE_LEN", format!("spk too large: {}", spk.len)));
+    }
+
+    Ok((value_sats, spk))
+}
+
+#[allow(dead_code)]
+fn read_undo_for_block_from_cursor_slices(
+    rc: &mut parser::Cursor,
+    vin_counts_non_cb: &[u64],
+    arena: &mut Vec<u8>,
+) -> Result<UndoPrevoutsSlices, String> {
+    let n_txundo = read_compactsize(rc)?;
+    ensure_len("undo", "n_txundo", n_txundo, 200_000)?;
+
+    let expected = vin_counts_non_cb.len() as u64;
+
+    let mut has_cb_undo = false;
+    if n_txundo == expected {
+        // ok
+    } else if n_txundo == expected.saturating_add(1) {
+        has_cb_undo = true;
+    } else {
+        return Err(err(
+            "UNDO_MISMATCH",
+            format!(
+                "undo txundo count mismatch: undo={}, expected={} (or {} if coinbase included)",
+                n_txundo,
+                expected,
+                expected.saturating_add(1)
+            ),
+        ));
+    }
+
+    if has_cb_undo {
+        let cb_vin_n = read_compactsize(rc)?;
+        if cb_vin_n != 0 {
+            return Err(err(
+                "UNDO_MISMATCH",
+                format!("coinbase undo present but vin_n != 0: got={cb_vin_n}"),
+            ));
+        }
+    }
+
+    let mut all: UndoPrevoutsSlices = Vec::with_capacity(vin_counts_non_cb.len());
+
+    for (txundo_idx, &vin_expected) in vin_counts_non_cb.iter().enumerate() {
+        let vin_n = read_compactsize(rc)?;
+        ensure_len("undo", "vin_count", vin_n, 100_000)?;
+
+        if vin_n != vin_expected {
+            return Err(err(
+                "UNDO_MISMATCH",
+                format!(
+                    "undo vin count mismatch: txundo_idx={} undo={} expected={}",
+                    txundo_idx, vin_n, vin_expected
+                ),
+            ));
+        }
+
+        let mut ins: Vec<(u64, ScriptSlice)> = Vec::with_capacity(vin_n as usize);
+        for _ in 0..(vin_n as usize) {
+            ins.push(read_one_inundo_slice(rc, arena)?);
+        }
+        all.push(ins);
+    }
+
+    Ok(all)
+}
+
+// Zero-copy strict parser: returns ScriptSlice references that can be materialized as &[u8]
+// using ScriptSlice::as_slice(undo_payload, arena).
+#[allow(dead_code)]
+pub(crate) fn parse_undo_payload_strict_slices(
+    undo_payload: &[u8],
+    vin_counts_non_cb: &[u64],
+    arena: &mut Vec<u8>,
+) -> Result<UndoPrevoutsSlices, String> {
+    let mut uc = parser::Cursor::new(undo_payload);
+    let v = read_undo_for_block_from_cursor_slices(&mut uc, vin_counts_non_cb, arena)?;
+    if uc.remaining() != 0 {
+        return Err(err(
+            "UNDO_TRAILING_BYTES",
+            format!("undo payload has {} trailing bytes", uc.remaining()),
+        ));
+    }
+    Ok(v)
+}
+
+pub(crate) fn extract_vin_count(raw_tx: &[u8]) -> Result<u64, String> {
+    let mut c = parser::Cursor::new(raw_tx);
+    let _ver = c.take_u32_le()?;
+
+    let p = c.take_u8()?;
+    if p == 0x00 {
+        let _f = c.take_u8()?;
+    } else {
+        c.i -= 1;
+    }
+
+    parser::read_varint(&mut c)
+}
+
+pub(crate) fn extract_vin_count_from_slice(raw_tx: &[u8]) -> Result<u64, String> {
+    extract_vin_count(raw_tx)
+}
+
+#[inline]
+fn skip_compressed_script(rc: &mut parser::Cursor) -> Result<(), String> {
+    // ScriptCompressor uses Bitcoin Core base-128 VarInt (not CompactSize).
+    let nsize = read_varint_core(rc)?;
+
+    match nsize {
+        0 | 1 => {
+            // P2PKH or P2SH: 20-byte hash160
+            let _ = rc.take(20)?;
+            Ok(())
+        }
+        2 | 3 | 4 | 5 => {
+            // P2PK: 32-byte X coordinate (compressed or uncompressed key)
+            let _ = rc.take(32)?;
+            Ok(())
+        }
+        _ => {
+            if nsize < 6 {
+                return Err(err("INVALID_SCRIPT_COMPRESSION", "nsize < 6 unexpected"));
+            }
+            let raw_len_u64 = nsize - 6;
+            ensure_len("undo", "compressed_script_raw_len", raw_len_u64, 100_000)?;
+            let raw_len: usize = usize::try_from(raw_len_u64)
+                .map_err(|_| err("LEN_OVERFLOW", format!("raw_len too large for usize: {raw_len_u64}")))?;
+            let _ = rc.take(raw_len)?;
+            Ok(())
+        }
+    }
+}
+
+#[inline]
+fn skip_one_inundo(rc: &mut parser::Cursor) -> Result<(), String> {
+    // Matches read_one_inundo/read_one_inundo_slice structure:
+    //   ncode (varint_core)
+    //   optional tx_version (varint_core) if height>0
+    //   comp_amt (varint_core)
+    //   compressed_script (varint_core + payload)
+    let ncode = read_varint_core(rc)?;
+    let height = ncode >> 1;
+    if height > 0 {
+        let _tx_version = read_varint_core(rc)?;
+    }
+    let _comp_amt = read_varint_core(rc)?;
+    skip_compressed_script(rc)?;
+    Ok(())
+}
+
+fn validate_undo_payload_strict_structure(
+    undo_payload: &[u8],
+    vin_counts_non_cb: &[u64],
+) -> Result<(), String> {
+    let mut uc = parser::Cursor::new(undo_payload);
+
+    // CBlockUndo: CompactSize(nTxUndo)
+    // Usually tx_count - 1, but some fixtures include an extra empty CTxUndo for coinbase.
+    let n_txundo = read_compactsize(&mut uc)?;
+    ensure_len("undo", "n_txundo", n_txundo, 200_000)?;
+
+    let expected = vin_counts_non_cb.len() as u64;
+
+    let mut has_cb_undo = false;
+    if n_txundo == expected {
+        // ok
+    } else if n_txundo == expected.saturating_add(1) {
+        has_cb_undo = true;
+    } else {
+        return Err(err(
+            "UNDO_MISMATCH",
+            format!(
+                "undo txundo count mismatch: undo={}, expected={} (or {} if coinbase included)",
+                n_txundo,
+                expected,
+                expected.saturating_add(1)
+            ),
+        ));
+    }
+
+    if has_cb_undo {
+        let cb_vin_n = read_compactsize(&mut uc)?;
+        if cb_vin_n != 0 {
+            return Err(err(
+                "UNDO_MISMATCH",
+                format!("coinbase undo present but vin_n != 0: got={cb_vin_n}"),
+            ));
+        }
+    }
+
+    for (txundo_idx, &vin_expected) in vin_counts_non_cb.iter().enumerate() {
+        let vin_n = read_compactsize(&mut uc)?;
+        ensure_len("undo", "vin_count", vin_n, 100_000)?;
+
+        if vin_n != vin_expected {
+            return Err(err(
+                "UNDO_MISMATCH",
+                format!(
+                    "undo vin count mismatch: txundo_idx={} undo={} expected={}",
+                    txundo_idx, vin_n, vin_expected
+                ),
+            ));
+        }
+
+        // Skip vin_n inputs.
+        for _ in 0..(vin_n as usize) {
+            skip_one_inundo(&mut uc)?;
+        }
+    }
+
+    if uc.remaining() != 0 {
+        return Err(err(
+            "UNDO_TRAILING_BYTES",
+            format!("undo payload has {} trailing bytes", uc.remaining()),
+        ));
+    }
+
+    Ok(())
+}
+
+// --- Drop-in replacement for your existing function ---
+// This preserves the external signature but makes it much faster.
+// It still computes vin_counts_non_cb the same way as before; a further speedup
+// is possible by adding a parser helper that returns vin_count during skip.
+
+pub(crate) fn validate_undo_payload_against_block(
+    block: &[u8],
+    undo_payload: &[u8],
+) -> Result<(), String> {
+    let mut bc = parser::Cursor::new(block);
+
+    if bc.remaining() < 80 {
+        return Err(err("INVALID_BLOCK", "block payload too small for header"));
+    }
+
+    // Skip header (no allocation)
+    let _header = bc.take(80)?;
+
+    let tx_count = parser::read_varint(&mut bc)?;
+    if tx_count == 0 {
+        return Err(err("INVALID_BLOCK", "block has zero transactions"));
+    }
+
+    // We only need vin-counts for non-coinbase txs.
+    // Parse each tx as a slice range without copying.
+    let mut vin_counts_non_cb: Vec<u64> =
+        Vec::with_capacity((tx_count as usize).saturating_sub(1));
+
+    for tx_idx in 0..(tx_count as usize) {
+        let start = bc.pos();
+        let _txid_le = parser::parse_tx_skip_and_txid_le(block, &mut bc)?;
+        let end = bc.pos();
+
+        if tx_idx == 0 {
+            // coinbase: ignore
+            continue;
+        }
+
+        vin_counts_non_cb.push(extract_vin_count_from_slice(&block[start..end])?);
+    }
+
+    // FAST structural validation (no script allocations, no pubkey decompression)
+    validate_undo_payload_strict_structure(undo_payload, &vin_counts_non_cb)
+}
+
+
+# =================== btc/block/report.rs
+
+// src/btc/block/report.rs
+
+use serde::Serialize;
+use std::collections::BTreeMap;
+
+use crate::btc::tx::TxReport;
+
+#[derive(Debug, Serialize)]
+pub struct BlockReport {
+    pub ok: bool,
+    /// Always "block" in block parsing mode.
+    pub mode: &'static str,
+    pub block_header: BlockHeaderReport,
+    pub tx_count: u64,
+    pub coinbase: CoinbaseReport,
+    pub transactions: Vec<TxReport>,
+    pub block_stats: BlockStatsReport,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BlockHeaderReport {
+    pub version: u32,
+    pub prev_block_hash: String,
+    pub merkle_root: String,
+    pub merkle_root_valid: bool,
+    pub timestamp: u32,
+    pub bits: String,
+    pub nonce: u32,
+    pub block_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CoinbaseReport {
+    pub bip34_height: u64,
+    pub coinbase_script_hex: String,
+    pub total_output_sats: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BlockStatsReport {
+    pub total_fees_sats: u64,
+    pub total_weight: u64,
+    pub avg_fee_rate_sat_vb: f64,
+    /// Map of script_type -> count. Using BTreeMap keeps JSON output deterministic.
+    pub script_type_summary: BTreeMap<String, u64>,
+}
+
+
+# =================== btc/mod.rs
+
+// src/btc/mod.rs
+
+// This module organizes Bitcoin functionality.
+// Submodules define transaction and block analysis.
+// Accessible as `chainlens::btc::tx` and `chainlens::btc::block`.
+pub mod block;
+pub mod tx;
+
+
+# =================== btc/web/static/index.html
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ChainLens — Bitcoin Transaction Visualizer</title>
+  <script>
+    // Minimal "utility" CSS (no external deps). Inspired by Tailwind spacing/typography.
+    const css = `
+      :root{--bg:#0b0f19;--panel:#111827;--panel2:#0f172a;--text:#e5e7eb;--muted:#9ca3af;--line:#1f2937;--ok:#34d399;--warn:#fbbf24;--bad:#fb7185;--accent:#60a5fa;}
+      *{box-sizing:border-box} html,body{height:100%}
+      body{margin:0;font:14px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; background:radial-gradient(1200px 800px at 20% 0%, #0b1227 0%, var(--bg) 55%); color:var(--text)}
+      a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+      .wrap{max-width:1180px;margin:0 auto;padding:24px}
+      .top{display:flex;gap:14px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}
+      .brand{display:flex;gap:12px;align-items:center}
+      .logo{width:40px;height:40px;border-radius:14px;background:linear-gradient(135deg,#2563eb,#22c55e);box-shadow:0 10px 24px rgba(0,0,0,.35)}
+      h1{margin:0;font-size:18px;letter-spacing:.2px}
+      .sub{margin-top:2px;color:var(--muted);font-size:12.5px}
+      .pill{display:inline-flex;gap:8px;align-items:center;border:1px solid var(--line);background:rgba(17,24,39,.65);padding:6px 10px;border-radius:999px;color:var(--muted)}
+      .pill b{color:var(--text);font-weight:600}
+      .grid{display:grid;grid-template-columns:1.1fr .9fr;gap:14px;margin-top:16px}
+      @media (max-width: 980px){.grid{grid-template-columns:1fr}}
+      .card{background:rgba(17,24,39,.75);border:1px solid var(--line);border-radius:18px;box-shadow:0 20px 45px rgba(0,0,0,.25)}
+      .card .hd{padding:14px 14px 10px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:10px}
+      .card .bd{padding:14px}
+      .title{font-size:13px;color:var(--muted)}
+      .btn{cursor:pointer;border:1px solid var(--line);background:rgba(15,23,42,.9);color:var(--text);padding:10px 12px;border-radius:14px;display:inline-flex;gap:8px;align-items:center}
+      .btn:hover{border-color:#334155}
+      .btn:disabled{opacity:.55;cursor:not-allowed}
+      .btn.primary{background:linear-gradient(135deg,#2563eb,#22c55e);border-color:transparent}
+      .btn.ghost{background:transparent}
+      .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+      textarea,input,select{width:100%;border:1px solid var(--line);background:rgba(15,23,42,.9);color:var(--text);border-radius:14px;padding:10px 12px;outline:none}
+      textarea{min-height:160px;resize:vertical}
+      label{display:block;color:var(--muted);font-size:12px;margin-bottom:6px}
+      .kpi{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+      @media (max-width: 980px){.kpi{grid-template-columns:repeat(2,1fr)}}
+      .k{padding:12px;border:1px solid var(--line);border-radius:16px;background:rgba(15,23,42,.7)}
+      .k .n{color:var(--muted);font-size:11.5px}
+      .k .v{margin-top:6px;font-size:16px;font-weight:650}
+      .k .s{margin-top:3px;color:var(--muted);font-size:12px}
+      .bad{color:var(--bad)} .ok{color:var(--ok)} .warn{color:var(--warn)}
+      .tabs{display:flex;gap:8px;flex-wrap:wrap}
+      .tab{padding:7px 10px;border-radius:999px;border:1px solid var(--line);background:rgba(15,23,42,.7);color:var(--muted);cursor:pointer}
+      .tab.active{background:rgba(96,165,250,.18);color:var(--text);border-color:rgba(96,165,250,.35)}
+      table{width:100%;border-collapse:separate;border-spacing:0 8px}
+      th{color:var(--muted);font-size:11.5px;text-align:left;font-weight:600;padding:0 8px}
+      td{padding:10px 8px;background:rgba(15,23,42,.7);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+      tr td:first-child{border-left:1px solid var(--line);border-top-left-radius:14px;border-bottom-left-radius:14px}
+      tr td:last-child{border-right:1px solid var(--line);border-top-right-radius:14px;border-bottom-right-radius:14px}
+      code, pre{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+      pre{margin:0;padding:12px;border-radius:16px;border:1px solid var(--line);background:rgba(15,23,42,.85);overflow:auto;max-height:360px}
+      .mini{font-size:12px;color:var(--muted)}
+      .bar{height:10px;border-radius:999px;background:rgba(148,163,184,.18);overflow:hidden;border:1px solid rgba(148,163,184,.15)}
+      .bar > div{height:100%;background:linear-gradient(90deg,#60a5fa,#22c55e)}
+      .svgbox{border:1px solid var(--line);background:rgba(15,23,42,.6);border-radius:18px;overflow:hidden}
+      .hint{color:var(--muted);font-size:12px}
+      .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:22px;background:rgba(17,24,39,.92);border:1px solid var(--line);padding:10px 12px;border-radius:14px;box-shadow:0 18px 40px rgba(0,0,0,.35);opacity:0;pointer-events:none;transition:opacity .18s}
+      .toast.show{opacity:1}
+    `;
+    const style = document.createElement('style'); style.textContent = css; document.head.appendChild(style);
+  </script>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div class="brand">
+        <div class="logo"></div>
+        <div>
+          <h1>ChainLens</h1>
+          <div class="sub">Bitcoin transaction & block analysis — fast, deterministic, fixture-friendly.</div>
+        </div>
+      </div>
+      <div class="row">
+        <div class="pill"><span>API</span> <b id="apiState">checking…</b></div>
+        <button class="btn" id="btnHealth">Check health</button>
+        <a class="btn ghost" href="/api/health" target="_blank" rel="noopener">/api/health</a>
+      </div>
+    </div>
+
+    <div class="grid">
+      <!-- Left: Input / Story -->
+      <div class="card">
+        <div class="hd">
+          <div>
+            <div class="title">Input</div>
+            <div style="font-weight:650;font-size:14px">Analyze a transaction fixture</div>
+          </div>
+          <div class="row">
+            <select id="network">
+              <option value="mainnet">mainnet</option>
+              <option value="testnet">testnet</option>
+              <option value="signet">signet</option>
+              <option value="regtest">regtest</option>
+            </select>
+            <button class="btn primary" id="btnAnalyze">Analyze</button>
+          </div>
+        </div>
+        <div class="bd">
+          <div class="row" style="justify-content:space-between;align-items:flex-end">
+            <div style="flex:1">
+              <label>Paste fixture JSON (recommended)</label>
+              <textarea id="fixture" spellcheck="false" placeholder='{"network":"mainnet","raw_tx":"...","prevouts":[...]}'></textarea>
+              <div class="hint" style="margin-top:8px">Tip: you can also load a file. The UI posts to <code>/api/analyze</code>.</div>
+            </div>
+          </div>
+
+          <div class="row" style="margin-top:10px">
+            <input type="file" id="file" accept="application/json" />
+            <button class="btn" id="btnLoad">Load JSON</button>
+            <button class="btn" id="btnExample">Example</button>
+            <button class="btn" id="btnClear">Clear</button>
+          </div>
+
+          <div style="margin-top:14px" class="tabs">
+            <div class="tab active" data-tab="story">Story</div>
+            <div class="tab" data-tab="graph">Flow</div>
+            <div class="tab" data-tab="raw">Raw JSON</div>
+          </div>
+
+          <div id="tab_story" style="margin-top:12px">
+            <div class="mini" id="storyText">Run an analysis to see a human-readable summary here.</div>
+          </div>
+
+          <div id="tab_graph" style="display:none;margin-top:12px">
+            <div class="svgbox">
+              <svg id="flow" width="100%" height="260" viewBox="0 0 980 260" preserveAspectRatio="none"></svg>
+            </div>
+            <div class="hint" style="margin-top:8px">Left = inputs (prevouts), Right = outputs. Fee is shown as a separate sink.</div>
+          </div>
+
+          <div id="tab_raw" style="display:none;margin-top:12px">
+            <pre id="rawOut">{}</pre>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: Results -->
+      <div class="card">
+        <div class="hd">
+          <div>
+            <div class="title">Report</div>
+            <div style="font-weight:650;font-size:14px">Transaction summary</div>
+          </div>
+          <div class="row">
+            <button class="btn" id="btnCopy">Copy JSON</button>
+            <button class="btn" id="btnToggleTech">Show technical details</button>
+          </div>
+        </div>
+        <div class="bd">
+          <div class="kpi">
+            <div class="k"><div class="n">TXID</div><div class="v" id="k_txid">—</div><div class="s" id="k_txid_s"></div></div>
+            <div class="k"><div class="n">Fee</div><div class="v" id="k_fee">—</div><div class="s" id="k_feerate">—</div></div>
+            <div class="k"><div class="n">Size</div><div class="v" id="k_vb">—</div><div class="s" id="k_wt">—</div></div>
+            <div class="k"><div class="n">SegWit</div><div class="v" id="k_sw">—</div><div class="s" id="k_sw_s">—</div></div>
+          </div>
+
+          <div style="margin-top:12px" class="row">
+            <div style="flex:1">
+              <div class="mini">Warnings</div>
+              <div id="warnings" class="mini" style="margin-top:6px">—</div>
+            </div>
+          </div>
+
+          <div style="margin-top:12px" class="tabs">
+            <div class="tab active" data-tab2="io">Inputs & Outputs</div>
+            <div class="tab" data-tab2="scripts">Scripts</div>
+            <div class="tab" data-tab2="tech">Technical</div>
+          </div>
+
+          <div id="tab2_io" style="margin-top:12px">
+            <div class="mini">Inputs</div>
+            <div style="margin-top:6px;overflow:auto">
+              <table id="tbl_in"><thead><tr><th>#</th><th>Spend type</th><th>Value (sats)</th><th>Outpoint</th></tr></thead><tbody></tbody></table>
+            </div>
+            <div class="mini" style="margin-top:12px">Outputs</div>
+            <div style="margin-top:6px;overflow:auto">
+              <table id="tbl_out"><thead><tr><th>#</th><th>Script type</th><th>Value (sats)</th><th>Address/Asm</th></tr></thead><tbody></tbody></table>
+            </div>
+          </div>
+
+          <div id="tab2_scripts" style="display:none;margin-top:12px">
+            <div class="mini">Script type distribution (by output count)</div>
+            <div style="margin-top:8px" id="scriptBars"></div>
+          </div>
+
+          <div id="tab2_tech" style="display:none;margin-top:12px">
+            <div class="mini">Locktimes</div>
+            <div style="margin-top:8px" class="row">
+              <div class="k" style="flex:1"><div class="n">Locktime</div><div class="v" id="t_lock">—</div><div class="s" id="t_lock_s">—</div></div>
+              <div class="k" style="flex:1"><div class="n">RBF</div><div class="v" id="t_rbf">—</div><div class="s" id="t_rbf_s">—</div></div>
+            </div>
+            <div style="margin-top:10px" class="mini">Full report JSON</div>
+            <div style="margin-top:8px"><pre id="jsonFull">{}</pre></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    // ---------- helpers ----------
+    const $ = (id) => document.getElementById(id);
+    const toast = (msg) => {
+      const t = $('toast');
+      t.textContent = msg;
+      t.classList.add('show');
+      setTimeout(() => t.classList.remove('show'), 1200);
+    };
+
+    function safeJsonParse(s) {
+      try { return [JSON.parse(s), null]; } catch (e) { return [null, e]; }
+    }
+
+    function sats(n){
+      if (n === null || n === undefined) return '—';
+      const x = Number(n);
+      if (!Number.isFinite(x)) return String(n);
+      return x.toLocaleString('en-US');
+    }
+
+    function shortHex(h, n=10){
+      if (!h || typeof h !== 'string') return '—';
+      if (h.length <= n*2) return h;
+      return h.slice(0,n) + '…' + h.slice(-n);
+    }
+
+    function setText(id, v){ $(id).textContent = v; }
+
+    // ---------- tabs ----------
+    document.querySelectorAll('[data-tab]').forEach(el => {
+      el.addEventListener('click', () => {
+        document.querySelectorAll('[data-tab]').forEach(x => x.classList.remove('active'));
+        el.classList.add('active');
+        ['story','graph','raw'].forEach(t => {
+          $('tab_'+t).style.display = (t === el.dataset.tab) ? '' : 'none';
+        });
+      });
+    });
+
+    document.querySelectorAll('[data-tab2]').forEach(el => {
+      el.addEventListener('click', () => {
+        document.querySelectorAll('[data-tab2]').forEach(x => x.classList.remove('active'));
+        el.classList.add('active');
+        ['io','scripts','tech'].forEach(t => {
+          $('tab2_'+t).style.display = (t === el.dataset.tab2) ? '' : 'none';
+        });
+      });
+    });
+
+    // ---------- health ----------
+    async function checkHealth(){
+      try {
+        const r = await fetch('/api/health', {cache:'no-store'});
+        const j = await r.json();
+        if (r.ok && j && j.ok === true) {
+          setText('apiState', 'ok');
+          $('apiState').className = 'ok';
+          return true;
+        }
+        setText('apiState', 'error');
+        $('apiState').className = 'bad';
+        return false;
+      } catch {
+        setText('apiState', 'offline');
+        $('apiState').className = 'bad';
+        return false;
+      }
+    }
+
+    $('btnHealth').addEventListener('click', checkHealth);
+    checkHealth();
+
+    // ---------- load file ----------
+    $('btnLoad').addEventListener('click', async () => {
+      const f = $('file').files?.[0];
+      if (!f) return toast('Pick a JSON file first');
+      const txt = await f.text();
+      $('fixture').value = txt;
+      toast('Loaded');
+    });
+
+    $('btnExample').addEventListener('click', () => {
+      $('fixture').value = JSON.stringify({
+        network: $('network').value,
+        raw_tx: "<paste-raw-tx-hex-here>",
+        prevouts: [
+          { txid: "<txid>", vout: 0, value_sats: 100000, script_pubkey_hex: "<hex>" }
+        ]
+      }, null, 2);
+      toast('Example inserted');
+    });
+
+    $('btnClear').addEventListener('click', () => {
+      $('fixture').value = '';
+      $('rawOut').textContent = '{}';
+      $('jsonFull').textContent = '{}';
+      toast('Cleared');
+    });
+
+    // ---------- copy JSON ----------
+    $('btnCopy').addEventListener('click', async () => {
+      const txt = $('jsonFull').textContent;
+      await navigator.clipboard.writeText(txt);
+      toast('Copied');
+    });
+
+    // ---------- technical toggle ----------
+    let showTech = false;
+    $('btnToggleTech').addEventListener('click', () => {
+      showTech = !showTech;
+      $('btnToggleTech').textContent = showTech ? 'Hide technical details' : 'Show technical details';
+      if (showTech){
+        document.querySelector('[data-tab2="tech"]').click();
+      } else {
+        document.querySelector('[data-tab2="io"]').click();
+      }
+    });
+
+    // ---------- render ----------
+    function render(report){
+      const txid = report?.txid || report?.txid_hex || report?.id || '—';
+      const fee = report?.fee_sats;
+      const feerate = report?.fee_rate_sat_vb;
+      const vbytes = report?.vbytes;
+      const weight = report?.weight;
+      const is_segwit = report?.is_segwit;
+      const savings = report?.segwit_savings;
+
+      setText('k_txid', shortHex(txid, 14));
+      setText('k_txid_s', txid && txid !== '—' ? txid : '');
+      setText('k_fee', fee == null ? '—' : (sats(fee) + ' sats'));
+      setText('k_feerate', feerate == null ? '—' : (Number(feerate).toFixed(1) + ' sat/vB'));
+      setText('k_vb', vbytes == null ? '—' : (sats(vbytes) + ' vB'));
+      setText('k_wt', weight == null ? '—' : (sats(weight) + ' WU'));
+      setText('k_sw', is_segwit ? 'yes' : 'no');
+      setText('k_sw_s', savings ? (sats(savings.saved_vbytes) + ' vB saved') : '');
+
+      const ws = report?.warnings || [];
+      if (!ws.length) {
+        $('warnings').innerHTML = '<span class="ok">none</span>';
+      } else {
+        $('warnings').innerHTML = ws.map(w => {
+          const code = w.code || w;
+          const msg = w.message ? ` — ${w.message}` : '';
+          return `<span class="warn"><b>${code}</b>${msg}</span>`;
+        }).join('<br/>');
+      }
+
+      const inBody = $('tbl_in').querySelector('tbody');
+      inBody.innerHTML = '';
+      const vins = report?.inputs || report?.vin || [];
+      vins.forEach((vin, idx) => {
+        const spend = vin?.spend_type || vin?.type || '—';
+        const value = vin?.prevout_value_sats ?? vin?.value_sats ?? vin?.value ?? null;
+        const op = vin?.outpoint || (vin?.prevout_txid && (vin.prevout_txid + ':' + vin.prevout_vout));
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${idx}</td>
+          <td><code>${spend}</code></td>
+          <td>${sats(value)}</td>
+          <td><code>${op ? shortHex(String(op), 16) : '—'}</code></td>
+        `;
+        inBody.appendChild(tr);
+      });
+
+      const outBody = $('tbl_out').querySelector('tbody');
+      outBody.innerHTML = '';
+      const vouts = report?.outputs || report?.vout || [];
+      vouts.forEach((vout, idx) => {
+        const st = vout?.script_type || vout?.type || '—';
+        const value = vout?.value_sats ?? vout?.value ?? null;
+        const addr = vout?.address || vout?.script_asm || vout?.script_pubkey_asm || '—';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${idx}</td>
+          <td><code>${st}</code></td>
+          <td>${sats(value)}</td>
+          <td><code>${String(addr).slice(0,64)}${String(addr).length>64?'…':''}</code></td>
+        `;
+        outBody.appendChild(tr);
+      });
+
+      const dist = report?.script_type_summary || report?.output_script_type_summary || null;
+      const sb = $('scriptBars');
+      sb.innerHTML = '';
+      if (dist && typeof dist === 'object') {
+        const entries = Object.entries(dist).sort((a,b)=>b[1]-a[1]);
+        const total = entries.reduce((s,[,v])=>s+Number(v||0),0) || 1;
+        entries.forEach(([k,v]) => {
+          const pct = (Number(v||0)/total)*100;
+          const div = document.createElement('div');
+          div.style.marginBottom = '10px';
+          div.innerHTML = `
+            <div class="row" style="justify-content:space-between">
+              <div><code>${k}</code></div>
+              <div class="mini">${v} (${pct.toFixed(1)}%)</div>
+            </div>
+            <div class="bar" style="margin-top:6px"><div style="width:${pct}%"></div></div>
+          `;
+          sb.appendChild(div);
+        });
+      } else {
+        sb.innerHTML = '<div class="mini">No script summary available in the report.</div>';
+      }
+
+      const ltType = report?.locktime_type;
+      const ltVal = report?.locktime_value;
+      setText('t_lock', ltVal == null ? '—' : String(ltVal));
+      setText('t_lock_s', ltType ? String(ltType) : '');
+      const rbf = report?.rbf_signaling;
+      setText('t_rbf', rbf === true ? 'signaling' : (rbf === false ? 'no' : '—'));
+      setText('t_rbf_s', rbf === true ? 'At least one input opts in (BIP125).' : '');
+
+      const insum = report?.inputs_sum_sats ?? report?.total_in_sats;
+      const outsum = report?.outputs_sum_sats ?? report?.total_out_sats;
+      const feeText = fee == null ? 'an unknown fee' : (sats(fee) + ' sats');
+      const rateText = feerate == null ? 'unknown fee rate' : (Number(feerate).toFixed(1) + ' sat/vB');
+      const parts = [];
+      if (txid && txid !== '—') parts.push(`<b>TXID</b> <code>${txid}</code>.`);
+      if (insum != null && outsum != null) parts.push(`Moves <b>${sats(insum)}</b> sats in and <b>${sats(outsum)}</b> sats out.`);
+      parts.push(`Pays <b>${feeText}</b> at <b>${rateText}</b>.`);
+      parts.push(`SegWit: <b>${is_segwit ? 'yes' : 'no'}</b>.`);
+      $('storyText').innerHTML = parts.join(' ');
+
+      const pretty = JSON.stringify(report, null, 2);
+      $('rawOut').textContent = pretty;
+      $('jsonFull').textContent = pretty;
+
+      drawFlow(vins, vouts, fee);
+    }
+
+    function drawFlow(vins, vouts, fee){
+      const svg = $('flow');
+      svg.innerHTML = '';
+      const inVals = vins.map(v => Number(v?.prevout_value_sats ?? v?.value_sats ?? v?.value ?? 0)).map(x=>Number.isFinite(x)?x:0);
+      const outVals = vouts.map(v => Number(v?.value_sats ?? v?.value ?? 0)).map(x=>Number.isFinite(x)?x:0);
+      const totalIn = inVals.reduce((a,b)=>a+b,0) || 1;
+      const totalOut = outVals.reduce((a,b)=>a+b,0);
+      const feeVal = Number.isFinite(Number(fee)) ? Number(fee) : Math.max(totalIn - totalOut, 0);
+
+      function node(x,y,w,h,label,sub){
+        const g = document.createElementNS('http://www.w3.org/2000/svg','g');
+        const r = document.createElementNS('http://www.w3.org/2000/svg','rect');
+        r.setAttribute('x',x); r.setAttribute('y',y);
+        r.setAttribute('width',w); r.setAttribute('height',h);
+        r.setAttribute('rx',14);
+        r.setAttribute('fill','rgba(17,24,39,0.9)');
+        r.setAttribute('stroke','rgba(31,41,55,1)');
+        g.appendChild(r);
+        const t = document.createElementNS('http://www.w3.org/2000/svg','text');
+        t.setAttribute('x',x+12); t.setAttribute('y',y+22);
+        t.setAttribute('fill','#e5e7eb'); t.setAttribute('font-size','12'); t.textContent = label;
+        g.appendChild(t);
+        const s = document.createElementNS('http://www.w3.org/2000/svg','text');
+        s.setAttribute('x',x+12); s.setAttribute('y',y+42);
+        s.setAttribute('fill','#9ca3af'); s.setAttribute('font-size','11'); s.textContent = sub || '';
+        g.appendChild(s);
+        svg.appendChild(g);
+      }
+
+      function link(x1,y1,x2,y2,thick){
+        const p = document.createElementNS('http://www.w3.org/2000/svg','path');
+        const c = (x2-x1)*0.45;
+        const d = `M ${x1} ${y1} C ${x1+c} ${y1}, ${x2-c} ${y2}, ${x2} ${y2}`;
+        p.setAttribute('d', d);
+        p.setAttribute('fill','none');
+        p.setAttribute('stroke','rgba(96,165,250,0.55)');
+        p.setAttribute('stroke-width', Math.max(1.5, thick));
+        p.setAttribute('stroke-linecap','round');
+        svg.appendChild(p);
+      }
+
+      node(60, 30, 200, 56, `Inputs (${vins.length})`, `${sats(totalIn)} sats`);
+      node(390, 30, 200, 56, 'Transaction', 'value flow');
+      node(720, 30, 200, 56, `Outputs (${vouts.length})`, `${sats(totalOut)} sats`);
+      node(720, 110, 200, 56, 'Fee', `${sats(feeVal)} sats`);
+
+      const base = 18;
+      link(260, 58, 390, 58, base);
+      link(590, 58, 720, 58, base);
+      link(590, 74, 720, 138, Math.max(6, base * (feeVal/totalIn)));
+
+      const maxItems = 8;
+      const inIdx = vins.length > maxItems ? Array.from({length:maxItems}, (_,i)=>i) : Array.from({length:vins.length}, (_,i)=>i);
+      const outIdx = vouts.length > maxItems ? Array.from({length:maxItems}, (_,i)=>i) : Array.from({length:vouts.length}, (_,i)=>i);
+      inIdx.forEach((i, k) => {
+        const y = 110 + k*16;
+        const thick = 2 + 10*(inVals[i]/totalIn);
+        link(260, 58, 390, y, thick);
+      });
+      outIdx.forEach((i, k) => {
+        const y = 110 + k*16;
+        const thick = 2 + 10*(outVals[i]/(totalOut||1));
+        link(590, 58, 720, y, thick);
+      });
+    }
+
+    $('btnAnalyze').addEventListener('click', async () => {
+      const txt = $('fixture').value.trim();
+      if (!txt) return toast('Paste fixture JSON first');
+      const [obj, err] = safeJsonParse(txt);
+      if (err) return toast('Invalid JSON');
+      if (!obj.network) obj.network = $('network').value;
+
+      $('btnAnalyze').disabled = true;
+      $('btnAnalyze').textContent = 'Analyzing…';
+      try {
+        const r = await fetch('/api/analyze', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(obj),
+        });
+        const j = await r.json();
+        if (!r.ok || !j || j.ok === false) {
+          const code = j?.error?.code || 'HTTP_'+r.status;
+          const msg = j?.error?.message || 'Request failed';
+          $('storyText').innerHTML = `<span class="bad"><b>${code}</b> — ${msg}</span>`;
+          $('rawOut').textContent = JSON.stringify(j, null, 2);
+          $('jsonFull').textContent = JSON.stringify(j, null, 2);
+          toast('Error');
+          return;
+        }
+        const report = j.report || j;
+        render(report);
+        toast('Done');
+      } catch (e) {
+        $('storyText').innerHTML = `<span class="bad"><b>NETWORK</b> — ${String(e)}</span>`;
+        toast('Network error');
+      } finally {
+        $('btnAnalyze').disabled = false;
+        $('btnAnalyze').textContent = 'Analyze';
+      }
+    });
+  </script>
+</body>
+</html>
+*/
+
+
+
+# =================== btc/tx.rs
+
+// src/btc/tx.rs
+
+use ahash::AHashMap;
+use bech32::{ToBase32, Variant};
+use bs58;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::hash::{Hash, Hasher};
+
+// ===============================
+// CORE LAYER (Performance First)
+// ===============================
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScriptType {
+    P2PKH = 0,
+    P2SH = 1,
+    P2WPKH = 2,
+    P2WSH = 3,
+    P2TR = 4,
+    OpReturn = 5,
+    Unknown = 6,
+}
+
+impl ScriptType {
+    #[inline]
+    fn as_str(self) -> &'static str {
+        match self {
+            ScriptType::P2PKH => "p2pkh",
+            ScriptType::P2SH => "p2sh",
+            ScriptType::P2WPKH => "p2wpkh",
+            ScriptType::P2WSH => "p2wsh",
+            ScriptType::P2TR => "p2tr",
+            ScriptType::OpReturn => "op_return",
+            ScriptType::Unknown => "unknown",
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpendType {
+    P2PKH = 0,
+    P2WPKH = 1,
+    P2WSH = 2,
+    P2TRKeyPath = 3,
+    P2TRScriptPath = 4,
+    P2SHP2WPKH = 5,
+    P2SHP2WSH = 6,
+    P2SH = 7,
+    Unknown = 8,
+}
+
+impl SpendType {
+    #[inline]
+    fn as_str(self) -> &'static str {
+        match self {
+            SpendType::P2PKH => "p2pkh",
+            SpendType::P2WPKH => "p2wpkh",
+            SpendType::P2WSH => "p2wsh",
+            SpendType::P2TRKeyPath => "p2tr_keypath",
+            SpendType::P2TRScriptPath => "p2tr_scriptpath",
+            SpendType::P2SHP2WPKH => "p2sh-p2wpkh",
+            SpendType::P2SHP2WSH => "p2sh-p2wsh",
+            SpendType::P2SH => "p2sh",
+            SpendType::Unknown => "unknown",
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WarningCode {
+    RbfSignaling = 0,
+    UnknownOutputScript = 1,
+    DustOutput = 2,
+    HighFee = 3,
+}
+
+impl WarningCode {
+    #[inline]
+    fn as_str(self) -> &'static str {
+        match self {
+            WarningCode::RbfSignaling => "RBF_SIGNALING",
+            WarningCode::UnknownOutputScript => "UNKNOWN_OUTPUT_SCRIPT",
+            WarningCode::DustOutput => "DUST_OUTPUT",
+            WarningCode::HighFee => "HIGH_FEE",
+        }
+    }
+}
+
+// Internal zero-heap core representations (no Strings)
+struct CoreInput<'a> {
+    prev_txid_le: [u8; 32],
+    vout: u32,
+    sequence: u32,
+    script_sig: &'a [u8],
+    witness: Vec<&'a [u8]>,
+    spend_type: SpendType,
+    prev_value: u64,
+    prev_spk: &'a [u8],
+}
+
+struct CoreOutput<'a> {
+    value: u64,
+    spk: &'a [u8],
+    script_type: ScriptType,
+}
+
+pub(crate) struct CoreTx<'a> {
+    txid_le: [u8; 32],
+    wtxid_le: Option<[u8; 32]>,
+    version: u32,
+    locktime: u32,
+    segwit: bool,
+    size_bytes: usize,
+    weight: usize,
+    vbytes: usize,
+    total_input: u64,
+    total_output: u64,
+    fee: i64,
+    rbf: bool,
+    inputs: Vec<CoreInput<'a>>,
+    outputs: Vec<CoreOutput<'a>>,
+    warnings: Vec<WarningCode>,
+}
+
+// NOTE:
+// Next refactor step:
+// 1) Convert script_type() -> ScriptType (remove String returns)
+// 2) Convert classify_input_spend() -> SpendType
+// 3) Make analyze_tx_from_bytes_ordered_impl build CoreTx
+// 4) Add separate build_tx_report(CoreTx) -> TxReport
+// This splits Core Engine from JSON Layer (Bitcoin Core style).
+
+
+#[derive(Debug, Clone)]
+pub struct Prevout {
+    pub txid_hex: String,
+    pub vout: u32,
+    pub value_sats: u64,
+    pub script_pubkey_hex: String,
+}
+
+// README schema expects warnings as an array of objects that only contain { code }
+#[derive(Debug, Serialize)]
+pub struct WarningItem {
+    pub code: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SegwitSavings {
+    pub witness_bytes: usize,
+    pub non_witness_bytes: usize,
+    pub total_bytes: usize,
+    pub weight_actual: usize,
+    pub weight_if_legacy: usize,
+    pub savings_pct: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PrevoutInfo {
+    pub value_sats: u64,
+    pub script_pubkey_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RelativeTimelock {
+    pub enabled: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>, // "blocks" | "time"
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<u64>, // blocks OR seconds
+}
+
+#[derive(Debug, Serialize)]
+pub struct VinReport {
+    pub txid: String,
+    pub vout: u32,
+    pub sequence: u32,
+    pub script_sig_hex: String,
+    pub script_asm: String,
+    pub witness: Vec<String>,
+    /// Only present for p2wsh and p2sh-p2wsh spends (disassembly of the witnessScript).
+    pub witness_script_asm: Option<String>,
+    pub script_type: String,
+    pub address: Option<String>,
+    pub prevout: PrevoutInfo,
+    pub relative_timelock: RelativeTimelock,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VoutReport {
+    pub n: u32,
+    pub value_sats: u64,
+    pub script_pubkey_hex: String,
+    pub script_asm: String,
+    pub script_type: String,
+    pub address: Option<String>,
+
+    pub op_return_data_hex: Option<String>,
+    pub op_return_data_utf8: Option<String>,
+    pub op_return_protocol: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TxReport {
+    pub ok: bool,
+    pub network: String,
+    pub segwit: bool,
+    pub txid: String,
+    pub wtxid: Option<String>,
+    pub version: u32,
+    pub locktime: u32,
+    pub locktime_value: u32,
+    pub size_bytes: usize,
+    pub weight: usize,
+    pub vbytes: usize,
+    pub fee_sats: i64,
+    pub fee_rate_sat_vb: f64,
+    pub total_input_sats: u64,
+    pub total_output_sats: u64,
+    pub rbf_signaling: bool,
+    pub locktime_type: String,
+
+    pub vin: Vec<VinReport>,
+    pub vout: Vec<VoutReport>,
+    pub warnings: Vec<WarningItem>,
+    pub segwit_savings: Option<SegwitSavings>,
+}
+
+struct Cursor<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Self { b, i: 0 }
+    }
+
+    fn backtrack_1(&mut self) -> Result<(), String> {
+        if self.i == 0 {
+            return Err("cursor underflow".into());
+        }
+        self.i -= 1;
+        Ok(())
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        if self.i + n > self.b.len() {
+            return Err("unexpected EOF".into());
+        }
+        let s = &self.b[self.i..self.i + n];
+        self.i += n;
+        Ok(s)
+    }
+
+    fn take_u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn take_u32_le(&mut self) -> Result<u32, String> {
+        let s = self.take(4)?;
+        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    fn take_u64_le(&mut self) -> Result<u64, String> {
+        let s = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
+    }
+
+    fn remaining(&self) -> usize {
+        self.b.len().saturating_sub(self.i)
+    }
+}
+
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
+    hex::decode(hex).map_err(|_| "invalid hex".to_string())
+}
+
+fn bytes_to_hex(b: &[u8]) -> String {
+    hex::encode(b)
+}
+
+fn dsha256(data: &[u8]) -> [u8; 32] {
+    let h1 = Sha256::digest(data);
+    let h2 = Sha256::digest(h1);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h2);
+    out
+}
+
+fn hash_to_display_hex(hash: [u8; 32]) -> String {
+    // Bitcoin displays hashes as big-endian hex; SHA256 output here is treated as internal byte order.
+    // We reverse for human display.
+    let mut be = hash;
+    be.reverse();
+    bytes_to_hex(&be)
+}
+
+#[derive(Clone, Copy)]
+struct NetParams {
+    p2pkh_prefix: u8,
+    p2sh_prefix: u8,
+    bech32_hrp: &'static str,
+}
+
+fn net_params(network: &str) -> Result<NetParams, String> {
+    match network {
+        "main" | "mainnet" | "bitcoin" => Ok(NetParams {
+            p2pkh_prefix: 0x00,
+            p2sh_prefix: 0x05,
+            bech32_hrp: "bc",
+        }),
+        "test" | "testnet" | "signet" | "regtest" => Ok(NetParams {
+            p2pkh_prefix: 0x6f,
+            p2sh_prefix: 0xc4,
+            bech32_hrp: "tb",
+        }),
+        _ => Err(format!("unsupported network: {network}")),
+    }
+}
+
+fn base58check(version: u8, payload: &[u8]) -> String {
+    let mut buf = Vec::with_capacity(1 + payload.len() + 4);
+    buf.push(version);
+    buf.extend_from_slice(payload);
+    let chk = dsha256(&buf);
+    buf.extend_from_slice(&chk[0..4]);
+    bs58::encode(buf).into_string()
+}
+
+fn bech32_witness_addr(hrp: &str, witver: u8, program: &[u8]) -> Result<String, String> {
+    if witver > 16 {
+        return Err("invalid witness version".into());
+    }
+    if program.len() < 2 || program.len() > 40 {
+        return Err("invalid witness program length".into());
+    }
+
+    let variant = if witver == 0 {
+        Variant::Bech32
+    } else {
+        Variant::Bech32m
+    };
+
+    let mut data = Vec::with_capacity(1 + (program.len() * 8 + 4) / 5);
+    data.push(bech32::u5::try_from_u8(witver).map_err(|_| "invalid witver".to_string())?);
+    data.extend_from_slice(&program.to_base32());
+
+    bech32::encode(hrp, data, variant).map_err(|e| format!("bech32 encode error: {e}"))
+}
+
+fn address_from_spk(network: &str, spk: &[u8]) -> Result<Option<String>, String> {
+    let p = net_params(network)?;
+
+    if is_p2pkh_spk(spk) {
+        let h160 = &spk[3..23];
+        return Ok(Some(base58check(p.p2pkh_prefix, h160)));
+    }
+    if is_p2sh_spk(spk) {
+        let h160 = &spk[2..22];
+        return Ok(Some(base58check(p.p2sh_prefix, h160)));
+    }
+    if is_p2wpkh_spk(spk) {
+        let prog = &spk[2..22];
+        return Ok(Some(bech32_witness_addr(p.bech32_hrp, 0, prog)?));
+    }
+    if is_p2wsh_spk(spk) {
+        let prog = &spk[2..34];
+        return Ok(Some(bech32_witness_addr(p.bech32_hrp, 0, prog)?));
+    }
+    if is_p2tr_spk(spk) {
+        let prog = &spk[2..34];
+        return Ok(Some(bech32_witness_addr(p.bech32_hrp, 1, prog)?));
+    }
+
+    Ok(None)
+}
+
+/// Streaming double-SHA256 writer (lets us compute txid without allocating a "stripped" buffer).
+struct Dsha256Writer {
+    h: Sha256,
+    len: usize,
+}
+
+impl Dsha256Writer {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            h: Sha256::new(),
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        self.h.update(bytes);
+        self.len += bytes.len();
+    }
+
+    #[inline]
+    fn finish(self) -> [u8; 32] {
+        let h1 = self.h.finalize();
+        let h2 = Sha256::digest(h1);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&h2);
+        out
+    }
+}
+
+#[inline]
+fn write_varint_hasher(out: &mut Dsha256Writer, n: u64) {
+    match n {
+        0x00..=0xfc => out.write(&[n as u8]),
+        0xfd..=0xffff => {
+            let b0 = 0xfdu8;
+            let le = (n as u16).to_le_bytes();
+            out.write(&[b0]);
+            out.write(&le);
+        }
+        0x1_0000..=0xffff_ffff => {
+            let b0 = 0xfeu8;
+            let le = (n as u32).to_le_bytes();
+            out.write(&[b0]);
+            out.write(&le);
+        }
+        _ => {
+            let b0 = 0xffu8;
+            let le = n.to_le_bytes();
+            out.write(&[b0]);
+            out.write(&le);
+        }
+    }
+}
+
+fn read_varint(c: &mut Cursor) -> Result<u64, String> {
+    let n = c.take_u8()? as u64;
+    match n {
+        0x00..=0xfc => Ok(n),
+        0xfd => {
+            let s = c.take(2)?;
+            Ok(u16::from_le_bytes([s[0], s[1]]) as u64)
+        }
+        0xfe => Ok(c.take_u32_le()? as u64),
+        0xff => Ok(c.take_u64_le()?),
+        _ => Err("invalid varint prefix".into()),
+    }
+}
+
+fn script_type(spk: &[u8]) -> ScriptType {
+    if spk.len() == 25
+        && spk[0] == 0x76
+        && spk[1] == 0xa9
+        && spk[2] == 0x14
+        && spk[23] == 0x88
+        && spk[24] == 0xac
+    {
+        return ScriptType::P2PKH;
+    }
+    if spk.len() == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87 {
+        return ScriptType::P2SH;
+    }
+    if spk.len() == 22 && spk[0] == 0x00 && spk[1] == 0x14 {
+        return ScriptType::P2WPKH;
+    }
+    if spk.len() == 34 && spk[0] == 0x00 && spk[1] == 0x20 {
+        return ScriptType::P2WSH;
+    }
+    if spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20 {
+        return ScriptType::P2TR;
+    }
+    if !spk.is_empty() && spk[0] == 0x6a {
+        return ScriptType::OpReturn;
+    }
+    ScriptType::Unknown
+}
+
+fn parse_op_return_data(spk: &[u8]) -> Option<Vec<u8>> {
+    // scriptPubKey for OP_RETURN outputs is typically:
+    // OP_RETURN <pushdata...> [<pushdata...> ...]
+    // Requirement: concatenate *all* data pushes after OP_RETURN, in order.
+    if spk.is_empty() || spk[0] != 0x6a {
+        return None;
+    }
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut i: usize = 1; // after OP_RETURN
+
+    while i < spk.len() {
+        let op = spk[i];
+        i += 1;
+
+        // OP_0 pushes an empty vector.
+        if op == 0x00 {
+            continue;
+        }
+
+        let (n, is_push) = match op {
+            0x01..=0x4b => (op as usize, true),
+            0x4c => {
+                if i + 1 > spk.len() {
+                    return None;
+                }
+                let n = spk[i] as usize;
+                i += 1;
+                (n, true)
+            }
+            0x4d => {
+                if i + 2 > spk.len() {
+                    return None;
+                }
+                let n = u16::from_le_bytes([spk[i], spk[i + 1]]) as usize;
+                i += 2;
+                (n, true)
+            }
+            0x4e => {
+                if i + 4 > spk.len() {
+                    return None;
+                }
+                let n = u32::from_le_bytes([spk[i], spk[i + 1], spk[i + 2], spk[i + 3]]) as usize;
+                i += 4;
+                (n, true)
+            }
+            _ => (0, false),
+        };
+
+        // Stop at first non-push opcode (requirement only concerns pushes).
+        if !is_push {
+            break;
+        }
+
+        if i + n > spk.len() {
+            return None;
+        }
+
+        out.extend_from_slice(&spk[i..i + n]);
+        i += n;
+    }
+
+    Some(out)
+}
+
+#[inline]
+fn opcode_name(op: u8) -> String {
+    // Bitcoin Core Script opcode names.
+    // Unknown / undefined opcodes must render as OP_UNKNOWN_0xNN.
+    let s: Option<&'static str> = match op {
+        0x00 => Some("OP_0"),
+        0x4c => Some("OP_PUSHDATA1"),
+        0x4d => Some("OP_PUSHDATA2"),
+        0x4e => Some("OP_PUSHDATA4"),
+        0x4f => Some("OP_1NEGATE"),
+        0x50 => Some("OP_RESERVED"),
+        0x51 => Some("OP_1"),
+        0x52 => Some("OP_2"),
+        0x53 => Some("OP_3"),
+        0x54 => Some("OP_4"),
+        0x55 => Some("OP_5"),
+        0x56 => Some("OP_6"),
+        0x57 => Some("OP_7"),
+        0x58 => Some("OP_8"),
+        0x59 => Some("OP_9"),
+        0x5a => Some("OP_10"),
+        0x5b => Some("OP_11"),
+        0x5c => Some("OP_12"),
+        0x5d => Some("OP_13"),
+        0x5e => Some("OP_14"),
+        0x5f => Some("OP_15"),
+        0x60 => Some("OP_16"),
+        0x61 => Some("OP_NOP"),
+        0x62 => Some("OP_VER"),
+        0x63 => Some("OP_IF"),
+        0x64 => Some("OP_NOTIF"),
+        0x65 => Some("OP_VERIF"),
+        0x66 => Some("OP_VERNOTIF"),
+        0x67 => Some("OP_ELSE"),
+        0x68 => Some("OP_ENDIF"),
+        0x69 => Some("OP_VERIFY"),
+        0x6a => Some("OP_RETURN"),
+        0x6b => Some("OP_TOALTSTACK"),
+        0x6c => Some("OP_FROMALTSTACK"),
+        0x6d => Some("OP_2DROP"),
+        0x6e => Some("OP_2DUP"),
+        0x6f => Some("OP_3DUP"),
+        0x70 => Some("OP_2OVER"),
+        0x71 => Some("OP_2ROT"),
+        0x72 => Some("OP_2SWAP"),
+        0x73 => Some("OP_IFDUP"),
+        0x74 => Some("OP_DEPTH"),
+        0x75 => Some("OP_DROP"),
+        0x76 => Some("OP_DUP"),
+        0x77 => Some("OP_NIP"),
+        0x78 => Some("OP_OVER"),
+        0x79 => Some("OP_PICK"),
+        0x7a => Some("OP_ROLL"),
+        0x7b => Some("OP_ROT"),
+        0x7c => Some("OP_SWAP"),
+        0x7d => Some("OP_TUCK"),
+        0x7e => Some("OP_CAT"),
+        0x7f => Some("OP_SUBSTR"),
+        0x80 => Some("OP_LEFT"),
+        0x81 => Some("OP_RIGHT"),
+        0x82 => Some("OP_SIZE"),
+        0x83 => Some("OP_INVERT"),
+        0x84 => Some("OP_AND"),
+        0x85 => Some("OP_OR"),
+        0x86 => Some("OP_XOR"),
+        0x87 => Some("OP_EQUAL"),
+        0x88 => Some("OP_EQUALVERIFY"),
+        0x89 => Some("OP_RESERVED1"),
+        0x8a => Some("OP_RESERVED2"),
+        0x8b => Some("OP_1ADD"),
+        0x8c => Some("OP_1SUB"),
+        0x8d => Some("OP_2MUL"),
+        0x8e => Some("OP_2DIV"),
+        0x8f => Some("OP_NEGATE"),
+        0x90 => Some("OP_ABS"),
+        0x91 => Some("OP_NOT"),
+        0x92 => Some("OP_0NOTEQUAL"),
+        0x93 => Some("OP_ADD"),
+        0x94 => Some("OP_SUB"),
+        0x95 => Some("OP_MUL"),
+        0x96 => Some("OP_DIV"),
+        0x97 => Some("OP_MOD"),
+        0x98 => Some("OP_LSHIFT"),
+        0x99 => Some("OP_RSHIFT"),
+        0x9a => Some("OP_BOOLAND"),
+        0x9b => Some("OP_BOOLOR"),
+        0x9c => Some("OP_NUMEQUAL"),
+        0x9d => Some("OP_NUMEQUALVERIFY"),
+        0x9e => Some("OP_NUMNOTEQUAL"),
+        0x9f => Some("OP_LESSTHAN"),
+        0xa0 => Some("OP_GREATERTHAN"),
+        0xa1 => Some("OP_LESSTHANOREQUAL"),
+        0xa2 => Some("OP_GREATERTHANOREQUAL"),
+        0xa3 => Some("OP_MIN"),
+        0xa4 => Some("OP_MAX"),
+        0xa5 => Some("OP_WITHIN"),
+        0xa6 => Some("OP_RIPEMD160"),
+        0xa7 => Some("OP_SHA1"),
+        0xa8 => Some("OP_SHA256"),
+        0xa9 => Some("OP_HASH160"),
+        0xaa => Some("OP_HASH256"),
+        0xab => Some("OP_CODESEPARATOR"),
+        0xac => Some("OP_CHECKSIG"),
+        0xad => Some("OP_CHECKSIGVERIFY"),
+        0xae => Some("OP_CHECKMULTISIG"),
+        0xaf => Some("OP_CHECKMULTISIGVERIFY"),
+        0xb0 => Some("OP_NOP1"),
+        0xb1 => Some("OP_CHECKLOCKTIMEVERIFY"),
+        0xb2 => Some("OP_CHECKSEQUENCEVERIFY"),
+        0xb3 => Some("OP_NOP4"),
+        0xb4 => Some("OP_NOP5"),
+        0xb5 => Some("OP_NOP6"),
+        0xb6 => Some("OP_NOP7"),
+        0xb7 => Some("OP_NOP8"),
+        0xb8 => Some("OP_NOP9"),
+        0xb9 => Some("OP_NOP10"),
+        0xba => Some("OP_CHECKSIGADD"),
+        0xfd => Some("OP_PUBKEYHASH"),
+        0xfe => Some("OP_PUBKEY"),
+        0xff => Some("OP_INVALIDOPCODE"),
+        _ => None,
+    };
+
+    if let Some(name) = s {
+        name.to_string()
+    } else {
+        format!("OP_UNKNOWN_0x{:02x}", op)
+    }
+}
+
+fn disasm_script(script: &[u8]) -> String {
+    if script.is_empty() {
+        return String::new();
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut i: usize = 0;
+
+    while i < script.len() {
+        let op = script[i];
+        i += 1;
+
+        // Direct push
+        if (0x01..=0x4b).contains(&op) {
+            let n = op as usize;
+            if i + n > script.len() {
+                break;
+            }
+            out.push(format!("OP_PUSHBYTES_{} {}", n, bytes_to_hex(&script[i..i + n])));
+            i += n;
+            continue;
+        }
+
+        match op {
+            0x00 => out.push("OP_0".to_string()),
+            0x4c => {
+                if i + 1 > script.len() {
+                    break;
+                }
+                let n = script[i] as usize;
+                i += 1;
+                if i + n > script.len() {
+                    break;
+                }
+                out.push(format!("OP_PUSHDATA1 {}", bytes_to_hex(&script[i..i + n])));
+                i += n;
+            }
+            0x4d => {
+                if i + 2 > script.len() {
+                    break;
+                }
+                let n = u16::from_le_bytes([script[i], script[i + 1]]) as usize;
+                i += 2;
+                if i + n > script.len() {
+                    break;
+                }
+                out.push(format!("OP_PUSHDATA2 {}", bytes_to_hex(&script[i..i + n])));
+                i += n;
+            }
+            0x4e => {
+                if i + 4 > script.len() {
+                    break;
+                }
+                let n = u32::from_le_bytes([script[i], script[i + 1], script[i + 2], script[i + 3]]) as usize;
+                i += 4;
+                if i + n > script.len() {
+                    break;
+                }
+                out.push(format!("OP_PUSHDATA4 {}", bytes_to_hex(&script[i..i + n])));
+                i += n;
+            }
+            _ => out.push(opcode_name(op)),
+        }
+    }
+
+    out.join(" ")
+}
+
+fn extract_last_push(script: &[u8]) -> Option<&[u8]> {
+    // Returns the data bytes of the last push in a script (used for P2SH redeemScript detection).
+    // Only considers canonical push opcodes (direct pushes and PUSHDATA1/2/4).
+    let mut i = 0usize;
+    let mut last: Option<&[u8]> = None;
+
+    while i < script.len() {
+        let op = script[i];
+        i += 1;
+
+        let n_opt: Option<usize> = match op {
+            0x01..=0x4b => Some(op as usize),
+            0x4c => {
+                if i + 1 > script.len() {
+                    return None;
+                }
+                let n = script[i] as usize;
+                i += 1;
+                Some(n)
+            }
+            0x4d => {
+                if i + 2 > script.len() {
+                    return None;
+                }
+                let n = u16::from_le_bytes([script[i], script[i + 1]]) as usize;
+                i += 2;
+                Some(n)
+            }
+            0x4e => {
+                if i + 4 > script.len() {
+                    return None;
+                }
+                let n = u32::from_le_bytes([script[i], script[i + 1], script[i + 2], script[i + 3]]) as usize;
+                i += 4;
+                Some(n)
+            }
+            0x00 => Some(0),
+            _ => None,
+        };
+
+        let Some(n) = n_opt else {
+            continue;
+        };
+
+        if i + n > script.len() {
+            return None;
+        }
+        let data = &script[i..i + n];
+        i += n;
+        last = Some(data);
+    }
+
+    last
+}
+
+#[inline]
+fn is_p2pkh_spk(spk: &[u8]) -> bool {
+    spk.len() == 25
+        && spk[0] == 0x76
+        && spk[1] == 0xa9
+        && spk[2] == 0x14
+        && spk[23] == 0x88
+        && spk[24] == 0xac
+}
+
+#[inline]
+fn is_p2sh_spk(spk: &[u8]) -> bool {
+    spk.len() == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87
+}
+
+#[inline]
+fn is_p2wpkh_spk(spk: &[u8]) -> bool {
+    spk.len() == 22 && spk[0] == 0x00 && spk[1] == 0x14
+}
+
+#[inline]
+fn is_p2wsh_spk(spk: &[u8]) -> bool {
+    spk.len() == 34 && spk[0] == 0x00 && spk[1] == 0x20
+}
+
+#[inline]
+fn is_p2tr_spk(spk: &[u8]) -> bool {
+    spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20
+}
+
+fn classify_input_spend(
+    prevout_spk: &[u8],
+    script_sig: &[u8],
+    witness_items: &[&[u8]],
+    include_witness_script_asm: bool,
+) -> (SpendType, Option<String>) {
+    if is_p2pkh_spk(prevout_spk) {
+        return (SpendType::P2PKH, None);
+    }
+    if is_p2wpkh_spk(prevout_spk) {
+        return (SpendType::P2WPKH, None);
+    }
+    if is_p2wsh_spk(prevout_spk) {
+        let ws_asm = if include_witness_script_asm {
+            witness_items.last().map(|b| disasm_script(b))
+        } else {
+            None
+        };
+        return (SpendType::P2WSH, ws_asm);
+    }
+    if is_p2tr_spk(prevout_spk) {
+        if witness_items.len() == 1 && witness_items[0].len() == 64 {
+            return (SpendType::P2TRKeyPath, None);
+        }
+        if let Some(last) = witness_items.last() {
+            if !last.is_empty() && (last[0] == 0xc0 || last[0] == 0xc1) {
+                return (SpendType::P2TRScriptPath, None);
+            }
+        }
+        return (SpendType::Unknown, None);
+    }
+    if is_p2sh_spk(prevout_spk) {
+        let Some(rs) = extract_last_push(script_sig) else {
+            return (SpendType::Unknown, None);
+        };
+        if is_p2wpkh_spk(rs) {
+            return (SpendType::P2SHP2WPKH, None);
+        }
+        if is_p2wsh_spk(rs) {
+            let ws_asm = if include_witness_script_asm {
+                witness_items.last().map(|b| disasm_script(b))
+            } else {
+                None
+            };
+            return (SpendType::P2SHP2WSH, ws_asm);
+        }
+        return (SpendType::P2SH, None);
+    }
+    (SpendType::Unknown, None)
+}
+
+#[inline]
+fn locktime_type(locktime: u32) -> String {
+    if locktime == 0 {
+        return "none".into();
+    }
+    // Consensus convention: < 500_000_000 => block height, else unix timestamp
+    if locktime < 500_000_000 {
+        "block_height".into()
+    } else {
+        "unix_timestamp".into()
+    }
+}
+
+#[inline]
+fn relative_timelock(version: u32, sequence: u32) -> RelativeTimelock {
+    // BIP68 only applies to tx version >= 2
+    if version < 2 {
+        return RelativeTimelock {
+            enabled: false,
+            r#type: None,
+            value: None,
+        };
+    }
+
+    // Disable flag (bit 31) => disabled
+    if (sequence & (1u32 << 31)) != 0 {
+        return RelativeTimelock {
+            enabled: false,
+            r#type: None,
+            value: None,
+        };
+    }
+
+    // Low 16 bits are the value
+    let v = (sequence & 0x0000_ffff) as u64;
+
+    // Type flag (bit 22): 0 = blocks, 1 = time (512-second units)
+    if (sequence & (1u32 << 22)) != 0 {
+        RelativeTimelock {
+            enabled: true,
+            r#type: Some("time".into()),
+            value: Some(v * 512),
+        }
+    } else {
+        RelativeTimelock {
+            enabled: true,
+            r#type: Some("blocks".into()),
+            value: Some(v),
+        }
+    }
+}
+
+
+#[derive(Clone, Copy, Debug)]
+pub struct TxComputeFlags {
+    pub include_script_hex: bool,
+    pub include_script_asm: bool,
+    pub include_addresses: bool,
+    pub include_witness_hex: bool,
+    pub include_op_return: bool,
+    pub include_warnings: bool,
+}
+
+impl TxComputeFlags {
+    pub const FULL: Self = Self {
+        include_script_hex: true,
+        include_script_asm: true,
+        include_addresses: true,
+        include_witness_hex: true,
+        include_op_return: true,
+        include_warnings: true,
+    };
+
+    // Designed for block-mode performance.
+    pub const LITE: Self = Self {
+        include_script_hex: false,
+        include_script_asm: false,
+        include_addresses: false,
+        include_witness_hex: false,
+        include_op_return: false,
+        include_warnings: false,
+    };
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct PrevoutKey {
+    // txid in little-endian bytes (matches tx serialization)
+    txid_le: [u8; 32],
+    vout: u32,
+}
+
+impl Hash for PrevoutKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write(&self.txid_le);
+        state.write_u32(self.vout);
+    }
+}
+
+/// Fast path for block-mode: analyze a transaction from raw bytes and an *ordered* prevout list.
+///
+/// `prevouts_ordered` must be in the same order as the transaction inputs (vin order).
+/// Each entry is `(value_sats, script_pubkey_bytes)`.
+///
+/// This avoids hex decoding/encoding and avoids building a prevout HashMap.
+fn analyze_tx_from_bytes_ordered_impl<'a>(
+    _network: &str,
+    raw: &'a [u8],
+    prevouts_ordered: &'a [(u64, &'a [u8])],
+    flags: TxComputeFlags,
+) -> Result<CoreTx<'a>, String> {
+    let size_bytes = raw.len();
+    let mut c = Cursor::new(raw);
+
+    // --- Header / segwit detection ---
+    let version = c.take_u32_le()?;
+
+    let mut segwit = false;
+    let peek = c.take_u8()?;
+    if peek == 0x00 {
+        let flag = c.take_u8()?;
+        if flag != 0x01 {
+            return Err("invalid segwit flag".into());
+        }
+        segwit = true;
+    } else {
+        c.backtrack_1()?;
+    }
+
+    let mut txid_hasher = if segwit {
+        Some(Dsha256Writer::new())
+    } else {
+        None
+    };
+
+    if let Some(h) = txid_hasher.as_mut() {
+        h.write(&version.to_le_bytes());
+    }
+
+    // --- VIN ---
+    let vin_count_u64 = read_varint(&mut c)?;
+    let vin_count = vin_count_u64 as usize;
+    if let Some(h) = txid_hasher.as_mut() {
+        write_varint_hasher(h, vin_count_u64);
+    }
+
+    let mut inputs: Vec<CoreInput> = Vec::with_capacity(vin_count);
+    let mut rbf_signaling = false;
+    let mut coinbase = false;
+
+    for vin_index in 0..vin_count {
+        let prev_txid_le_bytes = c.take(32)?;
+        let prev_vout = c.take_u32_le()?;
+
+        if vin_index == 0
+            && vin_count == 1
+            && prev_vout == 0xffff_ffff
+            && prev_txid_le_bytes.iter().all(|&b| b == 0)
+        {
+            coinbase = true;
+        }
+
+        if let Some(h) = txid_hasher.as_mut() {
+            h.write(prev_txid_le_bytes);
+            h.write(&prev_vout.to_le_bytes());
+        }
+
+        let script_len_u64 = read_varint(&mut c)?;
+        let script_len = script_len_u64 as usize;
+        if let Some(h) = txid_hasher.as_mut() {
+            write_varint_hasher(h, script_len_u64);
+        }
+
+        let script_sig = c.take(script_len)?;
+        if let Some(h) = txid_hasher.as_mut() {
+            h.write(script_sig);
+        }
+
+        let sequence = c.take_u32_le()?;
+        if let Some(h) = txid_hasher.as_mut() {
+            h.write(&sequence.to_le_bytes());
+        }
+
+        if sequence < 0xffff_fffe {
+            rbf_signaling = true;
+        }
+
+        let (prev_value, prev_spk) = if coinbase {
+            (0u64, &[][..])
+        } else {
+            prevouts_ordered
+                .get(vin_index)
+                .copied()
+                .ok_or_else(|| "prevouts_ordered length mismatch".to_string())?
+        };
+
+        let witness: Vec<&[u8]> = Vec::new(); // filled later
+
+        inputs.push(CoreInput {
+            prev_txid_le: {
+                let mut t = [0u8; 32];
+                t.copy_from_slice(prev_txid_le_bytes);
+                t
+            },
+            vout: prev_vout,
+            sequence,
+            script_sig,
+            witness,
+            spend_type: SpendType::Unknown, // filled later
+            prev_value,
+            prev_spk,
+        });
+    }
+
+    // --- VOUT ---
+    let vout_count_u64 = read_varint(&mut c)?;
+    let vout_count = vout_count_u64 as usize;
+    if let Some(h) = txid_hasher.as_mut() {
+        write_varint_hasher(h, vout_count_u64);
+    }
+
+    let mut outputs: Vec<CoreOutput> = Vec::with_capacity(vout_count);
+    let mut total_output_sats: u64 = 0;
+
+    for _ in 0..vout_count {
+        let value = c.take_u64_le()?;
+        total_output_sats = total_output_sats.saturating_add(value);
+        if let Some(h) = txid_hasher.as_mut() {
+            h.write(&value.to_le_bytes());
+        }
+
+        let spk_len_u64 = read_varint(&mut c)?;
+        let spk_len = spk_len_u64 as usize;
+        if let Some(h) = txid_hasher.as_mut() {
+            write_varint_hasher(h, spk_len_u64);
+        }
+
+        let spk = c.take(spk_len)?;
+        if let Some(h) = txid_hasher.as_mut() {
+            h.write(spk);
+        }
+
+        outputs.push(CoreOutput {
+            value,
+            spk,
+            script_type: script_type(spk),
+        });
+    }
+
+    // --- Witness ---
+    if segwit {
+        for input in inputs.iter_mut() {
+            let n_stack = read_varint(&mut c)? as usize;
+            let mut items: Vec<&[u8]> = Vec::with_capacity(n_stack);
+            for _ in 0..n_stack {
+                let item_len = read_varint(&mut c)? as usize;
+                let item = c.take(item_len)?;
+                items.push(item);
+            }
+            input.witness = items;
+        }
+    }
+
+    let locktime = c.take_u32_le()?;
+    if let Some(h) = txid_hasher.as_mut() {
+        h.write(&locktime.to_le_bytes());
+    }
+
+    if c.remaining() != 0 {
+        return Err("trailing bytes after parsing".into());
+    }
+
+    let non_witness_size = txid_hasher.as_ref().map(|h| h.len).unwrap_or(size_bytes);
+
+    let txid_le = if segwit {
+        txid_hasher.unwrap().finish()
+    } else {
+        dsha256(raw)
+    };
+
+        // Compute input totals + spend types
+    let mut total_input_sats: u64 = 0;
+    for input in inputs.iter_mut() {
+        total_input_sats = total_input_sats.saturating_add(input.prev_value);
+        input.spend_type = classify_input_spend(
+            input.prev_spk,
+            input.script_sig,
+            &input.witness,
+            false,
+        )
+        .0;
+    }
+
+    if coinbase {
+        total_input_sats = total_output_sats;
+        rbf_signaling = false;
+    }
+
+    let fee = if coinbase {
+        0
+    } else {
+        total_input_sats as i64 - total_output_sats as i64
+    };
+
+    let weight = if segwit {
+        let witness_bytes = size_bytes.saturating_sub(non_witness_size);
+        non_witness_size * 4 + witness_bytes
+    } else {
+        size_bytes * 4
+    };
+
+        let vbytes = weight.div_ceil(4);
+
+    // --- Core warning generation (enum-based, no Strings) ---
+    let mut warnings: Vec<WarningCode> = Vec::new();
+
+    if flags.include_warnings {
+        if rbf_signaling {
+            warnings.push(WarningCode::RbfSignaling);
+        }
+
+        // Unknown output scripts
+        if outputs.iter().any(|o| o.script_type == ScriptType::Unknown) {
+            warnings.push(WarningCode::UnknownOutputScript);
+        }
+
+        // Dust detection (simple heuristic: < 546 sats and not OP_RETURN)
+        if outputs.iter().any(|o| {
+            o.value < 546 && o.script_type != ScriptType::OpReturn
+        }) {
+            warnings.push(WarningCode::DustOutput);
+        }
+
+        // High fee heuristic (> 1 BTC absolute fee)
+        if !coinbase && fee > 100_000_000 {
+            warnings.push(WarningCode::HighFee);
+        }
+    }
+
+    Ok(CoreTx {
+        txid_le,
+        wtxid_le: if segwit { Some(dsha256(raw)) } else { None },
+        version,
+        locktime,
+        segwit,
+        size_bytes,
+        weight,
+        vbytes,
+        total_input: total_input_sats,
+        total_output: total_output_sats,
+        fee,
+        rbf: rbf_signaling,
+        inputs,
+        outputs,
+        warnings,
+    })
+}
+
+// JSON layer: build TxReport from CoreTx
+fn build_tx_report(network: &str, core: CoreTx, _flags: TxComputeFlags) -> Result<TxReport, String> {
+    let txid = hash_to_display_hex(core.txid_le);
+    let wtxid = core.wtxid_le.map(hash_to_display_hex);
+
+    Ok(TxReport {
+        ok: true,
+        network: network.into(),
+        segwit: core.segwit,
+        txid,
+        wtxid,
+        version: core.version,
+        locktime: core.locktime,
+        locktime_value: core.locktime,
+        size_bytes: core.size_bytes,
+        weight: core.weight,
+        vbytes: core.vbytes,
+        fee_sats: core.fee,
+        fee_rate_sat_vb: if core.vbytes == 0 {
+            0.0
+        } else {
+            core.fee as f64 / core.vbytes as f64
+        },
+        total_input_sats: core.total_input,
+        total_output_sats: core.total_output,
+        rbf_signaling: core.rbf,
+        locktime_type: locktime_type(core.locktime),
+        vin: Vec::new(),
+        vout: Vec::new(),
+        warnings: core.warnings
+            .into_iter()
+            .map(|w| WarningItem {
+                code: w.as_str().to_string(),
+            })
+            .collect(),
+        segwit_savings: None,
+    })
+}
+
+/// Full (README-complete) transaction analyzer.
+pub fn analyze_tx_from_bytes_ordered<'a>(
+    network: &str,
+    raw: &'a [u8],
+    prevouts_ordered: &'a [(u64, &'a [u8])],
+) -> Result<TxReport, String> {
+    let core = analyze_tx_from_bytes_ordered_impl(
+        network,
+        raw,
+        prevouts_ordered,
+        TxComputeFlags::FULL,
+    )?;
+    build_tx_report(network, core, TxComputeFlags::FULL)
+}
+
+/// LITE analyzer for block-mode performance.
+///
+/// IMPORTANT:
+/// In high-performance block-mode we should NOT build a TxReport at all.
+/// This wrapper exists only for compatibility with existing callers.
+pub fn analyze_tx_from_bytes_ordered_lite<'a>(
+    network: &str,
+    raw: &[u8],
+    prevouts_ordered: &[(u64, &[u8])],
+) -> Result<TxReport, String> {
+    let core = analyze_tx_from_bytes_ordered_impl(
+        network,
+        raw,
+        prevouts_ordered,
+        TxComputeFlags::LITE,
+    )?;
+    build_tx_report(network, core, TxComputeFlags::LITE)
+}
+
+/// NEW: Pure Core analyzer for block-mode.
+///
+/// This is the function block/mod.rs should call directly.
+/// It avoids ANY JSON construction and returns CoreTx.
+pub fn analyze_tx_core_lite<'a>(
+    raw: &'a [u8],
+    prevouts_ordered: &'a [(u64, &'a [u8])],
+) -> Result<CoreTx<'a>, String> {
+    analyze_tx_from_bytes_ordered_impl(
+        "main", // network not needed for core computation
+        raw,
+        prevouts_ordered,
+        TxComputeFlags::LITE,
+    )
+}
+
+pub fn analyze_tx(network: &str, raw_tx_hex: &str, prevouts: &[Prevout]) -> Result<TxReport, String> {
+    let raw = hex_to_bytes(raw_tx_hex)?;
+
+    // --- 1) First pass: parse only the input outpoints (vin order) ---
+    let mut c = Cursor::new(&raw);
+
+    // version
+    let _version = c.take_u32_le()?;
+
+    // segwit marker/flag (if present)
+    let peek = c.take_u8()?;
+    if peek == 0x00 {
+        let flag = c.take_u8()?;
+        if flag != 0x01 {
+            return Err("invalid segwit flag".into());
+        }
+    } else {
+        c.backtrack_1()?;
+    }
+
+    let vin_count_u64 = read_varint(&mut c)?;
+    let vin_count = vin_count_u64 as usize;
+
+    // Collect outpoints as (txid_le, vout) in vin order.
+    let mut coinbase = false;
+    let mut keys: Vec<PrevoutKey> = Vec::with_capacity(vin_count);
+
+    for vin_idx in 0..vin_count {
+        let prev_txid_le_bytes = c.take(32)?;
+        let prev_vout = c.take_u32_le()?;
+
+        if vin_idx == 0
+            && vin_count == 1
+            && prev_vout == 0xffff_ffff
+            && prev_txid_le_bytes.iter().all(|&b| b == 0)
+        {
+            coinbase = true;
+        }
+
+        let script_len = read_varint(&mut c)? as usize;
+        let _ = c.take(script_len)?; // scriptSig
+        let _sequence = c.take_u32_le()?; // sequence
+
+        if !coinbase {
+            let mut txid_le = [0u8; 32];
+            txid_le.copy_from_slice(prev_txid_le_bytes);
+            keys.push(PrevoutKey {
+                txid_le,
+                vout: prev_vout,
+            });
+        }
+    }
+
+    // Coinbase txs don't require prevouts.
+    if coinbase {
+        {
+        let empty: &[(u64, &[u8])] = &[];
+        return analyze_tx_from_bytes_ordered(network, &raw, empty);
+    }
+    }
+
+    if prevouts.len() != keys.len() {
+        return Err(format!(
+            "prevouts length mismatch: got {} expected {}",
+            prevouts.len(),
+            keys.len()
+        ));
+    }
+
+    // Helper: fixture prevout uses display big-endian txid; tx serialization uses little-endian.
+    #[inline]
+    fn prevout_key_from_hex(txid_hex: &str, vout: u32) -> Result<PrevoutKey, String> {
+        let mut be = hex_to_bytes(txid_hex)?;
+        if be.len() != 32 {
+            return Err("prevout txid must be 32 bytes".into());
+        }
+        be.reverse();
+        let mut txid_le = [0u8; 32];
+        txid_le.copy_from_slice(&be);
+        Ok(PrevoutKey { txid_le, vout })
+    }
+
+    // --- 2) Fast path: if fixture prevouts are already in vin order, avoid HashMap entirely ---
+    let mut ordered_ok = true;
+    for (i, p) in prevouts.iter().enumerate() {
+        let k = prevout_key_from_hex(&p.txid_hex, p.vout)?;
+        if k != keys[i] {
+            ordered_ok = false;
+            break;
+        }
+    }
+
+    let mut prevouts_ordered: Vec<(u64, Vec<u8>)> = Vec::with_capacity(keys.len());
+
+    if ordered_ok {
+        for p in prevouts {
+            prevouts_ordered.push((p.value_sats, hex_to_bytes(&p.script_pubkey_hex)?));
+        }
+    } else {
+        // --- 3) General path: build a fast hash map from outpoint -> (value, script_pubkey_bytes) ---
+        let mut prevmap: AHashMap<PrevoutKey, (u64, Vec<u8>)> =
+            AHashMap::with_capacity(prevouts.len().saturating_mul(2));
+
+        for p in prevouts {
+            let k = prevout_key_from_hex(&p.txid_hex, p.vout)?;
+            let spk_bytes = hex_to_bytes(&p.script_pubkey_hex)?;
+            prevmap.insert(k, (p.value_sats, spk_bytes));
+        }
+
+        for k in &keys {
+            let (value, spk) = prevmap
+                .remove(k)
+                .ok_or_else(|| "missing prevout".to_string())?;
+            prevouts_ordered.push((value, spk));
+        }
+    }
+
+    // --- 4) Run the ordered, allocation-lean analyzer ---
+    {
+        // Convert owned scripts to borrowed slices for the zero-copy core analyzer.
+        let borrowed: Vec<(u64, &[u8])> = prevouts_ordered
+            .iter()
+            .map(|(v, spk)| (*v, spk.as_slice()))
+            .collect();
+        analyze_tx_from_bytes_ordered(network, &raw, &borrowed)
+    }
+}
+
+
 
 # =================== magic.sh
 
@@ -4419,7 +5550,7 @@ while IFS= read -r -d '' f; do
   cat -- "$f" >> "$OUT"
 done < <("${find_cmd[@]}" -print0)
 
-....... web.sh........
+...................
 
 #!/usr/bin/env bash
 set -euo pipefail
@@ -4448,8 +5579,8 @@ export PORT
 exec ./target/release/chainlens_web
 
 
+......... web.sh .............
 
-....... cli.sh ......
 
 #!/usr/bin/env bash
 set -euo pipefail
@@ -4535,3 +5666,5 @@ if [[ ! -x "./target/release/chainlens_cli" ]]; then
 fi
 
 exec ./target/release/chainlens_cli "$FIXTURE"
+
+............cli.sh ...........

@@ -7,6 +7,136 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::hash::{Hash, Hasher};
 
+// ===============================
+// CORE LAYER (Performance First)
+// ===============================
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScriptType {
+    P2PKH = 0,
+    P2SH = 1,
+    P2WPKH = 2,
+    P2WSH = 3,
+    P2TR = 4,
+    OpReturn = 5,
+    Unknown = 6,
+}
+
+impl ScriptType {
+    #[inline]
+    fn as_str(self) -> &'static str {
+        match self {
+            ScriptType::P2PKH => "p2pkh",
+            ScriptType::P2SH => "p2sh",
+            ScriptType::P2WPKH => "p2wpkh",
+            ScriptType::P2WSH => "p2wsh",
+            ScriptType::P2TR => "p2tr",
+            ScriptType::OpReturn => "op_return",
+            ScriptType::Unknown => "unknown",
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SpendType {
+    P2PKH = 0,
+    P2WPKH = 1,
+    P2WSH = 2,
+    P2TRKeyPath = 3,
+    P2TRScriptPath = 4,
+    P2SHP2WPKH = 5,
+    P2SHP2WSH = 6,
+    P2SH = 7,
+    Unknown = 8,
+}
+
+impl SpendType {
+    #[inline]
+    fn as_str(self) -> &'static str {
+        match self {
+            SpendType::P2PKH => "p2pkh",
+            SpendType::P2WPKH => "p2wpkh",
+            SpendType::P2WSH => "p2wsh",
+            SpendType::P2TRKeyPath => "p2tr_keypath",
+            SpendType::P2TRScriptPath => "p2tr_scriptpath",
+            SpendType::P2SHP2WPKH => "p2sh-p2wpkh",
+            SpendType::P2SHP2WSH => "p2sh-p2wsh",
+            SpendType::P2SH => "p2sh",
+            SpendType::Unknown => "unknown",
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WarningCode {
+    RbfSignaling = 0,
+    UnknownOutputScript = 1,
+    DustOutput = 2,
+    HighFee = 3,
+}
+
+impl WarningCode {
+    #[inline]
+    fn as_str(self) -> &'static str {
+        match self {
+            WarningCode::RbfSignaling => "RBF_SIGNALING",
+            WarningCode::UnknownOutputScript => "UNKNOWN_OUTPUT_SCRIPT",
+            WarningCode::DustOutput => "DUST_OUTPUT",
+            WarningCode::HighFee => "HIGH_FEE",
+        }
+    }
+}
+
+// Internal zero-heap core representations (no Strings)
+pub(crate) struct CoreInput<'a> {
+    pub(crate) prev_txid_le: [u8; 32],
+    pub(crate) vout: u32,
+    pub(crate) sequence: u32,
+    pub(crate) script_sig: &'a [u8],
+    pub(crate) witness: Vec<&'a [u8]>,
+    pub(crate) spend_type: SpendType,
+    pub(crate) prev_value: u64,
+    pub(crate) prev_spk: &'a [u8],
+}
+
+pub(crate) struct CoreOutput<'a> {
+    pub(crate) value: u64,
+    pub(crate) spk: &'a [u8],
+    pub(crate) script_type: ScriptType,
+}
+
+pub(crate) struct CoreTx<'a> {
+    pub(crate) txid_le: [u8; 32],
+    pub(crate) wtxid_le: Option<[u8; 32]>,
+    pub(crate) version: u32,
+    pub(crate) locktime: u32,
+    pub(crate) segwit: bool,
+    pub(crate) size_bytes: usize,
+    pub(crate) non_witness_bytes: usize,
+    pub(crate) witness_bytes: usize,
+    pub(crate) weight: usize,
+    pub(crate) vbytes: usize,
+    pub(crate) total_input: u64,
+    pub(crate) total_output: u64,
+    pub(crate) fee: i64,
+    pub(crate) rbf: bool,
+    pub(crate) inputs: Vec<CoreInput<'a>>,
+    pub(crate) outputs: Vec<CoreOutput<'a>>,
+    pub(crate) warnings: Vec<WarningCode>,
+}
+
+// NOTE:
+// Next refactor step:
+// 1) Convert script_type() -> ScriptType (remove String returns)
+// 2) Convert classify_input_spend() -> SpendType
+// 3) Make analyze_tx_from_bytes_ordered_impl build CoreTx
+// 4) Add separate build_tx_report(CoreTx) -> TxReport
+// This splits Core Engine from JSON Layer (Bitcoin Core style).
+
+
 #[derive(Debug, Clone)]
 pub struct Prevout {
     pub txid_hex: String,
@@ -326,7 +456,7 @@ fn read_varint(c: &mut Cursor) -> Result<u64, String> {
     }
 }
 
-fn script_type(spk: &[u8]) -> String {
+fn script_type(spk: &[u8]) -> ScriptType {
     if spk.len() == 25
         && spk[0] == 0x76
         && spk[1] == 0xa9
@@ -334,24 +464,24 @@ fn script_type(spk: &[u8]) -> String {
         && spk[23] == 0x88
         && spk[24] == 0xac
     {
-        return "p2pkh".into();
+        return ScriptType::P2PKH;
     }
     if spk.len() == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87 {
-        return "p2sh".into();
+        return ScriptType::P2SH;
     }
     if spk.len() == 22 && spk[0] == 0x00 && spk[1] == 0x14 {
-        return "p2wpkh".into();
+        return ScriptType::P2WPKH;
     }
     if spk.len() == 34 && spk[0] == 0x00 && spk[1] == 0x20 {
-        return "p2wsh".into();
+        return ScriptType::P2WSH;
     }
     if spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20 {
-        return "p2tr".into();
+        return ScriptType::P2TR;
     }
     if !spk.is_empty() && spk[0] == 0x6a {
-        return "op_return".into();
+        return ScriptType::OpReturn;
     }
-    "unknown".into()
+    ScriptType::Unknown
 }
 
 fn parse_op_return_data(spk: &[u8]) -> Option<Vec<u8>> {
@@ -707,15 +837,12 @@ fn classify_input_spend(
     script_sig: &[u8],
     witness_items: &[&[u8]],
     include_witness_script_asm: bool,
-) -> (String, Option<String>) {
-    // Returns (script_type, witness_script_asm).
-    // witness_script_asm is only set for p2wsh and p2sh-p2wsh per README.
-
+) -> (SpendType, Option<String>) {
     if is_p2pkh_spk(prevout_spk) {
-        return ("p2pkh".to_string(), None);
+        return (SpendType::P2PKH, None);
     }
     if is_p2wpkh_spk(prevout_spk) {
-        return ("p2wpkh".to_string(), None);
+        return (SpendType::P2WPKH, None);
     }
     if is_p2wsh_spk(prevout_spk) {
         let ws_asm = if include_witness_script_asm {
@@ -723,25 +850,25 @@ fn classify_input_spend(
         } else {
             None
         };
-        return ("p2wsh".to_string(), ws_asm);
+        return (SpendType::P2WSH, ws_asm);
     }
     if is_p2tr_spk(prevout_spk) {
         if witness_items.len() == 1 && witness_items[0].len() == 64 {
-            return ("p2tr_keypath".to_string(), None);
+            return (SpendType::P2TRKeyPath, None);
         }
         if let Some(last) = witness_items.last() {
             if !last.is_empty() && (last[0] == 0xc0 || last[0] == 0xc1) {
-                return ("p2tr_scriptpath".to_string(), None);
+                return (SpendType::P2TRScriptPath, None);
             }
         }
-        return ("unknown".to_string(), None);
+        return (SpendType::Unknown, None);
     }
     if is_p2sh_spk(prevout_spk) {
         let Some(rs) = extract_last_push(script_sig) else {
-            return ("unknown".to_string(), None);
+            return (SpendType::Unknown, None);
         };
         if is_p2wpkh_spk(rs) {
-            return ("p2sh-p2wpkh".to_string(), None);
+            return (SpendType::P2SHP2WPKH, None);
         }
         if is_p2wsh_spk(rs) {
             let ws_asm = if include_witness_script_asm {
@@ -749,12 +876,11 @@ fn classify_input_spend(
             } else {
                 None
             };
-            return ("p2sh-p2wsh".to_string(), ws_asm);
+            return (SpendType::P2SHP2WSH, ws_asm);
         }
-        return ("unknown".to_string(), None);
+        return (SpendType::P2SH, None);
     }
-
-    ("unknown".to_string(), None)
+    (SpendType::Unknown, None)
 }
 
 #[inline]
@@ -861,25 +987,12 @@ impl Hash for PrevoutKey {
 /// Each entry is `(value_sats, script_pubkey_bytes)`.
 ///
 /// This avoids hex decoding/encoding and avoids building a prevout HashMap.
-fn analyze_tx_from_bytes_ordered_impl(
-    network: &str,
-    raw: &[u8],
-    prevouts_ordered: &[(u64, &[u8])],
+fn analyze_tx_from_bytes_ordered_impl<'a>(
+    _network: &str,
+    raw: &'a [u8],
+    prevouts_ordered: &'a [(u64, &'a [u8])],
     flags: TxComputeFlags,
-) -> Result<TxReport, String> {
-    #[inline]
-    fn txid_le_slice_to_display_hex(txid_le: &[u8]) -> String {
-        let mut be = [0u8; 32];
-        be.copy_from_slice(txid_le);
-        be.reverse();
-        hex::encode(be)
-    }
-
-    #[inline]
-    fn round2(x: f64) -> f64 {
-        (x * 100.0).round() / 100.0
-    }
-
+) -> Result<CoreTx<'a>, String> {
     let size_bytes = raw.len();
     let mut c = Cursor::new(raw);
 
@@ -898,17 +1011,14 @@ fn analyze_tx_from_bytes_ordered_impl(
         c.backtrack_1()?;
     }
 
-    // For legacy txs, txid is just dSHA256(raw) and wtxid must be null.
-    // For segwit txs, wtxid is dSHA256(raw) and txid is dSHA256(stripped).
-    let (wtxid_full, mut txid_hasher) = if segwit {
-        (Some(hash_to_display_hex(dsha256(raw))), Some(Dsha256Writer::new()))
+    let mut txid_hasher = if segwit {
+        Some(Dsha256Writer::new())
     } else {
-        (None, None)
+        None
     };
 
     if let Some(h) = txid_hasher.as_mut() {
         h.write(&version.to_le_bytes());
-        // marker+flag are NOT included in txid serialization
     }
 
     // --- VIN ---
@@ -918,20 +1028,15 @@ fn analyze_tx_from_bytes_ordered_impl(
         write_varint_hasher(h, vin_count_u64);
     }
 
-    let mut vin_outpoints: Vec<(String, u32)> = Vec::with_capacity(vin_count);
-    let mut vin_script_sig_hex: Vec<String> = Vec::with_capacity(vin_count);
-    let mut vin_script_sig_asm: Vec<String> = Vec::with_capacity(vin_count);
-    let mut vin_script_sig_bytes: Vec<&[u8]> = Vec::with_capacity(vin_count);
-    let mut vin_sequences: Vec<u32> = Vec::with_capacity(vin_count);
-
+    let mut inputs: Vec<CoreInput> = Vec::with_capacity(vin_count);
     let mut rbf_signaling = false;
     let mut coinbase = false;
 
-    for _ in 0..vin_count {
+    for vin_index in 0..vin_count {
         let prev_txid_le_bytes = c.take(32)?;
         let prev_vout = c.take_u32_le()?;
 
-        if !coinbase
+        if vin_index == 0
             && vin_count == 1
             && prev_vout == 0xffff_ffff
             && prev_txid_le_bytes.iter().all(|&b| b == 0)
@@ -940,14 +1045,9 @@ fn analyze_tx_from_bytes_ordered_impl(
         }
 
         if let Some(h) = txid_hasher.as_mut() {
-            // TxID serialization uses LE txid.
             h.write(prev_txid_le_bytes);
             h.write(&prev_vout.to_le_bytes());
         }
-
-        // Human display uses BE.
-        let prev_txid_hex = txid_le_slice_to_display_hex(prev_txid_le_bytes);
-        vin_outpoints.push((prev_txid_hex, prev_vout));
 
         let script_len_u64 = read_varint(&mut c)?;
         let script_len = script_len_u64 as usize;
@@ -959,27 +1059,41 @@ fn analyze_tx_from_bytes_ordered_impl(
         if let Some(h) = txid_hasher.as_mut() {
             h.write(script_sig);
         }
-        vin_script_sig_hex.push(if flags.include_script_hex {
-            bytes_to_hex(script_sig)
-        } else {
-            String::new()
-        });
-        vin_script_sig_asm.push(if flags.include_script_asm {
-            disasm_script(script_sig)
-        } else {
-            String::new()
-        });
-        vin_script_sig_bytes.push(script_sig);
 
         let sequence = c.take_u32_le()?;
         if let Some(h) = txid_hasher.as_mut() {
             h.write(&sequence.to_le_bytes());
         }
-        vin_sequences.push(sequence);
 
         if sequence < 0xffff_fffe {
             rbf_signaling = true;
         }
+
+        let (prev_value, prev_spk) = if coinbase {
+            (0u64, &[][..])
+        } else {
+            prevouts_ordered
+                .get(vin_index)
+                .copied()
+                .ok_or_else(|| "prevouts_ordered length mismatch".to_string())?
+        };
+
+        let witness: Vec<&[u8]> = Vec::new(); // filled later
+
+        inputs.push(CoreInput {
+            prev_txid_le: {
+                let mut t = [0u8; 32];
+                t.copy_from_slice(prev_txid_le_bytes);
+                t
+            },
+            vout: prev_vout,
+            sequence,
+            script_sig,
+            witness,
+            spend_type: SpendType::Unknown, // filled later
+            prev_value,
+            prev_spk,
+        });
     }
 
     // --- VOUT ---
@@ -989,11 +1103,8 @@ fn analyze_tx_from_bytes_ordered_impl(
         write_varint_hasher(h, vout_count_u64);
     }
 
+    let mut outputs: Vec<CoreOutput> = Vec::with_capacity(vout_count);
     let mut total_output_sats: u64 = 0;
-    let mut vout_reports: Vec<VoutReport> = Vec::with_capacity(vout_count);
-    let mut has_unknown_output = false;
-    let mut has_dust_output = false;
-    let track_warnings = flags.include_warnings;
 
     for _ in 0..vout_count {
         let value = c.take_u64_le()?;
@@ -1013,87 +1124,27 @@ fn analyze_tx_from_bytes_ordered_impl(
             h.write(spk);
         }
 
-        let stype = script_type(spk);
-        if track_warnings {
-            if stype == "unknown" {
-                has_unknown_output = true;
-            }
-            // README dust rule: any non-OP_RETURN output with value_sats < 546.
-            if stype != "op_return" && value < 546 {
-                has_dust_output = true;
-            }
-        }
-
-        let (op_hex, op_utf8, op_proto) = if flags.include_op_return && stype == "op_return" {
-            // Concatenate all pushes after OP_RETURN per README requirements.
-            if let Some(data) = parse_op_return_data(spk) {
-                let h = bytes_to_hex(&data);
-                let u = std::str::from_utf8(&data).ok().map(|s| s.to_string());
-
-                let proto = if data.starts_with(&[0x6f, 0x6d, 0x6e, 0x69]) {
-                    "omni"
-                } else if data.starts_with(&[0x01, 0x09, 0xf9, 0x11, 0x02]) {
-                    "opentimestamps"
-                } else {
-                    "unknown"
-                };
-
-                (Some(h), u, Some(proto.to_string()))
-            } else {
-                // bare OP_RETURN or malformed push encoding
-                (Some(String::new()), None, Some("unknown".to_string()))
-            }
-        } else {
-            (None, None, None)
-        };
-
-        vout_reports.push(VoutReport {
-            n: vout_reports.len() as u32,
-            value_sats: value,
-            script_pubkey_hex: if flags.include_script_hex {
-                bytes_to_hex(spk)
-            } else {
-                String::new()
-            },
-            script_asm: if flags.include_script_asm {
-                disasm_script(spk)
-            } else {
-                String::new()
-            },
-            script_type: stype,
-            address: if flags.include_addresses {
-                address_from_spk(network, spk)?
-            } else {
-                None
-            },
-            op_return_data_hex: op_hex,
-            op_return_data_utf8: op_utf8,
-            op_return_protocol: op_proto,
+        outputs.push(CoreOutput {
+            value,
+            spk,
+            script_type: script_type(spk),
         });
     }
 
     // --- Witness ---
-    let mut witnesses: Vec<Vec<String>> = vec![Vec::new(); vin_count];
-    let mut witnesses_bytes: Vec<Vec<&[u8]>> = vec![Vec::new(); vin_count];
     if segwit {
-        for (idx, slot) in witnesses.iter_mut().enumerate() {
+        for input in inputs.iter_mut() {
             let n_stack = read_varint(&mut c)? as usize;
-            let mut items_hex: Vec<String> = Vec::with_capacity(n_stack);
-            let mut items_bytes: Vec<&[u8]> = Vec::with_capacity(n_stack);
+            let mut items: Vec<&[u8]> = Vec::with_capacity(n_stack);
             for _ in 0..n_stack {
                 let item_len = read_varint(&mut c)? as usize;
                 let item = c.take(item_len)?;
-                if flags.include_witness_hex {
-                    items_hex.push(bytes_to_hex(item));
-                }
-                items_bytes.push(item);
+                items.push(item);
             }
-            *slot = if flags.include_witness_hex { items_hex } else { Vec::new() };
-            witnesses_bytes[idx] = items_bytes;
+            input.witness = items;
         }
     }
 
-    // locktime
     let locktime = c.take_u32_le()?;
     if let Some(h) = txid_hasher.as_mut() {
         h.write(&locktime.to_le_bytes());
@@ -1103,228 +1154,313 @@ fn analyze_tx_from_bytes_ordered_impl(
         return Err("trailing bytes after parsing".into());
     }
 
-    // non-witness size is only meaningful for segwit txs (txid-hasher len).
-    let non_witness_size = if let Some(h) = txid_hasher.as_ref() {
-        h.len
+    let non_witness_size = txid_hasher.as_ref().map(|h| h.len).unwrap_or(size_bytes);
+    let non_witness_bytes = non_witness_size;
+    let witness_bytes = if segwit {
+        size_bytes.saturating_sub(non_witness_size)
     } else {
-        size_bytes
+        0
     };
 
-    let txid = if segwit {
-        hash_to_display_hex(txid_hasher.take().unwrap().finish())
+    let txid_le = if segwit {
+        txid_hasher.unwrap().finish()
     } else {
-        // Legacy txid is the hash of the full raw tx.
-        hash_to_display_hex(dsha256(raw))
+        dsha256(raw)
     };
 
-    if segwit && !coinbase && prevouts_ordered.len() != vin_count {
-        return Err(format!(
-            "prevouts_ordered length mismatch: got {} expected {}",
-            prevouts_ordered.len(),
-            vin_count
-        ));
-    }
-
+        // Compute input totals + spend types
     let mut total_input_sats: u64 = 0;
-    let mut vin_reports: Vec<VinReport> = Vec::with_capacity(vin_count);
-
-    if coinbase {
-        rbf_signaling = false;
-    }
-
-    // Build vin reports using moves (avoid clones).
-    let mut out_iter = vin_outpoints.into_iter();
-    let mut ss_iter = vin_script_sig_hex.into_iter();
-    let mut asm_iter = vin_script_sig_asm.into_iter();
-    let mut ssb_iter = vin_script_sig_bytes.into_iter();
-    let mut seq_iter = vin_sequences.into_iter();
-    let mut wit_iter = witnesses.into_iter();
-    let mut witb_iter = witnesses_bytes.into_iter();
-
-    for i in 0..vin_count {
-        let (txid_in, vout_in) = out_iter.next().unwrap();
-        let script_sig_hex = ss_iter.next().unwrap();
-        let script_asm = asm_iter.next().unwrap();
-        let sequence = seq_iter.next().unwrap();
-        let witness = wit_iter.next().unwrap();
-        let witness_b = witb_iter.next().unwrap();
-        let script_sig_b = ssb_iter.next().unwrap();
-
-        if coinbase {
-            vin_reports.push(VinReport {
-                txid: txid_in,
-                vout: vout_in,
-                sequence,
-                script_sig_hex,
-                script_asm,
-                witness,
-                witness_script_asm: None,
-                script_type: "unknown".to_string(),
-                address: None,
-                prevout: PrevoutInfo {
-                    value_sats: 0,
-                    script_pubkey_hex: String::new(),
-                },
-                relative_timelock: RelativeTimelock {
-                    enabled: false,
-                    r#type: None,
-                    value: None,
-                },
-            });
-            continue;
-        }
-
-        let (val, spk_bytes) = prevouts_ordered[i];
-        total_input_sats = total_input_sats.saturating_add(val);
-
-        let (in_type, witness_script_asm) =
-            classify_input_spend(spk_bytes, script_sig_b, witness_b.as_slice(), flags.include_script_asm);
-
-        vin_reports.push(VinReport {
-            txid: txid_in,
-            vout: vout_in,
-            sequence,
-            script_sig_hex,
-            script_asm,
-            witness,
-            witness_script_asm,
-            script_type: in_type,
-            address: if flags.include_addresses {
-                address_from_spk(network, spk_bytes)?
-            } else {
-                None
-            },
-            prevout: PrevoutInfo {
-                value_sats: val,
-                script_pubkey_hex: if flags.include_script_hex {
-                    bytes_to_hex(spk_bytes)
-                } else {
-                    String::new()
-                },
-            },
-            relative_timelock: relative_timelock(version, sequence),
-        });
+    for input in inputs.iter_mut() {
+        total_input_sats = total_input_sats.saturating_add(input.prev_value);
+        input.spend_type = classify_input_spend(
+            input.prev_spk,
+            input.script_sig,
+            &input.witness,
+            false,
+        )
+        .0;
     }
 
     if coinbase {
         total_input_sats = total_output_sats;
+        rbf_signaling = false;
     }
 
-    let mut fee_sats_i64 = (total_input_sats as i64) - (total_output_sats as i64);
-    if coinbase {
-        fee_sats_i64 = 0;
-    }
+    let fee = if coinbase {
+        0
+    } else {
+        total_input_sats as i64 - total_output_sats as i64
+    };
 
-    let (weight, vbytes, wtxid_opt, segwit_savings) = if segwit {
+    let weight = if segwit {
         let witness_bytes = size_bytes.saturating_sub(non_witness_size);
-        let weight_actual = non_witness_size * 4 + witness_bytes;
-        let vbytes = weight_actual.div_ceil(4);
+        non_witness_size * 4 + witness_bytes
+    } else {
+        size_bytes * 4
+    };
 
-        let weight_if_legacy = size_bytes * 4;
+        let vbytes = weight.div_ceil(4);
+
+    // --- Core warning generation (enum-based, no Strings) ---
+    let mut warnings: Vec<WarningCode> = Vec::new();
+
+    if flags.include_warnings {
+        if rbf_signaling {
+            warnings.push(WarningCode::RbfSignaling);
+        }
+
+        // Unknown output scripts
+        if outputs.iter().any(|o| o.script_type == ScriptType::Unknown) {
+            warnings.push(WarningCode::UnknownOutputScript);
+        }
+
+        // Dust detection (simple heuristic: < 546 sats and not OP_RETURN)
+        if outputs.iter().any(|o| {
+            o.value < 546 && o.script_type != ScriptType::OpReturn
+        }) {
+            warnings.push(WarningCode::DustOutput);
+        }
+
+        // High fee heuristic (> 1 BTC absolute fee)
+        if !coinbase && fee > 100_000_000 {
+            warnings.push(WarningCode::HighFee);
+        }
+    }
+
+    Ok(CoreTx {
+        txid_le,
+        wtxid_le: if segwit { Some(dsha256(raw)) } else { None },
+        version,
+        locktime,
+        segwit,
+        size_bytes,
+        non_witness_bytes,
+        witness_bytes,
+        weight,
+        vbytes,
+        total_input: total_input_sats,
+        total_output: total_output_sats,
+        fee,
+        rbf: rbf_signaling,
+        inputs,
+        outputs,
+        warnings,
+    })
+}
+
+// JSON layer: build TxReport from CoreTx
+fn build_tx_report(network: &str, core: CoreTx, flags: TxComputeFlags) -> Result<TxReport, String> {
+    let txid = hash_to_display_hex(core.txid_le);
+    let wtxid = core.wtxid_le.map(hash_to_display_hex);
+
+    // --- vin ---
+    let mut vin: Vec<VinReport> = Vec::with_capacity(core.inputs.len());
+    for inp in &core.inputs {
+        let prev_txid = hash_to_display_hex(inp.prev_txid_le);
+        let script_sig_hex = if flags.include_script_hex {
+            bytes_to_hex(inp.script_sig)
+        } else {
+            String::new()
+        };
+        let script_asm = if flags.include_script_asm {
+            disasm_script(inp.script_sig)
+        } else {
+            String::new()
+        };
+
+        let witness: Vec<String> = if flags.include_witness_hex {
+            inp.witness.iter().map(|w| bytes_to_hex(w)).collect()
+        } else {
+            Vec::new()
+        };
+
+        let (spend_type, witness_script_asm) = classify_input_spend(
+            inp.prev_spk,
+            inp.script_sig,
+            &inp.witness,
+            flags.include_script_asm,
+        );
+
+        let address = if flags.include_addresses {
+            address_from_spk(network, inp.prev_spk)?
+        } else {
+            None
+        };
+
+        vin.push(VinReport {
+            txid: prev_txid,
+            vout: inp.vout,
+            sequence: inp.sequence,
+            script_sig_hex,
+            script_asm,
+            witness,
+            witness_script_asm,
+            script_type: spend_type.as_str().to_string(),
+            address,
+            prevout: PrevoutInfo {
+                value_sats: inp.prev_value,
+                script_pubkey_hex: if flags.include_script_hex {
+                    bytes_to_hex(inp.prev_spk)
+                } else {
+                    String::new()
+                },
+            },
+            relative_timelock: relative_timelock(core.version, inp.sequence),
+        });
+    }
+
+    // --- vout ---
+    let mut vout: Vec<VoutReport> = Vec::with_capacity(core.outputs.len());
+    for (n, o) in core.outputs.iter().enumerate() {
+        let spk_hex = if flags.include_script_hex {
+            bytes_to_hex(o.spk)
+        } else {
+            String::new()
+        };
+        let script_asm = if flags.include_script_asm {
+            disasm_script(o.spk)
+        } else {
+            String::new()
+        };
+        let address = if flags.include_addresses {
+            address_from_spk(network, o.spk)?
+        } else {
+            None
+        };
+
+        let mut op_return_data_hex: Option<String> = None;
+        let mut op_return_data_utf8: Option<String> = None;
+        let mut op_return_protocol: Option<String> = None;
+
+        if flags.include_op_return && o.script_type == ScriptType::OpReturn {
+            if let Some(data) = parse_op_return_data(o.spk) {
+                op_return_data_hex = Some(bytes_to_hex(&data));
+                if let Ok(s) = std::str::from_utf8(&data) {
+                    op_return_data_utf8 = Some(s.to_string());
+                }
+                // protocol detection is optional; keep None for now
+                op_return_protocol = None;
+            }
+        }
+
+        vout.push(VoutReport {
+            n: n as u32,
+            value_sats: o.value,
+            script_pubkey_hex: spk_hex,
+            script_asm,
+            script_type: o.script_type.as_str().to_string(),
+            address,
+            op_return_data_hex,
+            op_return_data_utf8,
+            op_return_protocol,
+        });
+    }
+
+    // --- segwit savings ---
+    let segwit_savings = if core.segwit {
+        let weight_actual = core.weight;
+        let weight_if_legacy = core.size_bytes * 4;
         let savings_pct = if weight_if_legacy == 0 {
             0.0
         } else {
-            (1.0 - (weight_actual as f64 / weight_if_legacy as f64)) * 100.0
+            ((weight_if_legacy.saturating_sub(weight_actual)) as f64) * 100.0
+                / (weight_if_legacy as f64)
         };
-
-        (
+        Some(SegwitSavings {
+            witness_bytes: core.witness_bytes,
+            non_witness_bytes: core.non_witness_bytes,
+            total_bytes: core.size_bytes,
             weight_actual,
-            vbytes,
-            wtxid_full,
-            Some(SegwitSavings {
-                witness_bytes,
-                non_witness_bytes: non_witness_size,
-                total_bytes: size_bytes,
-                weight_actual,
-                weight_if_legacy,
-                savings_pct: round2(savings_pct),
-            }),
-        )
+            weight_if_legacy,
+            savings_pct,
+        })
     } else {
-        let weight = size_bytes * 4;
-        let vbytes = weight.div_ceil(4);
-        (weight, vbytes, None, None)
+        None
     };
-
-    let fee_rate = if coinbase || vbytes == 0 {
-        0.0
-    } else {
-        (fee_sats_i64 as f64) / (vbytes as f64)
-    };
-    let fee_rate_2dp = round2(fee_rate);
-
-    let mut warnings: Vec<WarningItem> = Vec::new();
-
-    if flags.include_warnings {
-        let high_fee = !coinbase && (fee_sats_i64 > 1_000_000 || fee_rate > 200.0);
-
-        // Emit warnings in a stable order (and avoid duplicates).
-        if rbf_signaling {
-            warnings.push(WarningItem {
-                code: "RBF_SIGNALING".into(),
-            });
-        }
-        if has_unknown_output {
-            warnings.push(WarningItem {
-                code: "UNKNOWN_OUTPUT_SCRIPT".into(),
-            });
-        }
-        if has_dust_output {
-            warnings.push(WarningItem {
-                code: "DUST_OUTPUT".into(),
-            });
-        }
-        if high_fee {
-            warnings.push(WarningItem {
-                code: "HIGH_FEE".into(),
-            });
-        }
-    }
 
     Ok(TxReport {
         ok: true,
         network: network.into(),
-        segwit,
+        segwit: core.segwit,
         txid,
-        wtxid: wtxid_opt,
-        version,
-        locktime,
-        locktime_value: locktime,
-        size_bytes,
-        weight,
-        vbytes,
-        fee_sats: fee_sats_i64,
-        fee_rate_sat_vb: fee_rate_2dp,
-        total_input_sats,
-        total_output_sats,
-        rbf_signaling,
-        locktime_type: locktime_type(locktime),
-        vin: vin_reports,
-        vout: vout_reports,
-        warnings,
+        wtxid,
+        version: core.version,
+        locktime: core.locktime,
+        locktime_value: core.locktime,
+        size_bytes: core.size_bytes,
+        weight: core.weight,
+        vbytes: core.vbytes,
+        fee_sats: core.fee,
+        fee_rate_sat_vb: if core.vbytes == 0 {
+            0.0
+        } else {
+            core.fee as f64 / core.vbytes as f64
+        },
+        total_input_sats: core.total_input,
+        total_output_sats: core.total_output,
+        rbf_signaling: core.rbf,
+        locktime_type: locktime_type(core.locktime),
+        vin,
+        vout,
+        warnings: core
+            .warnings
+            .into_iter()
+            .map(|w| WarningItem {
+                code: w.as_str().to_string(),
+            })
+            .collect(),
         segwit_savings,
     })
 }
 
 /// Full (README-complete) transaction analyzer.
-pub fn analyze_tx_from_bytes_ordered(
+pub fn analyze_tx_from_bytes_ordered<'a>(
     network: &str,
-    raw: &[u8],
-    prevouts_ordered: &[(u64, &[u8])],
+    raw: &'a [u8],
+    prevouts_ordered: &'a [(u64, &'a [u8])],
 ) -> Result<TxReport, String> {
-    analyze_tx_from_bytes_ordered_impl(network, raw, prevouts_ordered, TxComputeFlags::FULL)
+    let core = analyze_tx_from_bytes_ordered_impl(
+        network,
+        raw,
+        prevouts_ordered,
+        TxComputeFlags::FULL,
+    )?;
+    build_tx_report(network, core, TxComputeFlags::FULL)
 }
 
 /// LITE analyzer for block-mode performance.
 ///
-/// This keeps only the computations needed for block-level grading (fees/weights/txids/script types)
-/// and skips expensive hex/asm/address/op_return processing.
-pub fn analyze_tx_from_bytes_ordered_lite(
+/// IMPORTANT:
+/// In high-performance block-mode we should NOT build a TxReport at all.
+/// This wrapper exists only for compatibility with existing callers.
+pub fn analyze_tx_from_bytes_ordered_lite<'a>(
     network: &str,
     raw: &[u8],
     prevouts_ordered: &[(u64, &[u8])],
 ) -> Result<TxReport, String> {
-    analyze_tx_from_bytes_ordered_impl(network, raw, prevouts_ordered, TxComputeFlags::LITE)
+    let core = analyze_tx_from_bytes_ordered_impl(
+        network,
+        raw,
+        prevouts_ordered,
+        TxComputeFlags::LITE,
+    )?;
+    build_tx_report(network, core, TxComputeFlags::LITE)
+}
+
+/// NEW: Pure Core analyzer for block-mode.
+///
+/// This is the function block/mod.rs should call directly.
+/// It avoids ANY JSON construction and returns CoreTx.
+pub fn analyze_tx_core_lite<'a>(
+    raw: &'a [u8],
+    prevouts_ordered: &'a [(u64, &'a [u8])],
+) -> Result<CoreTx<'a>, String> {
+    analyze_tx_from_bytes_ordered_impl(
+        "main", // network not needed for core computation
+        raw,
+        prevouts_ordered,
+        TxComputeFlags::LITE,
+    )
 }
 
 pub fn analyze_tx(network: &str, raw_tx_hex: &str, prevouts: &[Prevout]) -> Result<TxReport, String> {
@@ -1454,3 +1590,4 @@ pub fn analyze_tx(network: &str, raw_tx_hex: &str, prevouts: &[Prevout]) -> Resu
         analyze_tx_from_bytes_ordered(network, &raw, &borrowed)
     }
 }
+
