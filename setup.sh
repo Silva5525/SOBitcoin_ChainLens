@@ -17,4 +17,8 @@ for gz in fixtures/blocks/*.dat.gz; do
   fi
 done
 
+# Prebuild Rust binaries once during setup so per-fixture cli.sh calls are fast.
+# This avoids 60s timeouts on the first fixture in GitHub runners.
+cargo build --release --bin chainlens_cli --bin chainlens_web --quiet
+
 echo "Setup complete"

@@ -5,3 +5,9 @@ node_modules/
 __pycache__/
 target/
 .env
+sample_fixture.json
+tests/
+tests
+magic.sh]
+flamegraph.svg
+perf.data
