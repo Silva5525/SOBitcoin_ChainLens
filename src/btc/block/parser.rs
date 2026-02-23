@@ -96,6 +96,70 @@ pub(crate) fn read_varint(c: &mut Cursor) -> Result<u64, String> {
     }
 }
 
+// ------------------------------------------------------------
+// Hot-path helpers (max speed)
+// ------------------------------------------------------------
+/// Read Bitcoin CompactSize/VarInt directly from a byte-slice cursor.
+///
+/// This avoids `Cursor` construction and is suitable for ultra-cheap checks in hot paths
+/// (e.g. blk↔rev pairing).
+#[inline]
+pub(crate) fn read_varint_bytes(input: &mut &[u8]) -> Result<u64, String> {
+    if input.is_empty() {
+        return Err(err("UNEXPECTED_EOF", "varint: empty input"));
+    }
+    let first = input[0];
+    *input = &input[1..];
+
+    match first {
+        0x00..=0xfc => Ok(first as u64),
+        0xfd => {
+            if input.len() < 2 {
+                return Err(err("UNEXPECTED_EOF", "varint: 0xfd missing 2 bytes"));
+            }
+            let v = u16::from_le_bytes([input[0], input[1]]) as u64;
+            *input = &input[2..];
+            Ok(v)
+        }
+        0xfe => {
+            if input.len() < 4 {
+                return Err(err("UNEXPECTED_EOF", "varint: 0xfe missing 4 bytes"));
+            }
+            let v = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as u64;
+            *input = &input[4..];
+            Ok(v)
+        }
+        0xff => {
+            if input.len() < 8 {
+                return Err(err("UNEXPECTED_EOF", "varint: 0xff missing 8 bytes"));
+            }
+            let v = u64::from_le_bytes([
+                input[0], input[1], input[2], input[3],
+                input[4], input[5], input[6], input[7],
+            ]);
+            *input = &input[8..];
+            Ok(v)
+        }
+    }
+}
+
+/// Ultra-cheap extraction of the block transaction count from a raw block payload.
+///
+/// Block payload format: 80-byte header followed by CompactSize(tx_count).
+///
+/// This is intentionally minimal and intended for fast-path plausibility checks.
+#[inline]
+pub(crate) fn block_tx_count_fast(block_payload: &[u8]) -> Result<u64, String> {
+    if block_payload.len() < 81 {
+        return Err(err("UNEXPECTED_EOF", "block: too small for header + tx_count"));
+    }
+    let mut cur = &block_payload[80..];
+    let txc = read_varint_bytes(&mut cur)?;
+    // Conservative sanity bound. Real blocks are far below this, but allow wiggle room.
+    ensure_len("block", "tx_count", txc, 200_000)?;
+    Ok(txc)
+}
+
 #[inline]
 fn sha256d_finish(h: Sha256) -> [u8; 32] {
     let h1 = h.finalize();

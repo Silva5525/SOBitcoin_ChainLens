@@ -155,21 +155,6 @@ fn block_hash_le(block_payload: &[u8]) -> Result<[u8; 32], String> {
     Ok(dsha256_bytes(&block_payload[..80]))
 }
 
-/// Helpers to extract structural counts from block and undo payloads.
-///
-/// We do not rely on on-disk ordering between blk*.dat and rev*.dat.
-/// Instead, pairing is done using structural invariants and full validation
-/// against the block's transactions.
-fn block_tx_count(block: &[u8]) -> Result<u64, String> {
-    let mut bc = parser::Cursor::new(block);
-    if bc.remaining() < 80 {
-        return Err(err("INVALID_BLOCK", "block payload too small for header"));
-    }
-    bc.take(80)?;
-    parser::read_varint(&mut bc).map_err(|e| err("INVALID_BLOCK", e))
-}
-
-
 /// Attempt fast-path pairing.
 ///
 /// Order between blk*.dat and rev*.dat is *often* aligned in practice (height order),
@@ -340,7 +325,7 @@ fn pair_rev_to_blocks_index_if_plausible(
         let block = &blk_buf[br.clone()];
         let undo_payload = &rev_buf[rr.payload.clone()];
 
-        let txc = block_tx_count(block)?;
+        let txc = parser::block_tx_count_fast(block)?;
         if txc == 0 {
             return Ok(None);
         }
@@ -404,7 +389,7 @@ fn pair_rev_to_blocks_fallback_validate_fill(
         }
 
         let block = &blk_buf[br.clone()];
-        let txc = block_tx_count(block)?;
+        let txc = parser::block_tx_count_fast(block)?;
         if txc == 0 {
             return Err(err("INVALID_BLOCK", format!("block[{i}] tx_count=0")));
         }
