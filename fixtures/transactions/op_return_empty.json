@@ -1,0 +1,12 @@
+{
+  "network": "mainnet",
+  "raw_tx": "0200000001cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdabababababababababababababababab0000000000ffffffff010000000000000000016a00000000",
+  "prevouts": [
+    {
+      "txid": "ababababababababababababababababcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "vout": 0,
+      "value_sats": 1000,
+      "script_pubkey_hex": "76a914373737373737373737373737373737373737373788ac"
+    }
+  ]
+}
