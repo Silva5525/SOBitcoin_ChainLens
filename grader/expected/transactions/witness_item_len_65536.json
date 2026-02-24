@@ -1,0 +1,23 @@
+{
+  "ok": true,
+  "network": "mainnet",
+  "segwit": true,
+  "txid": "0e78634c6682c2aa116e0085c76990d1427b1fb955d231434a43160ed4dc5ab8",
+  "wtxid": "b595f8c788aed7bef8854a0f69e563864418b54e9efcf3d51618ebe6a106b36c",
+  "version": 2,
+  "locktime": 0,
+  "size_bytes": 65626,
+  "weight": 65872,
+  "vbytes": 16468,
+  "fee_sats": 1000,
+  "fee_rate_sat_vb": 0.06,
+  "total_input_sats": 10000,
+  "total_output_sats": 9000,
+  "rbf_signaling": false,
+  "locktime_type": "none",
+  "vin_count": 1,
+  "vout_count": 1,
+  "vout_script_types": [
+    "p2wpkh"
+  ]
+}

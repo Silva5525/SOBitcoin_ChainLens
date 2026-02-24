@@ -1,0 +1,6 @@
+{
+  "network": "mainnet",
+  "raw_tx": "0200000001eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee00000000ff10000000000000000000",
+  "prevouts": [],
+  "_expect_ok": false
+}
