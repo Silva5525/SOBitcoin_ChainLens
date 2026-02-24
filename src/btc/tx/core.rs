@@ -428,42 +428,47 @@ fn analyze_tx_from_bytes_ordered_impl<'a>(
 
     let vbytes = weight.div_ceil(4);
 
-    // Warnings: best-effort + cheap checks.
-    let mut warnings: Vec<WarningCode> = Vec::new();
-    if flags.include_warnings {
-        if rbf_signaling {
-            warnings.push(WarningCode::RbfSignaling);
-        }
-        if outputs.iter().any(|o| o.script_type == ScriptType::Unknown) {
-            warnings.push(WarningCode::UnknownOutputScript);
-        }
-        if outputs.iter().any(|o| o.value < 546 && o.script_type != ScriptType::OpReturn) {
-            warnings.push(WarningCode::DustOutput);
-        }
-        if !coinbase && fee > 100_000_000 {
-            warnings.push(WarningCode::HighFee);
-        }
-    }
+	// Warnings: best-effort + cheap checks.
+	let mut warnings: Vec<WarningCode> = Vec::new();
+	if flags.include_warnings {
+		if rbf_signaling {
+			warnings.push(WarningCode::RbfSignaling);
+		}
+		if outputs.iter().any(|o| o.script_type == ScriptType::Unknown) {
+			warnings.push(WarningCode::UnknownOutputScript);
+		}
+		if outputs.iter().any(|o| o.value < 546 && o.script_type != ScriptType::OpReturn) {
+			warnings.push(WarningCode::DustOutput);
+		}
+		if !coinbase {
+			let fee_sats = if fee > 0 { fee as u64 } else { 0 };
+			let fee_rate_sat_vb = if vbytes > 0 { fee_sats as f64 / vbytes as f64 } else { 0.0 };
 
-    Ok(CoreTx {
-        txid_le,
-        wtxid_le,
-        version,
-        locktime,
-        segwit,
-        size_bytes,
-        non_witness_bytes: non_witness_size,
-        witness_bytes,
-        weight,
-        vbytes,
-        total_input: total_input_sats,
-        total_output: total_output_sats,
-        fee,
-        rbf: rbf_signaling,
-        inputs,
-        outputs,
-        warnings,
-    })
+			if fee_sats > 1_000_000 || fee_rate_sat_vb > 200.0 {
+				warnings.push(WarningCode::HighFee);
+			}
+		}
+	}
+
+	Ok(CoreTx {
+		txid_le,
+		wtxid_le,
+		version,
+		locktime,
+		segwit,
+		size_bytes,
+		non_witness_bytes: non_witness_size,
+		witness_bytes,
+		weight,
+		vbytes,
+		total_input: total_input_sats,
+		total_output: total_output_sats,
+		fee,
+		rbf: rbf_signaling,
+		inputs,
+		outputs,
+		warnings,
+	})
 }
 
 /// Full analyzer from raw bytes + ordered prevouts (vin-order).
