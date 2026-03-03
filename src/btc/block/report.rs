@@ -4,11 +4,6 @@
 //
 // These types define the exact shape of the serialized block report
 // returned by the block analyzer and written to `out/<block_hash>.json`.
-//
-// Design goals:
-//   - Stable, deterministic JSON (grader-friendly).
-//   - No internal parsing details exposed.
-//   - Reuse `TxReport` for per-transaction analysis.
 
 use serde::Serialize;
 use std::collections::BTreeMap;

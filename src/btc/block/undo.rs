@@ -10,10 +10,10 @@
 // This mirrors Bitcoin Core serialization semantics (serialize.h, ScriptCompressor),
 // but is optimized for analysis rather than full node validation.
 
-use super::parser;
+use super::parser; // Use block parser utilities (Cursor, ensure_len, varint helpers, tx skip)
 
-use k256::elliptic_curve::sec1::ToEncodedPoint;
-use k256::PublicKey;
+use k256::elliptic_curve::sec1::ToEncodedPoint; // Needed to convert k256 PublicKey into SEC1 encoded bytes
+use k256::PublicKey; // Used to decompress secp256k1 pubkeys for ScriptCompressor formats 4/5
 
 // -----------------------------------------------------------------------------
 // Zero-copy script representation
@@ -23,11 +23,11 @@ use k256::PublicKey;
 ///
 /// - `Undo`: raw bytes inside the original undo payload.
 /// - `Arena`: reconstructed/expanded script stored in a shared arena buffer.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // Some variants are only used in certain build paths
+#[derive(Debug, Clone, Copy)] // Small copyable enum for cheap passing
 pub(crate) enum ScriptSrc {
-    Undo,
-    Arena,
+    Undo,  // Script bytes live inside undo payload
+    Arena, // Script bytes live inside the arena buffer
 }
 
 /// A zero-copy slice descriptor for a scriptPubKey.
@@ -36,9 +36,9 @@ pub(crate) enum ScriptSrc {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScriptSlice {
-    pub src: ScriptSrc,
-    pub start: usize,
-    pub len: usize,
+    pub src: ScriptSrc, // Which backing buffer holds the bytes
+    pub start: usize,   // Start offset within that buffer
+    pub len: usize,     // Length in bytes
 }
 
 #[allow(dead_code)]
@@ -46,16 +46,16 @@ impl ScriptSlice {
     /// Materialize the slice as `&[u8]` using either undo payload or arena.
     #[inline]
     pub fn as_slice<'a>(&self, undo_payload: &'a [u8], arena: &'a [u8]) -> &'a [u8] {
-        match self.src {
-            ScriptSrc::Undo => &undo_payload[self.start..self.start + self.len],
-            ScriptSrc::Arena => &arena[self.start..self.start + self.len],
+        match self.src { // Choose the backing buffer based on ScriptSrc
+            ScriptSrc::Undo => &undo_payload[self.start..self.start + self.len], // Borrow from raw undo bytes
+            ScriptSrc::Arena => &arena[self.start..self.start + self.len], // Borrow from reconstructed arena
         }
     }
 }
 
 /// For each non-coinbase tx: a list of (value_sats, ScriptSlice) per input.
 #[allow(dead_code)]
-type UndoPrevoutsSlices = Vec<Vec<(u64, ScriptSlice)>>;
+type UndoPrevoutsSlices = Vec<Vec<(u64, ScriptSlice)>>; // Outer Vec: per tx, inner Vec: per input
 
 // -----------------------------------------------------------------------------
 // Small helpers
@@ -63,37 +63,43 @@ type UndoPrevoutsSlices = Vec<Vec<(u64, ScriptSlice)>>;
 
 /// Build a prefixed error string.
 fn err(code: &str, msg: impl AsRef<str>) -> String {
-    format!("{code}: {}", msg.as_ref())
+    format!("{code}: {}", msg.as_ref()) // Keep error strings machine-parsable by prefixing code
 }
 
 /// Enforce an upper bound for length-like fields.
 fn ensure_len(kind: &str, field: &str, val: u64, max: u64) -> Result<(), String> {
-    parser::ensure_len(kind, field, val, max)
+    parser::ensure_len(kind, field, val, max) // Delegate to shared parser bound-check helper
 }
 
 /// Read Bitcoin Core base-128 VarInt (serialize.h semantics).
+///
+/// NOTE: This is *not* Bitcoin CompactSize. Core's VarInt here is used by ScriptCompressor and Undo.
 fn read_varint_core(c: &mut parser::Cursor) -> Result<u64, String> {
-    let mut n: u64 = 0;
+    let mut n: u64 = 0; // Accumulator
     loop {
-        let ch = c.take_u8()? as u64;
-        let data = ch & 0x7f;
-        n = (n << 7) | data;
-        if (ch & 0x80) != 0 {
-            n = n.checked_add(1).ok_or_else(|| err("VARINT_OVERFLOW", "core varint overflow"))?;
-            continue;
+        let ch = c.take_u8()? as u64; // Read next byte
+        let data = ch & 0x7f; // Lower 7 bits carry data
+        n = (n << 7) | data; // Shift previous bits and append new 7-bit chunk
+        if (ch & 0x80) != 0 { // High bit set means: more bytes follow
+            n = n
+                .checked_add(1) // Core varint adds 1 when continuation bit is set (serialize.h behavior)
+                .ok_or_else(|| err("VARINT_OVERFLOW", "core varint overflow"))?;
+            continue; // Keep reading bytes
         }
-        return Ok(n);
+        return Ok(n); // High bit not set: end of varint
     }
 }
 
 /// Read Bitcoin CompactSize integer.
+///
+/// Used for: CBlockUndo.nTxUndo and per-CTxUndo vin count.
 fn read_compactsize(c: &mut parser::Cursor) -> Result<u64, String> {
-    let first = c.take_u8()?;
+    let first = c.take_u8()?; // Read prefix byte
     match first {
-        0x00..=0xfc => Ok(first as u64),
-        0xfd => Ok(c.take_u16_le()? as u64),
-        0xfe => Ok(c.take_u32_le()? as u64),
-        0xff => Ok(c.take_u64_le()?),
+        0x00..=0xfc => Ok(first as u64), // Direct encoding for 0..252
+        0xfd => Ok(c.take_u16_le()? as u64), // 0xfd + u16 LE
+        0xfe => Ok(c.take_u32_le()? as u64), // 0xfe + u32 LE
+        0xff => Ok(c.take_u64_le()?),        // 0xff + u64 LE
     }
 }
 
@@ -106,9 +112,9 @@ fn read_compactsize(c: &mut parser::Cursor) -> Result<u64, String> {
 /// Only reads the leading CompactSize and enforces a sanity bound.
 #[inline]
 pub(crate) fn undo_txundo_count_fast(undo_payload: &[u8]) -> Result<u64, String> {
-    let mut c = parser::Cursor::new(undo_payload);
-    let n = read_compactsize(&mut c)?;
-    ensure_len("undo", "n_txundo", n, 200_000)?;
+    let mut c = parser::Cursor::new(undo_payload); // Cursor over undo bytes
+    let n = read_compactsize(&mut c)?; // Read CompactSize(nTxUndo)
+    ensure_len("undo", "n_txundo", n, 200_000)?; // Bound count to avoid insane loops
     Ok(n)
 }
 
@@ -121,8 +127,8 @@ pub(crate) fn undo_txundo_count_fast_bytes(input: &mut &[u8]) -> Result<u64, Str
     if input.is_empty() {
         return Err(err("COMPACTSIZE_EOF", "empty input"));
     }
-    let first = input[0];
-    *input = &input[1..];
+    let first = input[0]; // Prefix byte
+    *input = &input[1..]; // Advance slice by 1
 
     let n = match first {
         0x00..=0xfc => first as u64,
@@ -130,16 +136,16 @@ pub(crate) fn undo_txundo_count_fast_bytes(input: &mut &[u8]) -> Result<u64, Str
             if input.len() < 2 {
                 return Err(err("COMPACTSIZE_EOF", "0xfd but missing 2 bytes"));
             }
-            let v = u16::from_le_bytes([input[0], input[1]]) as u64;
-            *input = &input[2..];
+            let v = u16::from_le_bytes([input[0], input[1]]) as u64; // Decode LE u16
+            *input = &input[2..]; // Advance
             v
         }
         0xfe => {
             if input.len() < 4 {
                 return Err(err("COMPACTSIZE_EOF", "0xfe but missing 4 bytes"));
             }
-            let v = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as u64;
-            *input = &input[4..];
+            let v = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as u64; // Decode LE u32
+            *input = &input[4..]; // Advance
             v
         }
         0xff => {
@@ -147,15 +153,14 @@ pub(crate) fn undo_txundo_count_fast_bytes(input: &mut &[u8]) -> Result<u64, Str
                 return Err(err("COMPACTSIZE_EOF", "0xff but missing 8 bytes"));
             }
             let v = u64::from_le_bytes([
-                input[0], input[1], input[2], input[3],
-                input[4], input[5], input[6], input[7],
-            ]);
-            *input = &input[8..];
+                input[0], input[1], input[2], input[3], input[4], input[5], input[6], input[7],
+            ]); // Decode LE u64
+            *input = &input[8..]; // Advance
             v
         }
     };
 
-    ensure_len("undo", "n_txundo", n, 200_000)?;
+    ensure_len("undo", "n_txundo", n, 200_000)?; // Same sanity check
     Ok(n)
 }
 
@@ -164,49 +169,53 @@ pub(crate) fn undo_txundo_count_fast_bytes(input: &mut &[u8]) -> Result<u64, Str
 // -----------------------------------------------------------------------------
 
 /// Decompress Bitcoin Core's compressed amount format.
+///
+/// This is used in undo to store satoshi amounts compactly.
 fn decompress_amount(x: u64) -> u64 {
     if x == 0 {
-        return 0;
+        return 0; // Special-case: 0 stays 0
     }
-    let mut x = x - 1;
-    let e = (x % 10) as u32;
-    x /= 10;
+    let mut x = x - 1; // Core format uses (x-1) internally
+    let e = (x % 10) as u32; // Exponent (number of trailing zeros)
+    x /= 10; // Remove exponent digit
 
     let mut n: u64;
     if e < 9 {
-        let d = (x % 9) + 1;
+        let d = (x % 9) + 1; // Digit 1..9
         x /= 9;
-        n = x * 10 + d;
+        n = x * 10 + d; // Rebuild base number
     } else {
-        n = x + 1;
+        n = x + 1; // Special case when exponent==9
     }
 
     for _ in 0..e {
-        n *= 10;
+        n *= 10; // Apply trailing zeros
     }
     n
 }
 
 /// Reconstruct uncompressed pubkey (65 bytes) from X coordinate + parity.
+///
+/// ScriptCompressor stores some P2PK scripts as (x, parity) and we rebuild 65-byte pubkey.
 fn decompress_uncompressed_pubkey_from_x(x32: &[u8], y_is_odd: bool) -> Result<Vec<u8>, String> {
     if x32.len() != 32 {
         return Err(err("INVALID_PUBKEY", "x32 must be 32 bytes"));
     }
 
-    let mut comp = [0u8; 33];
-    comp[0] = if y_is_odd { 0x03 } else { 0x02 };
-    comp[1..].copy_from_slice(x32);
+    let mut comp = [0u8; 33]; // Build compressed pubkey bytes
+    comp[0] = if y_is_odd { 0x03 } else { 0x02 }; // Prefix indicates parity
+    comp[1..].copy_from_slice(x32); // Copy x coordinate
 
-    let pk = PublicKey::from_sec1_bytes(&comp)
+    let pk = PublicKey::from_sec1_bytes(&comp) // Let k256 compute the y coordinate on the curve
         .map_err(|_| err("INVALID_PUBKEY", "failed to decompress pubkey from x"))?;
 
-    let enc = pk.to_encoded_point(false);
-    let bytes = enc.as_bytes();
+    let enc = pk.to_encoded_point(false); // Request uncompressed SEC1 encoding
+    let bytes = enc.as_bytes(); // Borrow encoded bytes
     if bytes.len() != 65 || bytes[0] != 0x04 {
         return Err(err("INVALID_PUBKEY", "unexpected uncompressed encoding"));
     }
 
-    Ok(bytes.to_vec())
+    Ok(bytes.to_vec()) // Return owned bytes for arena append
 }
 
 // -----------------------------------------------------------------------------
@@ -214,55 +223,59 @@ fn decompress_uncompressed_pubkey_from_x(x32: &[u8], y_is_odd: bool) -> Result<V
 // -----------------------------------------------------------------------------
 
 /// Read one compressed script and return a zero-copy ScriptSlice.
+///
+/// ScriptCompressor encoding:
+///   0 -> P2PKH (20 bytes hash160)
+///   1 -> P2SH  (20 bytes hash160)
+///   2/3 -> P2PK compressed (32-byte X + prefix)
+///   4/5 -> P2PK uncompressed (32-byte X + parity)
+///   >=6 -> raw script of length (nsize-6)
 #[allow(dead_code)]
-fn read_compressed_script_slice(
-    c: &mut parser::Cursor,
-    arena: &mut Vec<u8>,
-) -> Result<ScriptSlice, String> {
-    let nsize = read_varint_core(c)?;
+fn read_compressed_script_slice(c: &mut parser::Cursor, arena: &mut Vec<u8>) -> Result<ScriptSlice, String> {
+    let nsize = read_varint_core(c)?; // Read Core base-128 varint script "type/size" code
 
     match nsize {
         0 => {
             // P2PKH
-            let h160 = c.take(20)?;
-            let start = arena.len();
-            arena.extend_from_slice(&[0x76, 0xa9, 0x14]);
-            arena.extend_from_slice(h160);
-            arena.extend_from_slice(&[0x88, 0xac]);
-            let len = arena.len() - start;
-            Ok(ScriptSlice { src: ScriptSrc::Arena, start, len })
+            let h160 = c.take(20)?; // Read hash160
+            let start = arena.len(); // Remember arena start
+            arena.extend_from_slice(&[0x76, 0xa9, 0x14]); // OP_DUP OP_HASH160 PUSH20
+            arena.extend_from_slice(h160); // 20-byte pubkey-hash
+            arena.extend_from_slice(&[0x88, 0xac]); // OP_EQUALVERIFY OP_CHECKSIG
+            let len = arena.len() - start; // Compute appended length
+            Ok(ScriptSlice { src: ScriptSrc::Arena, start, len }) // Script bytes live in arena
         }
         1 => {
             // P2SH
             let h160 = c.take(20)?;
             let start = arena.len();
-            arena.extend_from_slice(&[0xa9, 0x14]);
+            arena.extend_from_slice(&[0xa9, 0x14]); // OP_HASH160 PUSH20
             arena.extend_from_slice(h160);
-            arena.push(0x87);
+            arena.push(0x87); // OP_EQUAL
             let len = arena.len() - start;
             Ok(ScriptSlice { src: ScriptSrc::Arena, start, len })
         }
         2 | 3 => {
             // P2PK (compressed)
-            let x = c.take(32)?;
-            let prefix = if nsize == 2 { 0x02 } else { 0x03 };
+            let x = c.take(32)?; // X coordinate
+            let prefix = if nsize == 2 { 0x02 } else { 0x03 }; // Even/odd prefix
             let start = arena.len();
-            arena.push(0x21);
-            arena.push(prefix);
-            arena.extend_from_slice(x);
-            arena.push(0xac);
+            arena.push(0x21); // PUSH33
+            arena.push(prefix); // Pubkey prefix
+            arena.extend_from_slice(x); // Pubkey X
+            arena.push(0xac); // OP_CHECKSIG
             let len = arena.len() - start;
             Ok(ScriptSlice { src: ScriptSrc::Arena, start, len })
         }
         4 | 5 => {
             // P2PK (uncompressed)
-            let x = c.take(32)?;
-            let y_is_odd = nsize == 5;
-            let pubkey65 = decompress_uncompressed_pubkey_from_x(x, y_is_odd)?;
+            let x = c.take(32)?; // X coordinate
+            let y_is_odd = nsize == 5; // 4=even, 5=odd
+            let pubkey65 = decompress_uncompressed_pubkey_from_x(x, y_is_odd)?; // Expand to 65-byte uncompressed
             let start = arena.len();
-            arena.push(0x41);
-            arena.extend_from_slice(&pubkey65);
-            arena.push(0xac);
+            arena.push(0x41); // PUSH65
+            arena.extend_from_slice(&pubkey65); // 65-byte pubkey
+            arena.push(0xac); // OP_CHECKSIG
             let len = arena.len() - start;
             Ok(ScriptSlice { src: ScriptSrc::Arena, start, len })
         }
@@ -271,57 +284,56 @@ fn read_compressed_script_slice(
                 return Err(err("INVALID_SCRIPT_COMPRESSION", "nsize < 6 unexpected"));
             }
 
-            let raw_len_u64 = nsize - 6;
-            ensure_len("undo", "compressed_script_raw_len", raw_len_u64, 100_000)?;
+            let raw_len_u64 = nsize - 6; // Raw script length
+            ensure_len("undo", "compressed_script_raw_len", raw_len_u64, 100_000)?; // Bound script length
 
-            let raw_len: usize = usize::try_from(raw_len_u64)
+            let raw_len: usize = usize::try_from(raw_len_u64) // Convert to usize
                 .map_err(|_| err("LEN_OVERFLOW", format!("raw_len too large for usize: {raw_len_u64}")))?;
 
-            let start = c.pos();
-            let _ = c.take(raw_len)?;
-            Ok(ScriptSlice { src: ScriptSrc::Undo, start, len: raw_len })
+            let start = c.pos(); // Start offset within undo payload
+            let _ = c.take(raw_len)?; // Advance cursor over raw bytes
+            Ok(ScriptSlice { src: ScriptSrc::Undo, start, len: raw_len }) // Reference raw bytes directly
         }
     }
 }
 
 /// Read one CTxUndo input entry (value + script).
+///
+/// Structure mirrors Bitcoin Core's CTxInUndo serialization.
 #[allow(dead_code)]
-fn read_one_inundo_slice(
-    rc: &mut parser::Cursor,
-    arena: &mut Vec<u8>,
-) -> Result<(u64, ScriptSlice), String> {
-    let ncode = read_varint_core(rc)?;
-    let height = ncode >> 1;
+fn read_one_inundo_slice(rc: &mut parser::Cursor, arena: &mut Vec<u8>) -> Result<(u64, ScriptSlice), String> {
+    let ncode = read_varint_core(rc)?; // Core varint encoding of (height, is_coinbase) style field
+    let height = ncode >> 1; // Height is stored in high bits
 
     if height > 0 {
-        let _tx_version = read_varint_core(rc)?;
+        let _tx_version = read_varint_core(rc)?; // If height>0, a tx version field is present
     }
 
-    let comp_amt = read_varint_core(rc)?;
-    let spk = read_compressed_script_slice(rc, arena)?;
-    let value_sats = decompress_amount(comp_amt);
+    let comp_amt = read_varint_core(rc)?; // Compressed amount
+    let spk = read_compressed_script_slice(rc, arena)?; // Compressed script → ScriptSlice
+    let value_sats = decompress_amount(comp_amt); // Convert to satoshis
 
     if spk.len > 100_000 {
         return Err(err("INSANE_LEN", format!("spk too large: {}", spk.len)));
     }
 
-    Ok((value_sats, spk))
+    Ok((value_sats, spk)) // Return (value, script)
 }
 
 /// Strictly parse full undo payload into zero-copy slices.
 #[allow(dead_code)]
 pub(crate) fn parse_undo_payload_strict_slices(
-    undo_payload: &[u8],
-    vin_counts_non_cb: &[u64],
-    arena: &mut Vec<u8>,
+    undo_payload: &[u8], // Raw undo payload for one block
+    vin_counts_non_cb: &[u64], // Expected vin counts for each non-coinbase tx
+    arena: &mut Vec<u8>, // Shared arena for reconstructed scripts
 ) -> Result<UndoPrevoutsSlices, String> {
-    let mut uc = parser::Cursor::new(undo_payload);
-    let v = read_undo_for_block_from_cursor_slices(&mut uc, vin_counts_non_cb, arena)?;
+    let mut uc = parser::Cursor::new(undo_payload); // Cursor over undo bytes
+    let v = read_undo_for_block_from_cursor_slices(&mut uc, vin_counts_non_cb, arena)?; // Parse everything
     if uc.remaining() != 0 {
         return Err(err(
             "UNDO_TRAILING_BYTES",
             format!("undo payload has {} trailing bytes", uc.remaining()),
-        ));
+        )); // Strict: payload must end exactly
     }
     Ok(v)
 }
@@ -330,59 +342,53 @@ pub(crate) fn parse_undo_payload_strict_slices(
 // Fast structural validation (no allocations)
 // -----------------------------------------------------------------------------
 
-// ---- Strict structure validation helpers (no script materialization) ----
-
 /// Extract CompactSize(vin_count) from a raw transaction slice.
 ///
 /// Used for validating undo payload structure against parsed block txs.
 pub(crate) fn extract_vin_count(raw_tx: &[u8]) -> Result<u64, String> {
-    let mut c = parser::Cursor::new(raw_tx);
-    let _ver = c.take_u32_le()?;
+    let mut c = parser::Cursor::new(raw_tx); // Cursor over tx bytes
+    let _ver = c.take_u32_le()?; // Skip version
 
     // SegWit marker+flag (0x00 0x01) may be present.
-    let p = c.take_u8()?;
+    let p = c.take_u8()?; // Peek next byte
     if p == 0x00 {
-        let _f = c.take_u8()?;
+        let _f = c.take_u8()?; // Consume flag (we only need to reach vin_count)
     } else {
-        // Not segwit: rewind one byte.
-        c.i -= 1;
+        c.i -= 1; // Not segwit: rewind
     }
 
-    parser::read_varint(&mut c)
+    parser::read_varint(&mut c) // Read vin_count (Bitcoin CompactSize)
 }
 
 /// Convenience wrapper for callers that already have the tx as a slice.
 #[inline]
 pub(crate) fn extract_vin_count_from_slice(raw_tx: &[u8]) -> Result<u64, String> {
-    extract_vin_count(raw_tx)
+    extract_vin_count(raw_tx) // Just forward to extract_vin_count
 }
 
 /// Skip a ScriptCompressor-compressed script without allocating.
 #[inline]
 fn skip_compressed_script(rc: &mut parser::Cursor) -> Result<(), String> {
-    // ScriptCompressor uses Bitcoin Core base-128 VarInt (not CompactSize).
-    let nsize = read_varint_core(rc)?;
+    let nsize = read_varint_core(rc)?; // Core base-128 varint code
 
     match nsize {
         0 | 1 => {
-            // P2PKH / P2SH: 20-byte hash160
-            let _ = rc.take(20)?;
+            let _ = rc.take(20)?; // Skip hash160
             Ok(())
         }
         2 | 3 | 4 | 5 => {
-            // P2PK (compressed or uncompressed): 32-byte X coordinate
-            let _ = rc.take(32)?;
+            let _ = rc.take(32)?; // Skip X coordinate
             Ok(())
         }
         _ => {
             if nsize < 6 {
                 return Err(err("INVALID_SCRIPT_COMPRESSION", "nsize < 6 unexpected"));
             }
-            let raw_len_u64 = nsize - 6;
-            ensure_len("undo", "compressed_script_raw_len", raw_len_u64, 100_000)?;
+            let raw_len_u64 = nsize - 6; // Raw script length
+            ensure_len("undo", "compressed_script_raw_len", raw_len_u64, 100_000)?; // Bound
             let raw_len: usize = usize::try_from(raw_len_u64)
                 .map_err(|_| err("LEN_OVERFLOW", format!("raw_len too large for usize: {raw_len_u64}")))?;
-            let _ = rc.take(raw_len)?;
+            let _ = rc.take(raw_len)?; // Skip raw bytes
             Ok(())
         }
     }
@@ -391,14 +397,13 @@ fn skip_compressed_script(rc: &mut parser::Cursor) -> Result<(), String> {
 /// Skip a single `CTxUndo` input entry (value + script) without allocating.
 #[inline]
 fn skip_one_inundo(rc: &mut parser::Cursor) -> Result<(), String> {
-    // Matches `read_one_inundo_slice` structure.
-    let ncode = read_varint_core(rc)?;
-    let height = ncode >> 1;
+    let ncode = read_varint_core(rc)?; // Read nCode
+    let height = ncode >> 1; // Extract height
     if height > 0 {
-        let _tx_version = read_varint_core(rc)?;
+        let _tx_version = read_varint_core(rc)?; // Skip tx version if present
     }
-    let _comp_amt = read_varint_core(rc)?;
-    skip_compressed_script(rc)?;
+    let _comp_amt = read_varint_core(rc)?; // Skip compressed amount
+    skip_compressed_script(rc)?; // Skip script
     Ok(())
 }
 
@@ -408,24 +413,19 @@ fn skip_one_inundo(rc: &mut parser::Cursor) -> Result<(), String> {
 ///   - CBlockUndo.nTxUndo (with optional extra empty entry for coinbase),
 ///   - per-txundo vin counts match the block's tx vin counts,
 ///   - payload ends exactly at record end.
-fn validate_undo_payload_strict_structure(
-    undo_payload: &[u8],
-    vin_counts_non_cb: &[u64],
-) -> Result<(), String> {
-    let mut uc = parser::Cursor::new(undo_payload);
+fn validate_undo_payload_strict_structure(undo_payload: &[u8], vin_counts_non_cb: &[u64]) -> Result<(), String> {
+    let mut uc = parser::Cursor::new(undo_payload); // Cursor over undo
 
-    // CBlockUndo: CompactSize(nTxUndo)
-    // Usually tx_count - 1, but some data includes an extra empty CTxUndo for coinbase.
-    let n_txundo = read_compactsize(&mut uc)?;
-    ensure_len("undo", "n_txundo", n_txundo, 200_000)?;
+    let n_txundo = read_compactsize(&mut uc)?; // Read nTxUndo
+    ensure_len("undo", "n_txundo", n_txundo, 200_000)?; // Bound
 
-    let expected = vin_counts_non_cb.len() as u64;
+    let expected = vin_counts_non_cb.len() as u64; // Expected txundo entries (non-coinbase tx count)
 
-    let mut has_cb_undo = false;
+    let mut has_cb_undo = false; // Track whether coinbase undo entry exists
     if n_txundo == expected {
         // ok
     } else if n_txundo == expected.saturating_add(1) {
-        has_cb_undo = true;
+        has_cb_undo = true; // Some datasets include an explicit empty entry for coinbase
     } else {
         return Err(err(
             "UNDO_MISMATCH",
@@ -439,7 +439,7 @@ fn validate_undo_payload_strict_structure(
     }
 
     if has_cb_undo {
-        let cb_vin_n = read_compactsize(&mut uc)?;
+        let cb_vin_n = read_compactsize(&mut uc)?; // Coinbase entry: vin count should be 0
         if cb_vin_n != 0 {
             return Err(err(
                 "UNDO_MISMATCH",
@@ -448,11 +448,11 @@ fn validate_undo_payload_strict_structure(
         }
     }
 
-    for (txundo_idx, &vin_expected) in vin_counts_non_cb.iter().enumerate() {
-        let vin_n = read_compactsize(&mut uc)?;
-        ensure_len("undo", "vin_count", vin_n, 100_000)?;
+    for (txundo_idx, &vin_expected) in vin_counts_non_cb.iter().enumerate() { // Validate each non-coinbase txundo
+        let vin_n = read_compactsize(&mut uc)?; // vin count stored in undo
+        ensure_len("undo", "vin_count", vin_n, 100_000)?; // Bound
 
-        if vin_n != vin_expected {
+        if vin_n != vin_expected { // Must match block's vin count
             return Err(err(
                 "UNDO_MISMATCH",
                 format!(
@@ -462,13 +462,12 @@ fn validate_undo_payload_strict_structure(
             ));
         }
 
-        // Skip vin_n inputs.
-        for _ in 0..(vin_n as usize) {
+        for _ in 0..(vin_n as usize) { // Skip each per-input undo record
             skip_one_inundo(&mut uc)?;
         }
     }
 
-    if uc.remaining() != 0 {
+    if uc.remaining() != 0 { // Strict: must end exactly
         return Err(err(
             "UNDO_TRAILING_BYTES",
             format!("undo payload has {} trailing bytes", uc.remaining()),
@@ -483,16 +482,16 @@ fn validate_undo_payload_strict_structure(
 /// This is the strict, zero-copy path used by block-mode analysis.
 #[allow(dead_code)]
 fn read_undo_for_block_from_cursor_slices(
-    rc: &mut parser::Cursor,
-    vin_counts_non_cb: &[u64],
-    arena: &mut Vec<u8>,
+    rc: &mut parser::Cursor, // Cursor over undo payload
+    vin_counts_non_cb: &[u64], // Expected vin count per non-coinbase tx
+    arena: &mut Vec<u8>, // Arena buffer for reconstructed scripts
 ) -> Result<UndoPrevoutsSlices, String> {
-    let n_txundo = read_compactsize(rc)?;
-    ensure_len("undo", "n_txundo", n_txundo, 200_000)?;
+    let n_txundo = read_compactsize(rc)?; // Read nTxUndo
+    ensure_len("undo", "n_txundo", n_txundo, 200_000)?; // Bound
 
-    let expected = vin_counts_non_cb.len() as u64;
+    let expected = vin_counts_non_cb.len() as u64; // Expected non-coinbase count
 
-    let mut has_cb_undo = false;
+    let mut has_cb_undo = false; // Whether coinbase undo entry exists
     if n_txundo == expected {
         // ok
     } else if n_txundo == expected.saturating_add(1) {
@@ -510,7 +509,7 @@ fn read_undo_for_block_from_cursor_slices(
     }
 
     if has_cb_undo {
-        let cb_vin_n = read_compactsize(rc)?;
+        let cb_vin_n = read_compactsize(rc)?; // Coinbase vin count should be 0
         if cb_vin_n != 0 {
             return Err(err(
                 "UNDO_MISMATCH",
@@ -519,10 +518,10 @@ fn read_undo_for_block_from_cursor_slices(
         }
     }
 
-    let mut all: UndoPrevoutsSlices = Vec::with_capacity(vin_counts_non_cb.len());
+    let mut all: UndoPrevoutsSlices = Vec::with_capacity(vin_counts_non_cb.len()); // Allocate outer vec
 
     for (txundo_idx, &vin_expected) in vin_counts_non_cb.iter().enumerate() {
-        let vin_n = read_compactsize(rc)?;
+        let vin_n = read_compactsize(rc)?; // Read vin count for this txundo
         ensure_len("undo", "vin_count", vin_n, 100_000)?;
 
         if vin_n != vin_expected {
@@ -535,11 +534,11 @@ fn read_undo_for_block_from_cursor_slices(
             ));
         }
 
-        let mut ins: Vec<(u64, ScriptSlice)> = Vec::with_capacity(vin_n as usize);
+        let mut ins: Vec<(u64, ScriptSlice)> = Vec::with_capacity(vin_n as usize); // Allocate per-input list
         for _ in 0..(vin_n as usize) {
-            ins.push(read_one_inundo_slice(rc, arena)?);
+            ins.push(read_one_inundo_slice(rc, arena)?); // Read value+script for each input
         }
-        all.push(ins);
+        all.push(ins); // Push txundo entry
     }
 
     Ok(all)
@@ -550,37 +549,35 @@ fn read_undo_for_block_from_cursor_slices(
 // -----------------------------------------------------------------------------
 
 /// Validate undo payload strictly against vin counts from the block.
-pub(crate) fn validate_undo_payload_against_block(
-    block: &[u8],
-    undo_payload: &[u8],
-) -> Result<(), String> {
-    let mut bc = parser::Cursor::new(block);
+///
+/// This is used in blk↔rev pairing fallback: verify that the undo record actually matches the block.
+pub(crate) fn validate_undo_payload_against_block(block: &[u8], undo_payload: &[u8]) -> Result<(), String> {
+    let mut bc = parser::Cursor::new(block); // Cursor over block payload
 
     if bc.remaining() < 80 {
         return Err(err("INVALID_BLOCK", "block payload too small for header"));
     }
 
-    let _header = bc.take(80)?;
+    let _header = bc.take(80)?; // Skip header
 
-    let tx_count = parser::read_varint(&mut bc)?;
+    let tx_count = parser::read_varint(&mut bc)?; // Read tx_count
     if tx_count == 0 {
         return Err(err("INVALID_BLOCK", "block has zero transactions"));
     }
 
-    let mut vin_counts_non_cb: Vec<u64> =
-        Vec::with_capacity((tx_count as usize).saturating_sub(1));
+    let mut vin_counts_non_cb: Vec<u64> = Vec::with_capacity((tx_count as usize).saturating_sub(1)); // Store vin counts for non-coinbase txs
 
     for tx_idx in 0..(tx_count as usize) {
-        let start = bc.pos();
-        let _txid_le = parser::parse_tx_skip_and_txid_le(block, &mut bc)?;
-        let end = bc.pos();
+        let start = bc.pos(); // Start offset of tx
+        let _txid_le = parser::parse_tx_skip_and_txid_le(block, &mut bc)?; // Skip tx and compute txid (also advances cursor)
+        let end = bc.pos(); // End offset of tx
 
         if tx_idx == 0 {
-            continue; // coinbase
+            continue; // Skip coinbase (undo is for non-coinbase txs)
         }
 
-        vin_counts_non_cb.push(extract_vin_count_from_slice(&block[start..end])?);
+        vin_counts_non_cb.push(extract_vin_count_from_slice(&block[start..end])?); // Extract vin count from tx bytes
     }
 
-    validate_undo_payload_strict_structure(undo_payload, &vin_counts_non_cb)
+    validate_undo_payload_strict_structure(undo_payload, &vin_counts_non_cb) // Validate undo structure matches those vin counts
 }

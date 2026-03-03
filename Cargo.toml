@@ -1,43 +1,88 @@
-[package]
-name = "chainlens"
-version = "0.1.0"
-edition = "2021"
+# ==============================
+# Cargo.toml – Project definition for chainlens
+# Every line is explained directly via comments
+# ==============================
 
-[dependencies]
-# Core
-sha2 = "0.10"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-hex = "0.4"
-k256 = "0.13"
-ahash = "0.8"
+[package]                       # Defines metadata for the entire Cargo package (library + binaries)
+name = "chainlens"              # Name of the library crate → used as `use chainlens::...`
+version = "0.1.0"               # Current package version (SemVer: Major.Minor.Patch)
+edition = "2021"                # Rust edition (2021 = modern language features, recommended)
 
-# Address encoding (neu, weil tx.rs jetzt echte Adressen ausgibt)
-bs58 = "0.5"
-bech32 = "0.9"
 
-# Web server stack
+[dependencies]                   # External crates included at compile time
+
+# ------------------------------
+# Core (Bitcoin / Hashing / JSON / Crypto)
+# ------------------------------
+
+sha2 = "0.10"                    # SHA-256 implementation (used for txid, block hash, merkle root, etc.)
+serde = { version = "1.0", features = ["derive"] }  # Serialization/Deserialization framework + #[derive(Serialize, Deserialize)] support
+serde_json = "1.0"               # JSON encoding/decoding (reports, web API responses)
+hex = "0.4"                      # Hex encoding/decoding (scripts, hashes, debug output)
+k256 = "0.13"                    # secp256k1 (ECDSA / Schnorr support for Bitcoin)
+ahash = "0.8"                    # Very fast HashMap hasher (performance-optimized)
+
+
+# ------------------------------
+# Address encoding
+# ------------------------------
+
+bs58 = "0.5"                     # Base58 encoding (for P2PKH / P2SH addresses)
+bech32 = "0.9"                   # Bech32 encoding (for P2WPKH, P2WSH, P2TR)
+
+
+# ------------------------------
+# Web server stack (used by chainlens_web binary)
+# ------------------------------
+
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Tokio = Async runtime
+# macros → enables #[tokio::main]
+# rt-multi-thread → multi-threaded async executor
+
 axum = { version = "0.7", features = ["multipart"] }
+# Axum = Web framework (HTTP routing, JSON APIs)
+# multipart → enables file upload handling
+
 tower-http = { version = "0.5", features = ["trace"] }
-tempfile = "3"
-tracing = "0.1"
+# Middleware utilities (logging, tracing, etc.)
+# trace → HTTP request/response logging
+
+tempfile = "3"                    # Temporary files (e.g., for upload processing)
+tracing = "0.1"                   # Structured logging framework
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Logging subscriber + filtering via environment variables (e.g., RUST_LOG=info)
+
+
+# ------------------------------
+# Optional Features
+# ------------------------------
 
 [features]
-framing_fuzz = []
+framing_fuzz = []                  # Optional feature flag (can be enabled via --features)
+                                   # Currently empty → acts as a compile-time switch
 
-[profile.release]
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-opt-level = 3
-strip = true
 
-[[bin]]
-name = "chainlens_cli"
-path = "src/bin/chainlens_cli.rs"
+# ------------------------------
+# Release Build Optimizations
+# ------------------------------
 
-[[bin]]
-name = "chainlens_web"
-path = "src/bin/chainlens_web.rs"
+[profile.release]                  # Configuration for `cargo build --release`
+lto = "fat"                        # Link Time Optimization → maximizes performance
+codegen-units = 1                 # Single codegen unit → better optimization (slower compile time)
+panic = "abort"                   # No stack unwinding → smaller binary + faster
+opt-level = 3                     # Maximum optimization level
+strip = true                      # Removes debug symbols → smaller binary
+
+
+# ------------------------------
+# Binary Targets
+# ------------------------------
+
+[[bin]]                           # First executable program
+name = "chainlens_cli"            # Name of the CLI binary (cargo run --bin chainlens_cli)
+path = "src/bin/chainlens_cli.rs" # Entry point file
+
+[[bin]]                           # Second executable program
+name = "chainlens_web"            # Name of the web binary (cargo run --bin chainlens_web)
+path = "src/bin/chainlens_web.rs" # Entry point file
