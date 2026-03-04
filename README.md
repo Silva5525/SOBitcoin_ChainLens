@@ -403,19 +403,13 @@ cd fixtures/blocks
 gunzip *.gz
 cd ../../
 
-Analyze a raw transaction (out/*.json) (hex):
-
-```bash
-./target/release/chainlens_cli --block fixtures/blocks/blk04330.dat fixtures/blocks/rev04330.dat fixtures/blocks/xor.dat
-```
-
-Or from file (out/*.json & terminal):
+Analyze a transaction from file:
 
 ```bash
 ./target/release/chainlens_cli fixtures/transactions/dust_output.json
 ```
 
-Outputs structured JSON.
+Outputs structured JSON (out/*.json & terminal).
 
 ---
 
@@ -424,13 +418,10 @@ Outputs structured JSON.
 Analyze raw Bitcoin Core block files:
 
 ```bash
-chainlens_cli block \
-  --blk blk00000.dat \
-  --rev rev00000.dat \
-  --xor xor.dat
+./target/release/chainlens_cli --block fixtures/blocks/blk04330.dat fixtures/blocks/rev04330.dat fixtures/blocks/xor.dat
 ```
 
-Produces JSON reports for each block inside the file.
+Produces JSON reports for each block inside the file (out/*.json).
 
 ---
 
@@ -454,7 +445,7 @@ Then open:
 http://127.0.0.1:3000
 ```
 
-# use fixtures/transactions/*.json for test files
+# use fixtures/transactions/*.json for test
 
 cd fixtures/transactions
 
@@ -863,4 +854,4 @@ You are welcome to fork and experiment with it under the terms of the MIT Licens
 
 Bitcoin Core validates blocks.
 
-ChainLens **analyzes** them — fast, deterministic, and structured.
+ChainLens **analyzes** them — fast, deterministic, and structured
