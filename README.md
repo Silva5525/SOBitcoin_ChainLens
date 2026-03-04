@@ -116,6 +116,7 @@ gunzip *.gz
 cd ../../
 
 Analyze a transaction from file:
+=======
 
 ```bash
 ./target/release/chainlens_cli fixtures/transactions/dust_output.json
