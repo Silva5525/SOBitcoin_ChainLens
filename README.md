@@ -111,9 +111,11 @@ target/release/chainlens_cli
 ## Transaction Mode
 
 # open fixtures for tests
+```
 cd fixtures/blocks
 gunzip *.gz
 cd ../../
+```
 
 Analyze a transaction from file:
 =======
